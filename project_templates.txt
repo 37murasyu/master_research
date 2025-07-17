@@ -1,0 +1,60 @@
+
+🎯 master_research_core（本体：リアルタイム解析・記録）
+
+目的：
+- Mediapipeで取得した姿勢データから、各関節の運動情報（相対位置・角速度・トルク）をリアルタイムで計算。
+- トルクを算出し、映像に描画、またCSVに保存。
+- トルクの変化をmatplotlibでリアルタイム可視化。
+
+必要ファイル：
+- master_research_code.py（メイン処理）
+- utils.py（DLT, keypoint抽出など）
+- utils_dynamic.py（力・トルク・慣性テンソルの計算）
+- link_vector_calculator_module.py（LinkVectorCalculator クラス）
+- body_part_storage_module.py（姿勢・トルクの蓄積）
+- config.py（w, dt, gなど）
+- 動画ファイル or カメラ入力
+
+目的の質問例：
+- mp_pose の起動時間を短縮するには？
+- 姿勢推定後、他の人物を無視して1人だけトラッキングするには？
+- トルク計算のどこにボトルネックがあるか？
+
+
+🔁 inverse_dynamics_recalc（CSVからトルクを再解析）
+
+目的：
+- すでに保存済みの3D関節座標データ（CSV）から、左腕などのトルクを再計算する。
+- 姿勢データからLinkVectorCalculatorを使ってリンク情報を再取得。
+- calculate_inertia_tensor → calculate_M_and_F → calculate_individual_torques を順に実行。
+- トルクベクトルをCSVで出力。
+
+必要ファイル：
+- kpts3d_*.csv（3D関節位置データ）
+- link_vector_calculator_module.py
+- utils_dynamic.py（トルク・力計算関数）
+- config.py（g, w, dt, m1, m2）
+- 出力用のトルクCSVファイル名（例：recalc_torque_leftarm.csv）
+
+目的の質問例：
+- joint 0,1,3,5,6,7,9 のみ使って再解析したい。
+- LinkVectorCalculator の計算をループ処理でバッチ化するには？
+- グローバル変数 w, g を明示せずに渡す方法は？
+
+
+🧭 local_torque_transform（グローバルトルク→ローカルトルク）
+
+目的：
+- グローバル空間で算出されたトルクベクトルを、各部位の局所（ローカル）座標系に変換。
+- たとえば前腕方向をz軸にし、手首トルクがその軸に対してどう向いているかを定量化。
+- 出力は local_{元ファイル名}.csv のように保存。
+
+必要ファイル：
+- グローバルトルクCSV（例：aim_torque_vec_*.csv）
+- 対応するkpts3d_*.csv（関節位置）
+- utils_dynamic.py または新しい回転行列計算関数（例：get_rotation_matrix_from_vector）
+
+目的の質問例：
+- 前腕方向を基準に手首トルクをローカル化したい。
+- 各サイクルごとのローカルトルク合計を出力したい。
+- 複数ファイルを一括でローカル化するには？

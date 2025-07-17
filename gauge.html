@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Fixed Layout Gauges & Image</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    body { margin:0; padding:0; position:relative; }
+    .item {
+      position: absolute;
+    }
+    .chart {
+      width: 180px;
+      height: 180px;
+    }
+    .img-item {
+      width: 900px;
+      height: auto;
+      display: block;
+      margin: 0 auto;
+      background: transparent;   /* ← ここがポイント */
+      border: none;
+    }
+  </style>
+</head>
+<body>
+
+
+  <!-- ゲージ -->
+  <div id="item-chart1" class="item" style="left: 838.001px; top: 258.67px;">
+    <div id="chart1" class="chart"></div>
+    <div class="label">左前腕</div>
+  </div>
+  <div id="item-chart2" class="item" style="left: 778.665px; top: 103.332px;">
+    <div id="chart2" class="chart"></div>
+    <div class="label">左上腕</div>
+  </div>
+  <div id="item-chart3" class="item" style="left: 686.663px; top: -18.6665px;">
+    <div id="chart3" class="chart"></div>
+    <div class="label">左肩・左胸</div>
+  </div>
+  <div id="item-chart4" class="item" style="left: 269.999px; top: 259.996px;">
+    <div id="chart4" class="chart"></div>
+    <div class="label">右前腕</div>    
+  </div>
+  <div id="item-chart5" class="item" style="left: 305.999px; top: 96.6669px;">
+    <div id="chart5" class="chart"></div>
+    <div class="label">右上腕</div>
+  </div>
+  <div id="item-chart6" class="item" style="left: 417.998px; top: -21.9965px;">
+    <div id="chart6" class="chart"></div>
+    <div class="label">右肩・右胸</div>
+  </div>
+  <div id="item-chart7" class="item" style="left: 10px; top: 410px;">
+    <div id="chart7" class="chart"></div>
+  </div>
+  <!-- 画像 -->
+  <div id="item-img1" class="item" style="left: 180px; top: -38px;">
+    <img src="wheelchair_user.png" class="img-item" alt="User">
+  </div>
+  <script>
+    // 1) YlOrRd の 6 色パレット（ColorBrewer 6-class）を定義し、逆順に
+    const brewer6 = ['#E31A1C','#FC4E2A','#FD8D3C','#FEB24C','#FED976','#FFFFB2'];
+    const colors = brewer6.slice().reverse();  // [ '#E31A1C', ... , '#FFFFB2' ]
+
+    // 2) 表示するゲージの値（ここでは全て同じ値を使っています）
+    const gaugeValue = 110;
+
+    // 3) 各チャートをプロット
+    for (let i = 1; i <= 7; i++) {
+      Plotly.newPlot(
+        'chart' + i,
+        [{
+          type: "indicator",
+          mode: "gauge+number",
+          value: gaugeValue,
+          gauge: {
+            axis: { range: [0, 180], tickmode: 'linear', tick0: 0, dtick: 20 },
+            bar: { color: 'black' },
+            steps: [
+              { range: [0, 60],   color: 'lightgray' },
+              { range: [60,  80], color: colors[5] },
+              { range: [80, 100], color: colors[4] },
+              { range: [100,120], color: colors[3] },
+              { range: [120,140], color: colors[2] },
+              { range: [140,160], color: colors[1] },
+              { range: [160,180], color: colors[0] },
+            ]
+          }
+        }],
+        {
+          margin: { t: 20, b: 0, l: 0, r: 0 },
+          width: 180,
+          height: 180,
+          displayModeBar: false
+        }
+      );
+    }
+  </script>
+</body>
+</html>

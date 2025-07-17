@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: <your stack description here>
+# Available top-level fields are listed in code completion
+# Add Resources Here: uncomment the following lines
+Resources:
+  StereoCalibrateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda_stereo/  # 自動生成された関数フォルダ名
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      MemorySize: 2048
+      Timeout: 30
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /stereo-calibrate
+            Method: POST
+

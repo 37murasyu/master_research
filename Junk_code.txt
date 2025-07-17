@@ -1,0 +1,358 @@
+Junk
+
+
+matt_x = [1,2,3,5,6,7,
+    2,6,
+    1,2,3,5,6,7,
+    2,6,
+    1,2,3,4,5,6,7,
+    2,3,4,5,6,
+    1,3,5,7]
+matt_y = [1,1,1,1,1,1,2,2,3,3,3,3,3,3,4,4,5,5,5,5,5,5,5,6,6,6,6,6,7,7,7,7]
+matt = [
+    32,47,33,23,25,24,
+    46,26,
+    34,45,35,21,27,22,
+    44,28,
+    36,43,37,42,19,29,20,
+    41,39,40,18,30,
+    38,16,17,31
+]
+matt_data = [0] * 32  # 初期化されたマットデータ
+
+        #temp_np=temp_np*10
+        #file_modeの場合はx軸は正が奥、y軸は正が左肩、z軸は正が上
+        #transformed_p3ds[:, 0] = temp_np[:, 2]
+        #transformed_p3ds[:, 1] = temp_np[:, 1]
+        #transformed_p3ds[:, 2] = temp_np[:, 0]
+
+           """
+    upper_arm_R_data = storage.get_data('upper_arm_R')
+    #print("Data stored"+str(upper_arm_R_data[-1]))
+    # 重心位置の計算
+    if len(kpts_3d)<7:
+        #print(len(kpt_3d))
+        continue
+    #center_of_mass = calculate_center_of_mass(masses, Pos_t(0))
+    
+    # 速度の計算 (仮の t-1 と t+1 時刻のデータ)
+    positions_t_minus_1 = calculate_center_of_mass(masses, Pos_t(-1))
+    positions_t_plus_1  = calculate_center_of_mass(masses, Pos_t(1))
+
+    # 重心速度の計算
+    velocity_com = calculate_velocity_com(positions_t_minus_1, positions_t_plus_1, dt)
+    # 例としての使用
+    V_COM = velocity_com   # 仮の重心速度
+    P_COM = center_of_mass # 仮の重心位置
+    # 点Aから点Bへのベクトル
+    direction_vector = transformed_p3ds[9]+transformed_p3ds[8] - transformed_p3ds[7]-transformed_p3ds[6]
+    # ベクトルの大きさ（長さ）を正規化
+    normalized_vector = direction_vector / np.linalg.norm(direction_vector)
+
+    # 点Aから点B方向に0.3だけ移動した点Cの座標
+    distance = 0.3
+    P_BOS_front_end = (transformed_p3ds[7]+transformed_p3ds[6])/2+ normalized_vector * distance
+    V_Normal_COM, P_Normal_COM = calculate_normalized_values(V_COM, P_COM, P_BOS_front_end, Trunk_Height, length_of_BOS)
+    #print("Normalized COM Velocity:", V_Normal_COM)
+    #print(np.linalg.norm(V_Normal_COM))
+    #print("Normalized COM Position:", P_Normal_COM)
+    point = (P_Normal_COM[0], np.linalg.norm(V_Normal_COM))
+    min_distance = min_distance_from_point_to_polyline(polyline_points, point[0], point[1])
+    #print(f"点と折れ線の最小距離: {min_distance}")
+    if is_point_above_line(point, line_segments):
+        risk=1+min_distance/0.9013878188659973
+    else:
+        risk=1-min_distance/0.9013878188659973
+    #print("リスク(%)",risk*100)
+    #print(len(kpts_3d))
+    """
+
+
+        """
+    frame0 = draw_rotated_rectangle(frame0, np.array(frame0_keypoints[0]), np.array(frame0_keypoints[2]), (0,0,int(np.clip(torques[1][0]/5500,0,1)*255)), alpha=0.8)
+    frame0 = draw_rotated_rectangle(frame0, np.array(frame0_keypoints[2]), np.array(frame0_keypoints[4]), (0, 0, int(np.clip(torques[0][0]/8500,0,1)*255)), alpha=0.8)
+    frame0=draw_rotated_rectangle(frame0, np.array(frame0_keypoints[0]), (np.array(frame0_keypoints[1])+np.array(frame0_keypoints[0]))*.5, (0, 0, int(np.clip(torques[2][0]/5500,0,1)*255)),AC_width=30, alpha=0.8,shoulder_mode=True)
+    frame0 = draw_rotated_rectangle(frame0, np.array(frame0_keypoints[1]), np.array(frame0_keypoints[3]), (0,0,int(np.clip(torques[1][0]/5500,0,1)*255)), alpha=0.8)
+    frame0 = draw_rotated_rectangle(frame0, np.array(frame0_keypoints[3]), np.array(frame0_keypoints[5]), (0,0,int(np.clip(torques[0][0]/8500,0,1)*255)), alpha=0.8)
+    frame0=draw_rotated_rectangle(frame0, (np.array(frame0_keypoints[1])+np.array(frame0_keypoints[0]))*.5, np.array(frame0_keypoints[1]), (0, 0, int(np.clip(torques[2][0]/5500,0,1)*255)), AC_width=30,alpha=0.8,shoulder_mode=True)
+    """
+
+    
+
+
+"""
+try:
+    # ファイルを開いて内容を読み込む
+    with open('seat.txt', 'r') as file:
+        value = file.read().strip()  # 空白や改行を除去
+
+    # 値が'0'かどうかで条件分岐
+    if value == '0':
+        # 外部から与えられるトルクと力
+      f_E = w*0.66*g/2
+    else:
+      f_E = 0
+
+except FileNotFoundError:
+    print("ファイルが見つかりません。")
+except ValueError:
+    print("ファイルの内容が不正です。")
+except Exception as e:
+    print(f"予期せぬエラーが発生しました: {e}")
+"""
+"""
+r_x = .5*(both_shoulder_data[-1]['p1']+both_hip_data[-1]['p1'])+.25*(both_shoulder_data[-1]['relative_position_vector']+both_hip_data[-1]['relative_position_vector'])  # この例での r_x
+tau_E = np.array([0, 0, 0])
+
+r_g = [forearm_R_data[-1]['centroid'],upper_arm_R_data[-1]['centroid']]
+
+individual_torques = calculate_individual_torques(Ms, Fs, np.array(r_g), tau_E, f_E,r_x, np.array(forearm_R_data[-1]['p1']))
+for i, tau in enumerate(individual_torques, start=1):
+    print(f"Torque τ_{i}:", tau)
+
+"""
+
+
+"""
+    matt_data = read_data()
+    if not(len(matt_data)==32):
+        matt_data = [255] * 32
+    all_255 = all(value > 240 for value in matt_data)
+    if all_255:#離席
+        #print("all 255")
+        true_count+=1
+        false_count=0
+    else:
+        false_count+=1
+        true_count=0
+    if true_count==5:
+        stand_mode=True
+        #print("離席")
+    elif false_count==5:#着席
+        stand_mode=False
+        #print("着席")
+    """
+
+    def calculate_center_of_mass(masses, positions):
+    """
+    重心の位置を計算します。
+
+    :param masses: 各オブジェクトの質量のリスト
+    :param positions: 各時刻におけるオブジェクトの位置のリスト
+    :return: 重心の位置
+    """
+    total_mass = np.sum(masses)
+    weighted_positions = np.dot(masses, positions) / total_mass
+    return weighted_positions
+
+def calculate_velocity_com(positions_t_minus_1, positions_t_plus_1, dt):
+    """
+    重心の速度を計算します。
+
+    :param positions_t_minus_1: t-1 時刻での重心の位置
+    :param positions_t_plus_1: t+1 時刻での重心の位置
+    :param dt: 時間間隔 Δt
+    :return: 重心の速度
+    """
+    velocity_com = (positions_t_plus_1 - positions_t_minus_1) / (2 * dt)
+    return velocity_com
+
+def Pos_t(t):
+  #both_shoulder_data = storage.get_data('both_shoulder')
+  a=np.array(both_shoulder_data[t-2]['p1']+.5*both_shoulder_data[t-2]['relative_position_vector'])
+  b=np.array(both_hip_data[t-2]['p1']+.5*both_hip_data[t-2]['relative_position_vector'])
+  c0=np.array(upper_arm_R_data[t-2]['p1']+.5*upper_arm_R_data[t-2]['relative_position_vector'])
+  c1=np.array(forearm_R_data[t-2]['p1'])+np.array(forearm_R_data[t-2]['relative_position_vector'])*0.5
+  
+  d=np.array(upper_armL_data[t-2]['p1']+.5*upper_armL_data[t-2]['relative_position_vector'])+np.array(forearm_L_data[t-2]['p1']+.5*forearm_L_data[t-2]['relative_position_vector'])
+
+  positions = np.array([a+[0,0,0.05],0.75*a+0.25*b,0.25*a+0.75*b,b,0.5*(c0+c1),0.5*d])  # 各オブジェクトの位置 (t 時刻)
+  return positions
+
+def calculate_normalized_values(V_COM, P_COM, P_BOS_front_end, trunk_height, length_of_BOS, g=9.81):
+    """
+    正規化重心速度と正規化重心位置を計算します。
+
+    :param V_COM: 重心速度 (numpy array, shape: (3,))
+    :param P_COM: 重心位置 (numpy array, shape: (3,))
+    :param P_BOS_front_end: 床反力の前端位置 (numpy array, shape: (3,))
+    :param trunk_height: トランクの高さ (スカラー)
+    :param length_of_BOS: 床反力の長さ (スカラー)
+    :param g: 重力加速度 (スカラー、デフォルトは9.81 m/s^2)
+    :return: 正規化重心速度と正規化重心位置 (tuple of numpy arrays)
+    """
+    
+
+    V_Normal_COM = V_COM / np.sqrt(9.81 * trunk_height)
+    P_Normal_COM = (P_COM - P_BOS_front_end) / length_of_BOS
+    P_Normal_COM[0]=-P_Normal_COM[0]
+    return V_Normal_COM, P_Normal_COM
+
+    
+def point_to_segment_distance(px, py, x1, y1, x2, y2):
+    # ベクトル v と w を定義
+    v = np.array([x2 - x1, y2 - y1])
+    w = np.array([px - x1, py - y1])
+
+    # 内積を使って t を計算
+    c1 = np.dot(w, v)
+    c2 = np.dot(v, v)
+    t = c1 / c2
+
+    # t の範囲を 0 <= t <= 1 にクランプ
+    t = max(0, min(1, t))
+
+    # 線分上の最近接点を計算
+    nearest = np.array([x1, y1]) + t * v
+
+    # 点と線分の最近接点の距離を計算
+    distance = np.linalg.norm(np.array([px, py]) - nearest)
+    return distance
+def min_distance_from_point_to_polyline(points, px, py):
+    min_distance = float('inf')
+    for i in range(len(points) - 1):
+        x1, y1 = points[i]
+        x2, y2 = points[i + 1]
+        distance = point_to_segment_distance(px, py, x1, y1, x2, y2)
+        min_distance = min(min_distance, distance)
+    return min_distance
+def find_segment(x, line_segments):
+    """ 与えられたx座標に基づいて適切な線分を見つける """
+    for segment in line_segments:
+        if segment[0][0] <= x <= segment[1][0]:
+            return segment
+    return None
+def interpolate_y(x, segment):
+    """ 線形補間を使って、指定されたx座標におけるy座標を求める """
+    x1, y1 = segment[0]
+    x2, y2 = segment[1]
+    if x1 == x2:
+        return y1  # あまりあり得ないが、念のため
+    return y1 + (y2 - y1) * (x - x1) / (x2 - x1)
+    
+def read_data():
+    # シリアルデータを読み取る関数
+    data = []
+    port.write(b'1')  # シリアル通信でデータを送信
+    while True:
+        byte_data = port.read(1)
+        #print(byte_data)
+        if byte_data == b'\x0a':  # 改行が来たらデータの終わり
+            break
+        if byte_data:
+            data.append(ord(byte_data))  # バイトデータをリストに追加
+    return data
+
+def is_point_above_line(point, line_segments):
+    """ 点が線より上にあるかどうかを判定する """
+    segment = find_segment(point[0], line_segments)
+    if segment:
+        y_on_line = interpolate_y(point[0], segment)
+        return point[1] > y_on_line
+    return False
+    # シリアルポート設定
+try:
+    port = serial.Serial('COM3', 19200)  # Arduinoのポートを指定
+except serial.SerialException as e:
+    print("Serial port is not available. Please check the port number.")
+#time.sleep(2)  # シリアル通信の準備が整うのを待つ
+
+"""
+select=display_choices("カメラ調整は済みましたか？","カメラ調整する", "カメラ調整しない")
+if(select==1):
+   # 別のPythonスクリプトを実行する
+  subprocess.run(['python', 'calib.py','calibration_settings.yaml'])
+"""
+
+# 頭、胸、腰、尻、腕*2
+masses = np.array([0.075, 0.276, 0.19, 0.05, 0.049, 0.049]) * w  # 質量
+print("Masses defined")
+
+length_of_BOS = 0.5  # 仮の床反力の長さ
+
+Trunk_Height = 0.55
+
+polyline_points = [
+    (-1.5, 0.38 * 5),
+    (-1.25, 0.37 * 5),
+    (-1, 0.28 * 5),
+    (-0.75, 0.1 * 5),
+    (-0.5, 0.05 * 5),
+    (-0.25, -0.03 * 5),
+    (0, 0.01 * 5),
+]
+# 線分リストの作成
+line_segments = [
+    (polyline_points[i], polyline_points[i + 1])
+    for i in range(len(polyline_points) - 1)
+]
+
+
+Switch_seat = False
+
+
+def mouse_callback(event, x, y, flags, param):
+    if event == cv.EVENT_LBUTTONDOWN:
+        print("Clicked")
+        if Switch_seat == True:
+            Switch_seat = False
+        else:
+            Switch_seat = True
+
+            cv.setMouseCallback("MyWindow", mouse_callback)
+
+            
+FILENAME = "seat.txt"
+
+current_INTEG_values = [0, 0, 0, 0]
+
+"""
+if len(sys.argv) > 2:
+    input_stream1 = int(sys.argv[1])
+    input_stream2 = int(sys.argv[2])
+    file_mode = False
+    if len(sys.argv) > 3:
+        # reps=int(sys.argv[3])
+        reps = 10
+        one_rm_percentage = df_rm.loc[df_rm["反復回数"] == reps, "1RM%"].values[0] / 100
+        # ファイルを読み込みモードで開く
+        with open(folder_path + "\\max_value.txt", "r") as file:
+            # ファイルからデータを一行読み込む
+            data = file.readline().strip()  # strip()で余計な空白や改行を除去
+
+            # 読み込んだデータをfloatに変換
+            max_value = float(data)
+            print(f"ファイル内の最大値: {max_value}")
+        threshold = max_value / one_rm_percentage
+    else:
+        reps = 0
+else:
+    file_mode = False
+"""
+
+
+    """
+    for i in range(4):
+        if while_count > 5:
+            if (torques[i][0] > 100000) or (torques[i][0] < 100):
+                pass
+                # torques[i][0]=0
+            else:
+                # current_INTEG_values[i] = integrate_values_with_initial(dt, [torques[i][0]], current_INTEG_values[i])
+                if torques[i][0] > maxs[i]:
+                    maxs[i] = torques[i][0]
+    reps = 10
+    one_rm_percentage = df_rm.loc[df_rm["反復回数"] == reps, "1RM%"].values[0] / 100
+    threshold = max_value / one_rm_percentage
+    if threshold is not None:
+        clear = 0
+        if torques[2][0] > threshold * 0.8:
+            clear += 1
+            if (clear == 3) & (AIM_bool == False):
+                AIM_bool = True
+                clear = 0
+                AIM_count += 1
+        else:
+            AIM_bool = False
+            clear = 0
+            """

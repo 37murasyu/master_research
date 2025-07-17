@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../../../Documents/PlatformIO/Projects"
+		},
+		{
+			"name": "240220-015825-m5stack-core-esp32",
+			"path": "../../../Documents/PlatformIO/Projects/240220-015825-m5stack-core-esp32"
+		},
+		{
+			"name": "test",
+			"path": "../../../Documents/PlatformIO/Projects/test"
+		},
+		{
+			"path": "../../../Desktop/master_Research"
+		}
+	],
+	"settings": {}
+}
