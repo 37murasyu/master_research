@@ -1,4 +1,6 @@
 import textwrap
+import os
+import time
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -15,69 +17,57 @@ def _make_homogeneous_rep_matrix(R, t):
     return P
 
 
-# direct linear transform
+# Triangulation using OpenCV (replaces SVD-based DLT)
 def DLT(P1, P2, point1, point2):
+    """
+    2視点の射影行列 P1, P2 とピクセル座標 point1, point2 から、
+    OpenCV の cv.triangulatePoints を用いて 3D 点を推定する。
 
-    A = [
-        point1[1] * P1[2, :] - P1[1, :],
-        P1[0, :] - point1[0] * P1[2, :],
-        point2[1] * P2[2, :] - P2[1, :],
-        P2[0, :] - point2[0] * P2[2, :],
-    ]
-    A = np.array(A).reshape((4, 4))
+    Parameters
+    ----------
+    P1 : np.ndarray (3x4)
+    P2 : np.ndarray (3x4)
+    point1 : Sequence[float] -> [x,y]
+    point2 : Sequence[float] -> [x,y]
 
-    B = A.transpose() @ A
-    from scipy import linalg
+    Returns
+    -------
+    np.ndarray shape (3,)
+        三次元点 (x,y,z)。w が不正な場合は [-1,-1,-1]。
+    """
+    P1 = np.asarray(P1, dtype=np.float64)
+    P2 = np.asarray(P2, dtype=np.float64)
+    # 2x1 の配列にして渡す
+    pts1 = np.array([[float(point1[0])], [float(point1[1])]], dtype=np.float64)
+    pts2 = np.array([[float(point2[0])], [float(point2[1])]], dtype=np.float64)
 
-    U, s, Vh = linalg.svd(B, full_matrices=False)
-
-    # print('Triangulated point: ')
-    # print(Vh[3,0:3]/Vh[3,3])
-    return Vh[3, 0:3] / Vh[3, 3]
+    Xh = cv.triangulatePoints(P1, P2, pts1, pts2)  # 4xN (ここでは N=1)
+    w = float(Xh[3, 0])
+    if not np.isfinite(w) or abs(w) < 1e-12:
+        return np.array([-1.0, -1.0, -1.0], dtype=np.float64)
+    X = (Xh[:3, 0] / w).astype(np.float64)
+    if not np.all(np.isfinite(X)):
+        return np.array([-1.0, -1.0, -1.0], dtype=np.float64)
+    return X
 
 
 def read_camera_parameters(camera_id, savefolder=folder_path + "\\camera_parameters\\"):
-
-    inf = open(savefolder + "c" + str(camera_id) + ".dat", "r")
-    # print("camera parameters read")
-    cmtx = []
-    dist = []
-
-    line = inf.readline()
-    for _ in range(3):
-        line = inf.readline().split()
-        line = [float(en) for en in line]
-        cmtx.append(line)
-
-    line = inf.readline()
-    line = inf.readline().split()
-    line = [float(en) for en in line]
-    dist.append(line)
-
-    return np.array(cmtx), np.array(dist)
+    path = f"{savefolder}c{camera_id}.dat"
+    with open(path, "r", encoding="utf-8") as inf:
+        _ = inf.readline()
+        cmtx = [[float(en) for en in inf.readline().split()] for _ in range(3)]
+        _ = inf.readline()
+        dist = [float(en) for en in inf.readline().split()]
+    return np.array(cmtx), np.array([dist])
 
 
-def read_rotation_translation(
-    camera_id, savefolder=folder_path + "\\camera_parameters\\"
-):
-
-    inf = open(savefolder + "rot_trans_c" + str(camera_id) + ".dat", "r")
-
-    inf.readline()
-    rot = []
-    trans = []
-    for _ in range(3):
-        line = inf.readline().split()
-        line = [float(en) for en in line]
-        rot.append(line)
-
-    inf.readline()
-    for _ in range(3):
-        line = inf.readline().split()
-        line = [float(en) for en in line]
-        trans.append(line)
-
-    inf.close()
+def read_rotation_translation(camera_id, savefolder=folder_path + "\\camera_parameters\\"):
+    path = f"{savefolder}rot_trans_c{camera_id}.dat"
+    with open(path, "r", encoding="utf-8") as inf:
+        _ = inf.readline()
+        rot = [[float(en) for en in inf.readline().split()] for _ in range(3)]
+        _ = inf.readline()
+        trans = [[float(en) for en in inf.readline().split()] for _ in range(3)]
     return np.array(rot), np.array(trans)
 
 
@@ -91,35 +81,22 @@ def _convert_to_homogeneous(pts):
 
 
 def get_projection_matrix(camera_id, file_mode):
-    # read camera parameters
-    if file_mode:
-        cmtx, dist = read_camera_parameters(
-            camera_id, folder_path + "\\camera_parameters\\Param_for_MYvideo\\"
-        )
-        rvec, tvec = read_rotation_translation(
-            camera_id, folder_path + "\\camera_parameters\\Param_for_MYvideo\\"
-        )
-    else:
-        cmtx, dist = read_camera_parameters(camera_id)
-        rvec, tvec = read_rotation_translation(camera_id)
-
-    # calculate projection matrix
-    P = cmtx @ _make_homogeneous_rep_matrix(rvec, tvec)[:3, :]
-    return P
+    base = folder_path + ("\\camera_parameters\\Param_for_MYvideo\\" if file_mode else "\\camera_parameters\\")
+    cmtx, _ = read_camera_parameters(camera_id, base)
+    rvec, tvec = read_rotation_translation(camera_id, base)
+    return cmtx @ _make_homogeneous_rep_matrix(rvec, tvec)[:3]
 
 
 def write_keypoints_to_disk(filename, kpts):
-    fout = open(filename, "w")
+    with open(filename, "w", encoding="utf-8") as fout:
+        for frame_kpts in kpts:
+            for kpt in frame_kpts:
+                if len(kpt) == 2:
+                    fout.write(str(kpt[0]) + " " + str(kpt[1]) + " ")
+                else:
+                    fout.write(str(kpt[0]) + " " + str(kpt[1]) + " " + str(kpt[2]) + " ")
 
-    for frame_kpts in kpts:
-        for kpt in frame_kpts:
-            if len(kpt) == 2:
-                fout.write(str(kpt[0]) + " " + str(kpt[1]) + " ")
-            else:
-                fout.write(str(kpt[0]) + " " + str(kpt[1]) + " " + str(kpt[2]) + " ")
-
-        fout.write("\n")
-    fout.close()
+            fout.write("\n")
 
 
 def extract_keypoints(results0, results1, pose_keypoints, frame0, frame1):
@@ -148,58 +125,27 @@ def extract_keypoints(results0, results1, pose_keypoints, frame0, frame1):
             各キーポイントは [x, y] の形式で、未検出時は [-1, -1]。
     """
 
-    frame0_keypoints = []
-    frame1_keypoints = []
-    if results0.pose_landmarks:
-        for i, landmark in enumerate(results0.pose_landmarks.landmark):
-            if i not in pose_keypoints:
-                continue  # only save keypoints that are indicated in pose_keypoints
-            pxl_x = landmark.x * frame0.shape[1]
-            pxl_y = landmark.y * frame0.shape[0]
-            pxl_x = int(round(pxl_x))
-            pxl_y = int(round(pxl_y))
-            cv.circle(
-                frame0, (pxl_x, pxl_y), 3, (0, 0, 255), -1
-            )  # add keypoint detection points into figure
-            label = str(i)  # ループのインデックスを文字列に変換
-            cv.putText(
-                frame0,
-                label,
-                (pxl_x + 5, pxl_y - 5),
-                cv.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-            )
+    draw_kpts = os.getenv('DRAW_KEYPOINTS', '1') not in ('0','false','False')
 
-            kpts = [pxl_x, pxl_y]
-            frame0_keypoints.append(kpts)
-            # print(i,pxl_x,pxl_y)
-        # print("keypoints detected")
-    else:
-        # if no keypoints are found, simply fill the frame data with [-1,-1] for each kpt
-        frame0_keypoints = [[-1, -1]] * len(pose_keypoints)
-    if results1.pose_landmarks:
-        for i, landmark in enumerate(results1.pose_landmarks.landmark):
+    def _extract(results, frame):
+        if not results.pose_landmarks:
+            return [[-1, -1]] * len(pose_keypoints)
+        out = []
+        for i, landmark in enumerate(results.pose_landmarks.landmark):
             if i not in pose_keypoints:
                 continue
-            pxl_x = landmark.x * frame1.shape[1]
-            pxl_y = landmark.y * frame1.shape[0]
-            pxl_x = int(round(pxl_x))
-            pxl_y = int(round(pxl_y))
-            cv.circle(frame1, (pxl_x, pxl_y), 3, (0, 0, 255), -1)
-            kpts = [pxl_x, pxl_y]
-            frame1_keypoints.append(kpts)
+            px = int(round(landmark.x * frame.shape[1]))
+            py = int(round(landmark.y * frame.shape[0]))
+            if draw_kpts:
+                cv.circle(frame, (px, py), 3, (0, 0, 255), -1)
+                cv.putText(frame, str(i), (px + 5, py - 5), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            out.append([px, py])
+        return out or [[-1, -1]] * len(pose_keypoints)
 
-    else:
-        # if no keypoints are found, simply fill the frame data with [-1,-1] for each kpt
-        frame1_keypoints = [[-1, -1]] * len(pose_keypoints)
-        print("no keypoints detected111")
-
-    return frame0_keypoints, frame1_keypoints
+    return _extract(results0, frame0), _extract(results1, frame1)
 
 
-def calculate_3d_keypoints(frame0_keypoints, frame1_keypoints, P0, P1, pose_keypoints):
+def calculate_3d_keypoints(frame0_keypoints, frame1_keypoints, P0, P1, _=None):
     """
     2視点からの2Dキーポイント情報を用いて、DLT法により3次元キーポイントを計算する関数。
 
@@ -253,15 +199,54 @@ def put_text_jp(img, text, position, font_size, color, line_width):
     Returns:
         numpy.ndarray: テキストが描画されたOpenCV形式の画像。
     """
+    _t0 = time.perf_counter()
     img_pil = Image.fromarray(img)
+    _t1 = time.perf_counter()
+
+    # フォント取得（キャッシュあり）
+    def _get_jp_font(sz: int):
+        # シンプルなキャッシュ
+        cache_key = f"meiryo_{sz}"
+        font_obj = _FONT_CACHE.get(cache_key)
+        if font_obj is not None:
+            return font_obj
+        try:
+            font_path = folder_path + "\\meiryo\\meiryo.ttc"
+            font_obj = ImageFont.truetype(font_path, sz)
+        except OSError:
+            font_obj = ImageFont.load_default()
+        _FONT_CACHE[cache_key] = font_obj
+        return font_obj
+
     draw = ImageDraw.Draw(img_pil)
-    font = ImageFont.truetype(folder_path + "\\meiryo\\meiryo.ttc", font_size)
+    _t2a = time.perf_counter()
+    font = _get_jp_font(int(font_size))
+    _t2b = time.perf_counter()
+
     wrapped_text = textwrap.fill(text, width=line_width)
+    _t3 = time.perf_counter()
     draw.text(position, wrapped_text, font=font, fill=color)
-    return np.array(img_pil)
+    _t4 = time.perf_counter()
+    out = np.array(img_pil)
+    _t5 = time.perf_counter()
+
+    if os.getenv('PERF_DRAW_TRACE', '0') in ('1','true','True'):
+        print(
+            "[DRAW_TIMING] fromarray={:.2f}ms font={:.2f}ms wrap={:.2f}ms draw={:.2f}ms toarray={:.2f}ms".format(
+                (_t1 - _t0) * 1000.0,
+                (_t2b - _t2a) * 1000.0,
+                (_t3 - _t2b) * 1000.0,
+                (_t4 - _t3) * 1000.0,
+                (_t5 - _t4) * 1000.0,
+            )
+        )
+    return out
+
+# モジュール内フォントキャッシュ（サイズ毎）
+_FONT_CACHE = {}
 
 
-def display_choices(question, a, b):
+def display_choices(question, a, _=None):
     """
     質問と2つの選択肢を表示し、ユーザーのキーボード入力に応じて選択を受け付けるGUI関数。
 
@@ -330,7 +315,6 @@ def display_choices(question, a, b):
             # print("Enter key is pressed")
             break
     return selection
-    cv.destroyAllWindows()
 
 
 # if __name__ == "__main__":
@@ -367,6 +351,11 @@ def compute_local_torque(torque_global, link_vec):
     - 回転は右手系を想定。
     """
     l_x, l_y, l_z = link_vec
+    # 極端なゼロベクトルでの不安定化を防止
+    if not np.all(np.isfinite(link_vec)):
+        return torque_global
+    if np.linalg.norm(link_vec) < 1e-12:
+        return torque_global
     phi = np.arctan2(l_y, l_x)  # z軸回転角
     theta = np.arctan2(np.sqrt(l_x**2 + l_y**2), l_z)  # y軸回転角
 

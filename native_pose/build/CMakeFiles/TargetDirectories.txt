@@ -1,0 +1,3 @@
+C:/Users/villa/Desktop/master_Research/MAINCODE/native_pose/build/CMakeFiles/native_pose.dir
+C:/Users/villa/Desktop/master_Research/MAINCODE/native_pose/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/villa/Desktop/master_Research/MAINCODE/native_pose/build/CMakeFiles/ZERO_CHECK.dir

@@ -6,8 +6,11 @@ import cv2 as cv
 import pandas as pd
 from config import w, folder_path
 
+# Small numeric epsilon for numerical stability
+EPS = 1e-12
 
-def calculate_inertia_tensor(k, w, l):
+
+def calculate_inertia_tensor(k, mass, l):
     """
     質量と長さに基づいて、対象部位の慣性テンソルを計算する関数。
 
@@ -20,7 +23,7 @@ def calculate_inertia_tensor(k, w, l):
     ----------
     k : int
         係数データを取得するCSVの行インデックス（部位を表す）。
-    w : float
+    mass : float
         部位の質量（kg）。
     l : float
         部位の長さ（m）。
@@ -39,18 +42,13 @@ def calculate_inertia_tensor(k, w, l):
 
     csv_path = folder_path + "\\Moment of inertia estimation coefficient boys.csv"
 
-    data = pd.read_csv(csv_path)
-    print("Data loaded")
-    row = data.iloc[k]
-    # 位置指定で取り出す
-    a_x, b_x, c_x = row.iloc[1], row.iloc[2], row.iloc[3]
-    a_y, b_y, c_y = row.iloc[4], row.iloc[5], row.iloc[6]
-    a_z, b_z, c_z = row.iloc[7], row.iloc[8], row.iloc[9]
-    # 慣性モーメントの計算
-    I_x = a_x * w + b_x * l + c_x
-    I_y = a_y * w + b_y * l + c_y
-    I_z = a_z * w + b_z * l + c_z
-    I_tensor = np.array([[I_x, 0, 0], [0, I_y, 0], [0, 0, I_z]])
+    row = pd.read_csv(csv_path).iloc[k]
+    ax, bx, cx, ay, by, cy, az, bz, cz = [row.iloc[i] for i in range(1, 10)]
+    I_tensor = np.diag([
+        ax * mass + bx * l + cx,
+        ay * mass + by * l + cy,
+        az * mass + bz * l + cz,
+    ])
     return I_tensor
 
 
@@ -100,6 +98,9 @@ def calculate_M_and_F(
     - `omega` および `dot_omega` がゼロベクトルに設定される場合もある（特に I4 の場合）。
     """
 
+    if not part_data:
+        return np.zeros(3), np.zeros(3), "unknown"
+
     omega = part_data[-1]["omega"]
     dot_omega = part_data[-1]["dot_omega"]
     dot_dot_pg = part_data[-1]["dot_dot_pg"]
@@ -125,6 +126,12 @@ def calculate_M_and_F(
         dot_dot_pg = (
             part_data[-1]["dot_dot_pg"] * 3 + add_part_data[-1]["dot_dot_pg"]
         ) / 4
+
+    # NaN/None対策
+    I = np.zeros((3, 3)) if I is None else I
+    omega = np.zeros(3) if omega is None else omega
+    dot_omega = np.zeros(3) if dot_omega is None else dot_omega
+    dot_dot_pg = np.zeros(3) if dot_dot_pg is None else dot_dot_pg
 
     M = I.dot(dot_omega) + np.cross(omega, I.dot(omega))
     F = m * (dot_dot_pg - g)
@@ -166,7 +173,11 @@ def calculate_individual_torques(Ms, Fs, r_gs, tau_E, f_E, r_x, parts, storage):
     n = len(Ms)
     for j in range(n):
         part_j = parts[j]
-        data_j = storage.get_data(part_j)[-1]
+        data_list = storage.get_data(part_j)
+        if not data_list:
+            torques.append((np.zeros(3), part_j))
+            continue
+        data_j = data_list[-1]
         p1 = data_j["p1"]  # 関節位置
 
         # 1) 回転モーメントの合計
@@ -227,8 +238,7 @@ def update_graphs(new_data_points, lines, axes, torque_sss):
         # 新しいデータポイントを追加
         y.append(new_data)
         if len(y) > 100:
-            y.pop(0)  # リストが100を超えたら最初の要素を削除
-
+            y.pop(0)
         line.set_ydata(y)  # 折れ線グラフを更新
         ax.relim()  # データ範囲を更新
         ax.autoscale_view()  # 軸を再スケーリング
@@ -275,17 +285,9 @@ def draw_rotated_rectangle(
 
 def integrate_values_with_initial(dt, a, current_value):
     """
-    瞬間値のリスト、初期積分値のリスト、および時間間隔を受け取り、積分した結果のリストを返す。
-
-    :param dt: float - 各ステップの時間間隔
-    :param a_values: list of float - 各ステップにおける瞬間値（例えば加速度）
-    :param initial_values: list of float - 積分の初期値（例えば初期速度や初期位置）
-    :return: list of float - 積分値（例えば速度や位置）
+    単純なオイラー積分: current_value + a*dt を返す。
     """
-    current_value += a * dt  # 瞬間値を積分
-
-    return current_value
-
+    return current_value + a * dt
 
 # インパルス計算関数（compute_impulse と同一）
 def compute_impulse(series: pd.Series, dt: float):
@@ -293,3 +295,185 @@ def compute_impulse(series: pd.Series, dt: float):
     pos_imp = arr[arr > 0].sum() * dt
     neg_imp = arr[arr < 0].sum() * dt
     return pos_imp, neg_imp
+
+
+# ====== Native dynamics acceleration (optional, direct ctypes loader to avoid hard import) ======
+_NDLL = None
+_NDYN_MF = None
+_NDYN_TAU = None
+
+def _load_native_dynamics() -> bool:  # pragma: no cover - thin loader
+    global _NDLL, _NDYN_MF, _NDYN_TAU
+    if _NDYN_MF is not None and _NDYN_TAU is not None:
+        return True
+    import os as _os
+    import ctypes as _ct
+    from ctypes import c_int as _c_int, c_double as _c_double, POINTER as _POINTER
+    here = _os.path.dirname(__file__)
+    _trace = _os.getenv('NDYN_TRACE', '0') not in ('0','false','False')
+    candidates = [
+        _os.path.join(here, 'native_dynamics', 'build', 'Release', 'native_dynamics.dll'),
+        _os.path.join(here, 'native_dynamics', 'build', 'Debug', 'native_dynamics.dll'),
+        _os.path.join(here, 'native_dynamics.dll'),
+    ]
+    for p in candidates:
+        if _os.path.isfile(p):
+            try:
+                _NDLL = _ct.CDLL(p)
+                break
+            except OSError:
+                _NDLL = None
+    if _NDLL is None:
+        if _trace:
+            print('[NDYN] DLL not found; falling back to numpy')
+        return False
+    # set prototypes
+    _NDLL.dyn_compute_mf_batch.argtypes = [
+        _c_int,
+        _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double),
+        _POINTER(_c_double), _POINTER(_c_double),
+    ]
+    _NDLL.dyn_compute_mf_batch.restype = _c_int
+
+    _NDLL.dyn_compute_tau_chain.argtypes = [
+        _c_int,
+        _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double),
+        _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double), _POINTER(_c_double),
+    ]
+    _NDLL.dyn_compute_tau_chain.restype = _c_int
+
+    _NDYN_MF = _NDLL.dyn_compute_mf_batch
+    _NDYN_TAU = _NDLL.dyn_compute_tau_chain
+    if _trace:
+        try:
+            _path = getattr(_NDLL, '_name', 'native_dynamics.dll')
+        except Exception:
+            _path = 'native_dynamics.dll'
+        print(f'[NDYN] loaded: {_path}')
+    return True
+
+
+def compute_MF_batch_native(I_batch: np.ndarray,
+                            m_batch: np.ndarray,
+                            omega: np.ndarray,
+                            dot_omega: np.ndarray,
+                            ddpg: np.ndarray,
+                            g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute M and F for a batch using native DLL if available; fall back to numpy.
+
+    Shapes:
+      I_batch: (N,3,3)
+      m_batch: (N,)
+      omega, dot_omega, ddpg: (N,3)
+      g: (3,)
+    Returns: (M: (N,3), F: (N,3))
+    """
+    import os as _os
+    _trace = _os.getenv('NDYN_TRACE', '0') not in ('0','false','False')
+    if _load_native_dynamics():
+        try:
+            from ctypes import c_double as _c_double, POINTER as _POINTER
+            I_c = np.ascontiguousarray(I_batch, dtype=np.float64)
+            m_c = np.ascontiguousarray(m_batch, dtype=np.float64)
+            w_c = np.ascontiguousarray(omega, dtype=np.float64)
+            dw_c = np.ascontiguousarray(dot_omega, dtype=np.float64)
+            a_c = np.ascontiguousarray(ddpg, dtype=np.float64)
+            g_c = np.ascontiguousarray(g, dtype=np.float64)
+            N = int(I_c.shape[0])
+            M_out = np.empty((N, 3), dtype=np.float64)
+            F_out = np.empty((N, 3), dtype=np.float64)
+            ret = _NDYN_MF(
+                N,
+                I_c.ctypes.data_as(_POINTER(_c_double)),
+                m_c.ctypes.data_as(_POINTER(_c_double)),
+                w_c.ctypes.data_as(_POINTER(_c_double)),
+                dw_c.ctypes.data_as(_POINTER(_c_double)),
+                a_c.ctypes.data_as(_POINTER(_c_double)),
+                g_c.ctypes.data_as(_POINTER(_c_double)),
+                M_out.ctypes.data_as(_POINTER(_c_double)),
+                F_out.ctypes.data_as(_POINTER(_c_double)),
+            )
+            if ret == 0:
+                if _trace:
+                    print(f'[NDYN:MF] native ok (N={N})')
+                return M_out, F_out
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            if _trace:
+                print('[NDYN:MF] native failed; fallback to numpy')
+    # numpy fallback
+    N = I_batch.shape[0]
+    M = np.empty((N, 3), dtype=np.float64)
+    F = np.empty((N, 3), dtype=np.float64)
+    for i in range(N):
+        Ii = I_batch[i]
+        wi = omega[i]
+        dwi = dot_omega[i]
+        ai = ddpg[i]
+        Iw = Ii @ wi
+        M[i] = Ii @ dwi + np.cross(wi, Iw)
+        F[i] = m_batch[i] * (ai - g)
+    return M, F
+
+
+def compute_tau_chain_native(Ms: np.ndarray,
+                             Fs: np.ndarray,
+                             r_gs: np.ndarray,
+                             p1s: np.ndarray,
+                             tau_E: np.ndarray,
+                             f_E: np.ndarray,
+                             r_x: np.ndarray) -> np.ndarray:
+    """Compute joint torques for a chain using native DLL if available; fallback to numpy.
+
+    tau_j = sum_{i>=j} M_i + sum_{i>=j} ((r_gs[i]-p1s[j]) x F_i) - tau_E - ((r_x - p1s[j]) x f_E)
+    """
+    import os as _os
+    _trace = _os.getenv('NDYN_TRACE', '0') not in ('0','false','False')
+    if _load_native_dynamics():
+        try:
+            from ctypes import c_double as _c_double, POINTER as _POINTER
+            Ms_c = np.ascontiguousarray(Ms, dtype=np.float64)
+            Fs_c = np.ascontiguousarray(Fs, dtype=np.float64)
+            r_gs_c = np.ascontiguousarray(r_gs, dtype=np.float64)
+            p1s_c = np.ascontiguousarray(p1s, dtype=np.float64)
+            tau_E_c = np.ascontiguousarray(tau_E, dtype=np.float64)
+            f_E_c = np.ascontiguousarray(f_E, dtype=np.float64)
+            r_x_c = np.ascontiguousarray(r_x, dtype=np.float64)
+            N = int(Ms_c.shape[0])
+            tau_out = np.empty((N, 3), dtype=np.float64)
+            ret = _NDYN_TAU(
+                N,
+                Ms_c.ctypes.data_as(_POINTER(_c_double)),
+                Fs_c.ctypes.data_as(_POINTER(_c_double)),
+                r_gs_c.ctypes.data_as(_POINTER(_c_double)),
+                p1s_c.ctypes.data_as(_POINTER(_c_double)),
+                tau_E_c.ctypes.data_as(_POINTER(_c_double)),
+                f_E_c.ctypes.data_as(_POINTER(_c_double)),
+                r_x_c.ctypes.data_as(_POINTER(_c_double)),
+                tau_out.ctypes.data_as(_POINTER(_c_double)),
+            )
+            if ret == 0:
+                if _trace:
+                    print(f'[NDYN:TAU] native ok (N={N})')
+                return tau_out
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            if _trace:
+                print('[NDYN:TAU] native failed; fallback to numpy')
+    # numpy fallback
+    N = Ms.shape[0]
+    tau = np.zeros((N, 3), dtype=np.float64)
+    # cumulative M from the end
+    cumM = np.zeros((N, 3), dtype=np.float64)
+    cumM[-1] = Ms[-1]
+    for j in range(N-2, -1, -1):
+        cumM[j] = cumM[j+1] + Ms[j]
+    for j in range(N):
+        t = cumM[j].copy()
+        p1j = p1s[j]
+        for i in range(j, N):
+            rdiff = r_gs[i] - p1j
+            t += np.cross(rdiff, Fs[i])
+        t -= tau_E
+        t -= np.cross(r_x - p1j, f_E)
+        tau[j] = t
+    return tau
+

@@ -1,0 +1,15 @@
+opencv-python
+numpy
+scipy
+pandas
+matplotlib
+japanize-matplotlib
+mediapipe
+pygame
+pyyaml
+wmi
+boto3
+requests
+pyserial
+bleak
+comtypes

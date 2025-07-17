@@ -1,0 +1,10 @@
+^C:\USERS\VILLA\DESKTOP\MASTER_RESEARCH\MAINCODE\NATIVE_DYNAMICS\BUILD\CMAKEFILES\9F78F30E37DCC913A1A31D107E8935E0\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics -BC:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics/build/native_dynamics.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

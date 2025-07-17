@@ -1,0 +1,3 @@
+C:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics/build/CMakeFiles/native_dynamics.dir
+C:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics/build/CMakeFiles/ZERO_CHECK.dir

@@ -1,0 +1,10 @@
+^C:\USERS\VILLA\DESKTOP\MASTER_RESEARCH\MAINCODE\NATIVE_DYNAMICS\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics -BC:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics/build --check-stamp-file C:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

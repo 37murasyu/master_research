@@ -4,6 +4,7 @@
 import glob
 import os
 import time
+import argparse
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -13,6 +14,7 @@ import yaml
 
 # import sys
 from scipy import linalg
+from botocore.exceptions import NoCredentialsError, BotoCoreError
 
 # from config import (PADDING, dt, folder_path, fps, frame_shape, g,
 #                    input_stream1, input_stream2, m1, m2, pose_keypoints,
@@ -276,9 +278,29 @@ def save_frames_two_cams(camera0_name, camera1_name):
     cooldown_time = calibration_settings["cooldown"]
     number_to_save = calibration_settings["stereo_calibration_frames"]
 
-    # open the video streams
-    cap0 = cv.VideoCapture(calibration_settings[camera0_name])
-    cap1 = cv.VideoCapture(calibration_settings[camera1_name])
+    def _open_cam(index, label):
+        preferred_backends = [cv.CAP_DSHOW, cv.CAP_MSMF, cv.CAP_ANY]
+        last_cap = None
+        for be in preferred_backends:
+            cap = cv.VideoCapture(index, be)
+            if cap is not None and cap.isOpened():
+                print(f"[INFO] Opened {label} index={index} backend={be}")
+                return cap
+            if cap:
+                cap.release()
+        print(f"[ERROR] {label} (index {index}) をオープンできません。")
+        return last_cap
+
+    cam0_index = calibration_settings[camera0_name]
+    cam1_index = calibration_settings[camera1_name]
+    cap0 = _open_cam(cam0_index, camera0_name)
+    cap1 = _open_cam(cam1_index, camera1_name)
+    if cap0 is None or not cap0.isOpened() or cap1 is None or not cap1.isOpened():
+        raise RuntimeError("カメラオープン失敗。インデックス/他アプリ占有/USB 接続を確認してください。")
+
+    # Warm-up: discard initial unstable frames
+    for _ in range(10):
+        cap0.read(); cap1.read()
 
     # set camera resolutions
     width = calibration_settings["frame_width"]
@@ -293,12 +315,29 @@ def save_frames_two_cams(camera0_name, camera1_name):
     saved_count = 0
     while True:
 
-        ret0, frame0 = cap0.read()
-        ret1, frame1 = cap1.read()
-
-        if not ret0 or not ret1:
-            print("Cameras not returning video data. Exiting...")
-            quit()
+        ret0, frame0 = cap0.read(); ret1, frame1 = cap1.read()
+        if not ret0 or frame0 is None:
+            print(f"[WARN] {camera0_name} からフレーム取得失敗。再試行します。")
+            fail_retry = 0
+            recovered = False
+            while fail_retry < 5 and not recovered:
+                fail_retry += 1
+                ret0, frame0 = cap0.read()
+                if ret0 and frame0 is not None:
+                    recovered = True
+            if not recovered:
+                raise RuntimeError(f"{camera0_name} が継続的にフレームを返しません。ケーブル/インデックス/他プロセス確認。")
+        if not ret1 or frame1 is None:
+            print(f"[WARN] {camera1_name} からフレーム取得失敗。再試行します。")
+            fail_retry = 0
+            recovered = False
+            while fail_retry < 5 and not recovered:
+                fail_retry += 1
+                ret1, frame1 = cap1.read()
+                if ret1 and frame1 is not None:
+                    recovered = True
+            if not recovered:
+                raise RuntimeError(f"{camera1_name} が継続的にフレームを返しません。ケーブル/インデックス/他プロセス確認。")
 
         frame0_small = cv.resize(
             frame0, None, fx=1.0 / view_resize, fy=1.0 / view_resize
@@ -517,9 +556,33 @@ def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c
         "criteria": [3, 100, 0.001],
     }
 
-    R, T, ret, dist0, dist1 = invoke(data, Test_mode=False)
+    try:
+        R, T, ret, dist0, dist1 = invoke(data, Test_mode=False)
+        print("rmse (remote): ", ret)
+        RMSE = ret
+        cv.destroyAllWindows()
+        return R, T, RMSE
+    except (NoCredentialsError, BotoCoreError) as e:
+        print(f"[WARN] Remote invoke 失敗 (認証/接続): {e}. OpenCV stereoCalibrate にフォールバックします。")
+    except Exception as e:  # noqa: E722
+        print(f"[WARN] Remote invoke 失敗: {e}. OpenCV stereoCalibrate にフォールバックします。")
 
-    print("rmse: ", ret)
+    # ---- ローカルフォールバック ----
+    flags = cv.CALIB_FIX_INTRINSIC
+    # OpenCV stereoCalibrate は (R,T,E,F) を返す
+    ret, _, _, _, _, R, T, E, F = cv.stereoCalibrate(
+        objpoints,
+        imgpoints_left,
+        imgpoints_right,
+        mtx0,
+        dist0,
+        mtx1,
+        dist1,
+        (width, height),
+        criteria=criteria,
+        flags=flags,
+    )
+    print("rmse (local):", ret)
     RMSE = ret
     cv.destroyAllWindows()
     return R, T, RMSE
@@ -880,29 +943,121 @@ def enumerate_camera_device_names_windows():
     return cameras
 
 
+def probe_cameras(max_index=10):
+    print(f"[INFO] Probing camera indices 0..{max_index-1}")
+    available = []
+    for i in range(max_index):
+        cap = cv.VideoCapture(i, cv.CAP_DSHOW)
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            print(f"  Index {i}: OK (resolution={frame.shape[1]}x{frame.shape[0]})")
+            available.append(i)
+        else:
+            print(f"  Index {i}: (no frame)")
+        cap.release()
+    if not available:
+        print("[WARN] 取得可能なカメラが見つかりません。USB 接続/他アプリ占有を確認してください。")
+    return available
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Stereo calibration helper")
+    parser.add_argument("legacy_settings", nargs="?", help="(旧形式) 最初の位置引数として設定YAMLパスを指定可能")
+    parser.add_argument("--settings", default="calibration_settings.yaml", help="設定YAMLファイルパス (--settings が優先)")
+    parser.add_argument("--cam-pair", default=None, help="使用するカメラインデックスを '0,2' のように指定。指定時 calibration_settings の camera0/camera1 を上書き")
+    parser.add_argument("--skip-save-frames", action="store_true", help="Step3 のペアフレーム保存をスキップ (既存 frames_pair 利用)")
+    parser.add_argument("--skip-check", action="store_true", help="最終的な check_calibration 表示をスキップ")
+    parser.add_argument("--force-recapture", action="store_true", help="既存 frames_pair ディレクトリを削除して再キャプチャを強制")
+    parser.add_argument("--expected-stereo-frames", type=int, default=None, help="ステレオキャプチャ期待枚数 (calibration_settings.stereo_calibration_frames を上書き)")
+    parser.add_argument("--probe-cams", action="store_true", help="利用可能なカメラインデックスをスキャンして終了")
+    args = parser.parse_args()
 
-    # Open and parse the settings file
-    parse_calibration_settings_file("calibration_settings.yaml")
+    # Determine which settings path to use (CLI precedence: --settings > positional)
+    settings_path = args.settings
+    if args.legacy_settings and args.legacy_settings.strip().lower().endswith(('.yml', '.yaml')):
+        # Only override if user didn't explicitly change --settings
+        if settings_path == 'calibration_settings.yaml':
+            settings_path = args.legacy_settings
+    print(f"[INFO] Using settings file: {settings_path}")
+    parse_calibration_settings_file(settings_path)
 
-    """Step1. Save calibration frames for single cameras"""
-    # save_frames_single_camera("camera0")  # save frames for camera0
-    # save_frames_single_camera("camera1")  # save frames for camera1
+    # Override camera indices if requested
+    if args.cam_pair:
+        try:
+            c0_idx, c1_idx = [int(s) for s in args.cam_pair.split(',')]
+            calibration_settings['camera0'] = c0_idx
+            calibration_settings['camera1'] = c1_idx
+            print(f"[INFO] Overridden camera indices -> camera0={c0_idx}, camera1={c1_idx}")
+        except ValueError:
+            print("[WARN] --cam-pair の形式が不正です。例: --cam-pair 0,2")
 
-    """Step2. Obtain camera intrinsic matrices and save them"""
-    # camera0 intrinsics
-    # images_prefix = os.path.join("frames", "camera0*")
-    # cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix)
-    # save_camera_intrinsics(cmtx0, dist0, "c0")  # this will write cmtx and dist to disk
-    # camera1 intrinsics
-    # images_prefix = os.path.join("frames", "camera1*")
-    # cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
-    # save_camera_intrinsics(cmtx1, dist1, "c1")  # this will write cmtx and dist to disk
+    # Expected frames override
+    if args.expected_stereo_frames is not None:
+        calibration_settings['stereo_calibration_frames'] = args.expected_stereo_frames
+        print(f"[INFO] Overridden expected stereo frames -> {args.expected_stereo_frames}")
 
-    """Step3. Save calibration frames for both cameras simultaneously"""
-    save_frames_two_cams("camera0", "camera1")  # save simultaneous frames
+    def _remove_old_frames_pair():
+        import shutil, time
+        target = 'frames_pair'
+        if not os.path.isdir(target):
+            return
+        print('[INFO] Removing old frames_pair directory for fresh capture (--force-recapture)')
+        # Windows でロックされている場合に備えてリトライ + リネームフォールバック
+        for attempt in range(3):
+            try:
+                shutil.rmtree(target)
+                return
+            except PermissionError:
+                print(f'[WARN] 削除ロック (PermissionError) attempt={attempt+1}. 0.5秒待機して再試行します。')
+                time.sleep(0.5)
+        # リネームフォールバック
+        backup_name = f"{target}_old_{int(time.time())}"
+        try:
+            os.rename(target, backup_name)
+            print(f"[INFO] 削除できないため一時リネーム: {backup_name}")
+            # さらにバックグラウンドで削除試行
+            try:
+                shutil.rmtree(backup_name)
+            except PermissionError:
+                print(f"[WARN] 一時フォルダ {backup_name} の削除も失敗。手動で削除してください。")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ERROR] frames_pair の削除/リネームに失敗: {e}. エクスプローラで開かれていないか、画像が他アプリで使用中でないか確認してください。")
 
-    """Step4. Use paired calibration pattern frames to obtain camera0 to camera1 rotation and translation"""
+    def _validate_frames_pair():
+        expected = calibration_settings.get('stereo_calibration_frames', 0)
+        c0_files = sorted(glob.glob(os.path.join('frames_pair', 'camera0*')))
+        c1_files = sorted(glob.glob(os.path.join('frames_pair', 'camera1*')))
+        c0_n = len(c0_files)
+        c1_n = len(c1_files)
+        if c0_n == 0 or c1_n == 0:
+            raise RuntimeError('キャリブレーション用フレームが 0 枚です。環境光/パターン表示/カメラ角度を確認してください。')
+        if c0_n != c1_n:
+            raise RuntimeError(f'左右枚数不一致: left={c0_n}, right={c1_n} / 同期に問題があります。')
+        if expected and c0_n != expected:
+            print(f"[WARN] 期待枚数 {expected} に対し取得 {c0_n} 枚。設定値と異なります。")
+        else:
+            print(f"[INFO] Stereo frame count OK: {c0_n} ペア")
+
+    # Step1 / Step2 (単体キャリブレーション) はコメントのまま（必要時に有効化）
+
+    if args.probe_cams:
+        probe_cameras()
+        raise SystemExit(0)
+
+    # Step3. Save calibration frames for both cameras simultaneously
+    if not args.skip_save_frames:
+        if args.force_recapture:
+            _remove_old_frames_pair()
+        save_frames_two_cams("camera0", "camera1")
+        try:
+            _validate_frames_pair()
+        except Exception as e:  # noqa: BLE001
+            print(f"[ERROR] フレーム検証失敗: {e}")
+            raise
+    else:
+        print("[INFO] Skipping frame capture (using existing frames_pair)")
+
+    # Step4. Stereo calibration
     frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
     frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
     cmtx0, dist0 = load_camera_intrinsics("camera0")
@@ -911,33 +1066,15 @@ if __name__ == "__main__":
         cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
     )
 
-    """Step5. Save calibration data where camera0 defines the world space origin."""
-    # camera0 rotation and translation is identity matrix and zeros vector
+    # Step5. Save extrinsic (camera0 as world)
     R0 = np.eye(3, dtype=np.float32)
     T0 = np.array([0.0, 0.0, 0.0]).reshape((3, 1))
-
-    save_extrinsic_calibration_parameters(
-        R0, T0, R, T
-    )  # this will write R and T to disk
-    R1 = R
-    T1 = T  # to avoid confusion, camera1 R and T are labeled R1 and T1
-    # check your calibration makes sense
+    save_extrinsic_calibration_parameters(R0, T0, R, T)
     camera0_data = [cmtx0, dist0, R0, T0]
-    camera1_data = [cmtx1, dist1, R1, T1]
-    check_calibration(
-        "camera0", camera0_data, "camera1", camera1_data, RMSE, _zshift=60.0
-    )
-
-    """Optional. Define a different origin point and save the calibration data"""
-    # #get the world to camera0 rotation and translation
-    # R_W0, T_W0 = get_world_space_origin(cmtx0, dist0, os.path.join('frames_pair', 'camera0_4.png'))
-    # #get rotation and translation from world directly to camera1
-    # R_W1, T_W1 = get_cam1_to_world_transforms(cmtx0, dist0, R_W0, T_W0,
-    #                                           cmtx1, dist1, R1, T1,
-    #                                           os.path.join('frames_pair', 'camera0_4.png'),
-    #                                           os.path.join('frames_pair', 'camera1_4.png'),)
-
-    # #save rotation and translation parameters to disk
-    # save_extrinsic_calibration_parameters(R_W0, T_W0, R_W1, T_W1, prefix = 'world_to_') #this will write R and T to disk
+    camera1_data = [cmtx1, dist1, R, T]
+    if not args.skip_check:
+        check_calibration("camera0", camera0_data, "camera1", camera1_data, RMSE, _zshift=60.0)
+    else:
+        print("[INFO] Skipping visual check")
 
 # %%

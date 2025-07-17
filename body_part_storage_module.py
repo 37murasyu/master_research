@@ -1,4 +1,5 @@
 import numpy as np
+from collections import defaultdict
 
 
 class BodyPartDataStorage:
@@ -13,16 +14,7 @@ class BodyPartDataStorage:
 
     def __init__(self):
         self.storage = {}  # 部位ごとのデータを格納する辞書
-        self.torques = {
-            "wrist_R": [],
-            "wrist_L": [],
-            "elbow_R": [],
-            "elbow_L": [],
-            "core": [],
-            "hip": [],
-            "shoulder_R": [],
-            "shoulder_L": [],
-        }
+        self.torques = defaultdict(list)
         """
         BodyPartDataStorage のインスタンスを初期化する。
         各部位のデータは `storage` 属性の辞書に格納される。
@@ -51,14 +43,10 @@ class BodyPartDataStorage:
         :param dot_omega: 角加速度ベクトル
         :param dot_dot_pg: 加速度ベクトル (位置ベクトルの2階微分)
         """
-        # 部位名をキーとして、関連データをリストで格納
-        if part_name not in self.storage:
-            self.storage[part_name] = []
-        if dot_omega is None:
-            dot_omega = np.zeros(3)
-        if dot_dot_pg is None:
-            dot_dot_pg = np.zeros(3)
-        self.storage[part_name].append(
+        s = self.storage.setdefault(part_name, [])
+        dot_omega = np.zeros(3) if dot_omega is None else dot_omega
+        dot_dot_pg = np.zeros(3) if dot_dot_pg is None else dot_dot_pg
+        s.append(
             {
                 "part_name": str(part_name),
                 "relative_position_vector": relative_position_vector,
@@ -73,8 +61,6 @@ class BodyPartDataStorage:
         )
 
     def add_torque(self, part_name: str, torque: np.ndarray):
-        if part_name not in self.torques:
-            self.torques[part_name] = []
         self.torques[part_name].append(torque)
 
     def get_data(self, part_name):

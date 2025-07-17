@@ -1,0 +1,10 @@
+^C:\USERS\VILLA\DESKTOP\MASTER_RESEARCH\MAINCODE\NATIVE_POSE\BUILD\CMAKEFILES\81E644610650FDC5C694F4615CDAEB3B\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/villa/Desktop/master_Research/MAINCODE/native_pose -BC:/Users/villa/Desktop/master_Research/MAINCODE/native_pose/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/villa/Desktop/master_Research/MAINCODE/native_pose/build/native_pose.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

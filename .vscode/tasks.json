@@ -1,0 +1,37 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build overlay.dll (MSBuild)",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}/native_overlay/build_msbuild.ps1",
+				"-Configuration",
+				"Release"
+			],
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Detect joint11 Y cycles (test)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"detect_cycles_joint11y_threshold.py",
+				"--csv",
+				"output_data/poses/stereo_9_20250925_201442_pose_filt2_only_f_with_cycles.csv",
+				"--unit",
+				"cm",
+				"--out-png",
+				"joint11y_cycles_threshold.png"
+			],
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}
