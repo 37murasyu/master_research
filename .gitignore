@@ -17,3 +17,7 @@ output_data/**/*.csv
 *.mkv
 *.webm
 *.flv
+
+*.csv
+*.npy
+*.json
