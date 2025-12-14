@@ -28,6 +28,18 @@ calibration_settings = {}
 skip_manual_confirmation = True
 
 
+def _intrinsic_file_key(camera_name):
+    if camera_name == "camera0":
+        return "c0"
+    if camera_name == "camera1":
+        return "c1"
+    return camera_name
+
+
+def _get_setting(key, default=None):
+    return calibration_settings.get(key, default)
+
+
 # Given Projection matrices P1 and P2, and pixel coordinates point1 and point2, return triangulated 3D point.
 def DLT(P1, P2, point1, point2):
 
@@ -169,6 +181,8 @@ def calibrate_camera_for_intrinsic_parameters(images_prefix):
 
     # read all frames
     images = [cv.imread(imname, 1) for imname in images_names]
+    if not images:
+        raise RuntimeError(f"No images found for intrinsic calibration (prefix={images_prefix}).")
 
     # criteria used by checkerboard pattern detector.
     # Change this if the code can't find the checkerboard.
@@ -251,7 +265,8 @@ def save_camera_intrinsics(camera_matrix, distortion_coefs, camera_name):
     if not os.path.exists("camera_parameters"):
         os.mkdir("camera_parameters")
 
-    out_filename = os.path.join("camera_parameters", camera_name + ".dat")
+    file_key = _intrinsic_file_key(camera_name)
+    out_filename = os.path.join("camera_parameters", file_key + ".dat")
     outf = open(out_filename, "w")
 
     outf.write("intrinsic:\n")
@@ -366,6 +381,15 @@ def save_frames_two_cams(camera0_name, camera1_name):
                 20,
             )
 
+            frame1_small = putText_jp(
+                frame1_small,
+                "撮影中には体を動かしたり、小物をもってください",
+                (50, 150),
+                24,
+                (0, 0, 255),
+                20,
+            )
+
         if start:
 
             # 現在の時間を計算
@@ -461,8 +485,102 @@ def save_frames_two_cams(camera0_name, camera1_name):
     cv.destroyAllWindows()
 
 
+# ---- Feature-based extrinsic estimation (checkerboard不要) ----
+
+def _create_feature_detector(name="orb", nfeatures=None):
+    name = (name or "orb").lower()
+    if name == "sift":
+        if hasattr(cv, "SIFT_create"):
+            return cv.SIFT_create()
+        print("[WARN] SIFT unavailable. Falling back to ORB.")
+    return cv.ORB_create(nfeatures or 2000)
+
+
+def _match_descriptors(desc1, desc2, use_lowe=True, ratio=0.75):
+    if desc1 is None or desc2 is None:
+        return []
+    is_float = desc1.dtype == np.float32 or desc1.dtype == np.float64
+    if is_float:
+        index_params = dict(algorithm=1, trees=5)  # FLANN KDTree
+        search_params = dict(checks=32)
+        matcher = cv.FlannBasedMatcher(index_params, search_params)
+    else:
+        matcher = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=not use_lowe)
+    if use_lowe:
+        knn = matcher.knnMatch(desc1, desc2, k=2)
+        good = []
+        for m, n in knn:
+            if m.distance < ratio * n.distance:
+                good.append(m)
+        return good
+    return matcher.match(desc1, desc2)
+
+
+def _epipolar_rmse(F, pts1, pts2):
+    if F is None or len(pts1) == 0:
+        return float("inf")
+    pts1_h = cv.convertPointsToHomogeneous(pts1).reshape(-1, 3)
+    pts2_h = cv.convertPointsToHomogeneous(pts2).reshape(-1, 3)
+    Fx1 = (F @ pts1_h.T).T
+    Ftx2 = (F.T @ pts2_h.T).T
+    denom = Fx1[:, 0] ** 2 + Fx1[:, 1] ** 2 + Ftx2[:, 0] ** 2 + Ftx2[:, 1] ** 2
+    num = np.abs(np.sum(pts2_h * (F @ pts1_h.T).T, axis=1))
+    d = num / np.sqrt(denom + 1e-12)
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def _estimate_extrinsic_feature(imgL, imgR, K0, D0, K1, D1, *, detector="orb", ratio=0.75, ransac_thresh=1.0, baseline_m=None, nfeatures=None):
+    grayL = cv.cvtColor(imgL, cv.COLOR_BGR2GRAY)
+    grayR = cv.cvtColor(imgR, cv.COLOR_BGR2GRAY)
+
+    det = _create_feature_detector(detector, nfeatures=nfeatures)
+    kp1, des1 = det.detectAndCompute(grayL, None)
+    kp2, des2 = det.detectAndCompute(grayR, None)
+    matches = _match_descriptors(des1, des2, use_lowe=True, ratio=ratio)
+    matches = sorted(matches, key=lambda m: m.distance)
+    if len(matches) < 8:
+        raise RuntimeError(f"特徴対応が不足しています: {len(matches)} < 8")
+
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    # 歪みを補正した座標に変換（正規化座標に近づける）
+    pts1_ud = cv.undistortPoints(pts1, K0, D0)
+    pts2_ud = cv.undistortPoints(pts2, K1, D1)
+    pts1_ud = pts1_ud.reshape(-1, 2)
+    pts2_ud = pts2_ud.reshape(-1, 2)
+
+    # Fundamental を推定してから Essential を構成（Kが異なる場合に安全）
+    F, maskF = cv.findFundamentalMat(pts1, pts2, cv.FM_RANSAC, ransac_thresh, 0.999)
+    if F is None or maskF is None:
+        raise RuntimeError("Fundamental 行列の推定に失敗しました")
+    inlier_mask = maskF.ravel() == 1
+    pts1_in = pts1[inlier_mask]
+    pts2_in = pts2[inlier_mask]
+    if len(pts1_in) < 8:
+        raise RuntimeError(f"インライア不足: {len(pts1_in)} < 8")
+
+    E = K1.T @ F @ K0
+    retval, R, t, pose_mask = cv.recoverPose(E, pts1_in, pts2_in, K0, K1)
+
+    # スケールは recoverPose 内部で正規化される。指定があれば基線長でスケーリング。
+    t_unit = t / (np.linalg.norm(t) + 1e-12)
+    if baseline_m is not None:
+        t = t_unit * float(baseline_m)
+    else:
+        t = t_unit
+
+    rmse = _epipolar_rmse(F, pts1_in.reshape(-1, 2), pts2_in.reshape(-1, 2))
+    meta = {
+        "matches": len(matches),
+        "inliers": int(np.sum(inlier_mask)),
+        "recover_inliers": int(pose_mask.sum()) if pose_mask is not None else None,
+    }
+    return R, t, rmse, meta
+
+
 # open paired calibration frames and stereo calibrate for cam0 to cam1 coorindate transformations
-def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c1):
+def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c1, *, extrinsic_mode="checkerboard", feature_params=None, baseline_m=None):
     # read the synched frames
     c0_images_names = sorted(glob.glob(frames_prefix_c0))
     c1_images_names = sorted(glob.glob(frames_prefix_c1))
@@ -471,6 +589,44 @@ def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c
     c0_images = [cv.imread(imname, 1) for imname in c0_images_names]
     c1_images = [cv.imread(imname, 1) for imname in c1_images_names]
 
+    # frame dimensions. Frames should be the same size.
+    width = c0_images[0].shape[1]
+    height = c0_images[0].shape[0]
+
+    if extrinsic_mode == "feature":
+        params = feature_params or {}
+        detector = params.get("detector", "orb")
+        ratio = float(params.get("ratio", 0.75))
+        ransac_thresh = float(params.get("ransac_thresh", 1.0))
+        nfeatures = params.get("nfeatures")
+        per_pair_results = []
+        for f0, f1 in zip(c0_images, c1_images):
+            try:
+                R, T, rmse, meta = _estimate_extrinsic_feature(
+                    f0,
+                    f1,
+                    mtx0,
+                    dist0,
+                    mtx1,
+                    dist1,
+                    detector=detector,
+                    ratio=ratio,
+                    ransac_thresh=ransac_thresh,
+                    baseline_m=baseline_m,
+                    nfeatures=nfeatures,
+                )
+                per_pair_results.append((R, T, rmse, meta))
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] feature 外部推定失敗: {e}")
+        if not per_pair_results:
+            raise RuntimeError("feature ベース外部推定が全ペアで失敗しました")
+        # 最良RMSEのペアを採用（簡易集約）
+        per_pair_results.sort(key=lambda x: x[2])
+        best_R, best_T, best_rmse, meta = per_pair_results[0]
+        print(f"[INFO] feature外部推定: matches={meta['matches']} inliers={meta['inliers']} rmse={best_rmse:.4f}")
+        return best_R, best_T, best_rmse
+
+    # ---- Checkerboard (従来) ----
     # change this if stereo calibration not good.
     criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 100, 0.001)
 
@@ -483,10 +639,6 @@ def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c
     objp = np.zeros((rows * columns, 3), np.float32)
     objp[:, :2] = np.mgrid[0:rows, 0:columns].T.reshape(-1, 2)
     objp = world_scaling * objp
-
-    # frame dimensions. Frames should be the same size.
-    width = c0_images[0].shape[1]
-    height = c0_images[0].shape[0]
 
     # Pixel coordinates of checkerboards
     imgpoints_left = []  # 2d points in image plane.
@@ -893,12 +1045,13 @@ def is_camera_calibrated(mapping, label, current_device_name):
     )
 
 
+def _intrinsic_path(camera_name):
+    file_key = _intrinsic_file_key(camera_name)
+    return os.path.join("camera_parameters", f"{file_key}.dat")
+
+
 def load_camera_intrinsics(camera_name):
-    if camera_name == "camera0":
-        camera_name = "c0"
-    elif camera_name == "camera1":
-        camera_name = "c1"
-    path = os.path.join("camera_parameters", f"{camera_name}.dat")
+    path = _intrinsic_path(camera_name)
     with open(path, "r") as f:
         lines = f.readlines()
     camera_matrix, distortion = [], []
@@ -970,6 +1123,15 @@ if __name__ == "__main__":
     parser.add_argument("--force-recapture", action="store_true", help="既存 frames_pair ディレクトリを削除して再キャプチャを強制")
     parser.add_argument("--expected-stereo-frames", type=int, default=None, help="ステレオキャプチャ期待枚数 (calibration_settings.stereo_calibration_frames を上書き)")
     parser.add_argument("--probe-cams", action="store_true", help="利用可能なカメラインデックスをスキャンして終了")
+    parser.add_argument("--run-intrinsics", action="store_true", help="camera0/camera1 の内部パラメータ推定も実行 (既存データがない場合は自動で実行)")
+    parser.add_argument("--skip-mono-capture", action="store_true", help="単体キャリブレーションの撮影をスキップし既存 frames ディレクトリを利用")
+    parser.add_argument("--force-mono-recapture", action="store_true", help="単体キャリブレーション用 frames ディレクトリを削除して再撮影")
+    parser.add_argument("--extrinsic-mode", choices=["checkerboard", "feature"], default=None, help="外部推定モード: checkerboard または feature (自然特徴)")
+    parser.add_argument("--feature-detector", choices=["orb", "sift"], default=None, help="feature モード時の特徴量 (デフォルト orb)")
+    parser.add_argument("--feature-ratio", type=float, default=None, help="Lowe ratio (feature) デフォルト 0.75")
+    parser.add_argument("--feature-ransac-thresh", type=float, default=None, help="findFundamentalMat の RANSAC しきい値(px) デフォルト 1.0")
+    parser.add_argument("--baseline-m", type=float, default=None, help="ベースライン長[m] を指定すると t をスケーリング")
+    parser.add_argument("--feature-nfeatures", type=int, default=None, help="ORB の特徴点数上限 (デフォルト 2000)")
     args = parser.parse_args()
 
     # Determine which settings path to use (CLI precedence: --settings > positional)
@@ -995,6 +1157,23 @@ if __name__ == "__main__":
     if args.expected_stereo_frames is not None:
         calibration_settings['stereo_calibration_frames'] = args.expected_stereo_frames
         print(f"[INFO] Overridden expected stereo frames -> {args.expected_stereo_frames}")
+
+    # Extrinsic mode / feature params
+    extrinsic_mode = args.extrinsic_mode or calibration_settings.get('extrinsic_mode', 'checkerboard')
+    feature_params = {
+        'detector': args.feature_detector or calibration_settings.get('feature_detector', 'orb'),
+        'ratio': args.feature_ratio or calibration_settings.get('feature_ratio', 0.75),
+        'ransac_thresh': args.feature_ransac_thresh or calibration_settings.get('feature_ransac_thresh', 1.0),
+        'nfeatures': args.feature_nfeatures or calibration_settings.get('feature_nfeatures', None),
+    }
+    print(f"[INFO] Extrinsic mode: {extrinsic_mode}")
+
+    intrinsic_results = {}
+
+    def _intrinsics_exist():
+        return os.path.exists(_intrinsic_path("camera0")) and os.path.exists(
+            _intrinsic_path("camera1")
+        )
 
     def _remove_old_frames_pair():
         import shutil, time
@@ -1023,6 +1202,30 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001
             print(f"[ERROR] frames_pair の削除/リネームに失敗: {e}. エクスプローラで開かれていないか、画像が他アプリで使用中でないか確認してください。")
 
+    def _remove_old_frames_single():
+        import shutil, time
+        target = 'frames'
+        if not os.path.isdir(target):
+            return
+        print('[INFO] Removing old frames directory for fresh single-camera capture (--force-mono-recapture)')
+        for attempt in range(3):
+            try:
+                shutil.rmtree(target)
+                return
+            except PermissionError:
+                print(f'[WARN] 削除ロック (PermissionError) attempt={attempt+1}. 0.5秒待機して再試行します。')
+                time.sleep(0.5)
+        backup_name = f"{target}_old_{int(time.time())}"
+        try:
+            os.rename(target, backup_name)
+            print(f"[INFO] 削除できないため一時リネーム: {backup_name}")
+            try:
+                shutil.rmtree(backup_name)
+            except PermissionError:
+                print(f"[WARN] 一時フォルダ {backup_name} の削除も失敗。手動で削除してください。")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ERROR] frames ディレクトリの削除/リネームに失敗: {e}.")
+
     def _validate_frames_pair():
         expected = calibration_settings.get('stereo_calibration_frames', 0)
         c0_files = sorted(glob.glob(os.path.join('frames_pair', 'camera0*')))
@@ -1044,6 +1247,30 @@ if __name__ == "__main__":
         probe_cameras()
         raise SystemExit(0)
 
+    need_intrinsics = args.run_intrinsics or not _intrinsics_exist()
+    if need_intrinsics:
+        if not args.run_intrinsics:
+            print('[INFO] 既存の内部パラメータが見つからないため自動で推定します (--run-intrinsics 指定不要)')
+        if args.force_mono_recapture:
+            _remove_old_frames_single()
+        mono_prefix_c0 = os.path.join('frames', 'camera0_*.png')
+        mono_prefix_c1 = os.path.join('frames', 'camera1_*.png')
+        if args.skip_mono_capture:
+            print('[INFO] Skipping single-camera capture (using existing frames directory)')
+            if not glob.glob(mono_prefix_c0) or not glob.glob(mono_prefix_c1):
+                raise RuntimeError('単体キャリブレーション用の画像が見つかりません。--skip-mono-capture を外すか、frames ディレクトリに画像を用意してください。')
+        else:
+            save_frames_single_camera('camera0')
+            save_frames_single_camera('camera1')
+        cmtx0_mono, dist0_mono = calibrate_camera_for_intrinsic_parameters(mono_prefix_c0)
+        save_camera_intrinsics(cmtx0_mono, dist0_mono, 'camera0')
+        intrinsic_results['camera0'] = (cmtx0_mono, dist0_mono)
+        cmtx1_mono, dist1_mono = calibrate_camera_for_intrinsic_parameters(mono_prefix_c1)
+        save_camera_intrinsics(cmtx1_mono, dist1_mono, 'camera1')
+        intrinsic_results['camera1'] = (cmtx1_mono, dist1_mono)
+    else:
+        print('[INFO] 内部パラメータが既に存在するためスキップします (--run-intrinsics で再推定可能)')
+
     # Step3. Save calibration frames for both cameras simultaneously
     if not args.skip_save_frames:
         if args.force_recapture:
@@ -1060,10 +1287,24 @@ if __name__ == "__main__":
     # Step4. Stereo calibration
     frames_prefix_c0 = os.path.join("frames_pair", "camera0*")
     frames_prefix_c1 = os.path.join("frames_pair", "camera1*")
-    cmtx0, dist0 = load_camera_intrinsics("camera0")
-    cmtx1, dist1 = load_camera_intrinsics("camera1")
+    if 'camera0' in intrinsic_results:
+        cmtx0, dist0 = intrinsic_results['camera0']
+    else:
+        cmtx0, dist0 = load_camera_intrinsics("camera0")
+    if 'camera1' in intrinsic_results:
+        cmtx1, dist1 = intrinsic_results['camera1']
+    else:
+        cmtx1, dist1 = load_camera_intrinsics("camera1")
     R, T, RMSE = stereo_calibrate(
-        cmtx0, dist0, cmtx1, dist1, frames_prefix_c0, frames_prefix_c1
+        cmtx0,
+        dist0,
+        cmtx1,
+        dist1,
+        frames_prefix_c0,
+        frames_prefix_c1,
+        extrinsic_mode=extrinsic_mode,
+        feature_params=feature_params,
+        baseline_m=args.baseline_m,
     )
 
     # Step5. Save extrinsic (camera0 as world)

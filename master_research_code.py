@@ -20,6 +20,14 @@ import numpy as np
 import pandas as pd
 import csv
 import json
+from pose_runtime import PoseEstimator
+from logging_setup import setup_logging, get_logger
+from video_io import (
+    resolve_input_streams,
+    open_capture_and_read_first,
+    find_recording_pairs,
+)
+from energy_pipeline import angle_between
 
 from body_part_storage_module import BodyPartDataStorage
 from config import (
@@ -91,6 +99,10 @@ try:
     _SCIPY_OK = True
 except Exception:
     _SCIPY_OK = False
+
+# ===================== ロギング初期化 =====================
+_root_logger = setup_logging()
+logger = get_logger(__name__)
 
 # ===================== サイクルE（ゲージ用）フィルタパイプライン設定 =====================
 # 5 Hz 前提: fc は 1.0〜1.5 Hz 推奨。env で微調整可。
@@ -215,7 +227,7 @@ if not os.path.exists(POSE_TASK_MODEL):
             _candidates.sort(key=lambda p: (0 if 'pose' in os.path.basename(p).lower() else 1, len(os.path.basename(p))))
             POSE_TASK_MODEL = _candidates[0]
             if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                print(f"[Pose] Auto-detected model: {POSE_TASK_MODEL}")
+                logger.debug("[Pose] Auto-detected model: %s", POSE_TASK_MODEL)
     except Exception:
         pass
 def _detect_threads(default: int = 8) -> int:
@@ -265,10 +277,10 @@ if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
         _cv_threads = cv.getNumThreads() if hasattr(cv, 'getNumThreads') else None
     except Exception:
         _cv_cpus = _cv_threads = None
-    print(f"[CPU] MP_THREADS={MP_THREADS}  physical={_phy}  logical={_log}  os.cpu_count()={os.cpu_count()}")
-    print(f"[CPU] OpenCV: numCPUs={_cv_cpus}  numThreads={_cv_threads}")
-    print(f"[Pose] USE_POSE_LANDMARKER={USE_POSE_LANDMARKER}  model={POSE_TASK_MODEL}  exists={os.path.exists(POSE_TASK_MODEL)}")
-    print(f"[Pose] MP_INPUT_SCALE={MP_INPUT_SCALE}")
+    logger.debug("[CPU] MP_THREADS=%s  physical=%s  logical=%s  os.cpu_count()=%s", MP_THREADS, _phy, _log, os.cpu_count())
+    logger.debug("[CPU] OpenCV: numCPUs=%s  numThreads=%s", _cv_cpus, _cv_threads)
+    logger.debug("[Pose] USE_POSE_LANDMARKER=%s  model=%s  exists=%s", USE_POSE_LANDMARKER, POSE_TASK_MODEL, os.path.exists(POSE_TASK_MODEL))
+    logger.debug("[Pose] MP_INPUT_SCALE=%s", MP_INPUT_SCALE)
     # 任意: OpenCV スレッド数を明示設定（OPENCV_THREADS）
     _ocv_thr_env = os.getenv('OPENCV_THREADS', '').strip()
     if _ocv_thr_env:
@@ -276,196 +288,17 @@ if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
             _ocv_thr = max(1, int(_ocv_thr_env))
             if hasattr(cv, 'setNumThreads'):
                 cv.setNumThreads(_ocv_thr)
-                print(f"[CPU] OpenCV setNumThreads -> {cv.getNumThreads() if hasattr(cv, 'getNumThreads') else _ocv_thr}")
+                logger.debug("[CPU] OpenCV setNumThreads -> %s", (cv.getNumThreads() if hasattr(cv, 'getNumThreads') else _ocv_thr))
         except Exception as _e:
-            print(f"[CPU] OpenCV setNumThreads failed: {_e}")
+            logger.debug("[CPU] OpenCV setNumThreads failed: %s", _e)
 
 def _tasks_imports():
+    # moved to pose_runtime.PoseEstimator. Kept as a placeholder for backward compat if referenced elsewhere.
     try:
-        # 互換性のため段階的に import を試す
-        from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions  # type: ignore
-        try:
-            from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode  # type: ignore
-        except Exception:
-            # 古いAPI名
-            from mediapipe.tasks.python.vision import VisionRunningMode as VisionTaskRunningMode  # type: ignore
-        from mediapipe.tasks.python.core.base_options import BaseOptions  # type: ignore
-        return PoseLandmarker, PoseLandmarkerOptions, VisionTaskRunningMode, BaseOptions
-    except Exception as _e:
-        if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-            print(f"[Pose] Tasks API import failed: {_e}")
+        from pose_runtime import _tasks_imports as _imp  # type: ignore
+        return _imp()
+    except Exception:
         return None, None, None, None
-
-class _LM:
-    __slots__ = ('x','y','z','visibility')
-    def __init__(self, x=0.0, y=0.0, z=0.0, visibility=0.0):
-        self.x = float(x); self.y = float(y); self.z = float(z); self.visibility = float(visibility)
-
-class _NLList:
-    __slots__ = ('landmark',)
-    def __init__(self, landmark_list):
-        self.landmark = landmark_list
-
-class _PoseResult:
-    __slots__ = ('pose_landmarks',)
-    def __init__(self, lm_list_or_none):
-        # Solutions互換: None または _NLList
-        self.pose_landmarks = lm_list_or_none
-
-class PoseEstimator:
-    def __init__(self, use_tasks: bool, model_path: str, min_det: float = 0.5, min_track: float = 0.5, num_threads: int | None = None):
-        self._mode = 'solutions'
-        self._pose = None
-        self._landmarker = None
-        # ネイティブ優先（指定時・DLL有効時）
-        self._native = None
-        if USE_NATIVE_POSE and (_native_pose is not None):
-            try:
-                self._native = _native_pose.NativePoseEstimator(model_path, num_threads=num_threads or MP_THREADS)
-                self._mode = 'native'
-                if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                    print("[Pose] Using NativePoseEstimator (DLL)")
-            except Exception as _ne:
-                if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                    print(f"[Pose] Native pose not available -> { _ne }")
-        if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-            print(f"[Pose] init: use_tasks={use_tasks} model_path={model_path} exists={os.path.exists(model_path)}")
-
-        # Tasks API を試す（ネイティブが無効の場合）
-        if (self._mode != 'native') and use_tasks and os.path.exists(model_path):
-            PL, PLOpt, VRM, BO = _tasks_imports()
-            if PL and PLOpt and VRM and BO:
-                # XNNPACK スレッド設定（Tasks API BaseOptions）
-                nt = int(num_threads) if num_threads and num_threads > 0 else MP_THREADS
-                base = None
-                try:
-                    base = BO(model_asset_path=model_path, num_threads=nt)
-                except TypeError as _te:
-                    # 古い MediaPipe では BaseOptions に num_threads が無い
-                    if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                        print(f"[Pose] BaseOptions num_threads unsupported -> retry without it: {_te}")
-                    base = BO(model_asset_path=model_path)
-                    nt = None  # 表示用（未設定）
-                except Exception as _pe:
-                    if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                        print(f"[Pose] BaseOptions init failed: {_pe}")
-                    base = None
-                if base is not None:
-                    try:
-                        opts = PLOpt(base_options=base, running_mode=VRM.IMAGE, num_poses=1)
-                        # 環境変数からTasksの閾値を反映（あれば）
-                        try:
-                            _t_min_det = float(os.getenv('POSE_TASK_MIN_DET', os.getenv('POSE_MIN_DET', '0.5')))
-                        except Exception:
-                            _t_min_det = 0.5
-                        try:
-                            _t_min_track = float(os.getenv('POSE_TASK_MIN_TRACK', os.getenv('POSE_MIN_TRACK', '0.5')))
-                        except Exception:
-                            _t_min_track = 0.5
-                        try:
-                            _t_min_presence = float(os.getenv('POSE_TASK_MIN_PRESENCE', '0.5'))
-                        except Exception:
-                            _t_min_presence = 0.5
-                        # オプションに存在する項目のみ設定（互換維持）
-                        try:
-                            if hasattr(opts, 'min_pose_detection_confidence'):
-                                setattr(opts, 'min_pose_detection_confidence', _t_min_det)
-                            if hasattr(opts, 'min_tracking_confidence'):
-                                setattr(opts, 'min_tracking_confidence', _t_min_track)
-                            if hasattr(opts, 'min_pose_presence_confidence'):
-                                setattr(opts, 'min_pose_presence_confidence', _t_min_presence)
-                            if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                                print(f"[Pose] Tasks thresholds: det={_t_min_det} track={_t_min_track} presence={_t_min_presence}")
-                        except Exception as _te2:
-                            if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                                print(f"[Pose] Tasks threshold apply failed (ignored): {_te2}")
-                        self._landmarker = PL.create_from_options(opts)
-                        self._mode = 'tasks'
-                        if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                            th_str = str(nt) if nt is not None else 'n/a'
-                            print(f"[Pose] Using Tasks PoseLandmarker (threads={th_str}, model={model_path})")
-                    except Exception as _pe:
-                        if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                            print(f"[Pose] Tasks create_from_options failed: {_pe}")
-                        # 後段で Solutions へ
-            else:
-                if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                    print("[Pose] Mediapipe Tasks API not available -> using Solutions Pose")
-        else:
-            if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                reason = []
-                if self._mode == 'native':
-                    reason.append('native DLL active')
-                if not use_tasks:
-                    reason.append('USE_POSE_LANDMARKER=0')
-                if not os.path.exists(model_path):
-                    reason.append('model not found')
-                print(f"[Pose] Not using Tasks: {'; '.join(reason) if reason else 'unknown reason'}")
-
-        if (self._mode != 'tasks') and (self._mode != 'native'):
-            # 従来の Solutions Pose
-            self._pose = mp.solutions.pose.Pose(min_detection_confidence=min_det, min_tracking_confidence=min_track)
-            if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
-                print("[Pose] Using Solutions Pose")
-
-    def process(self, frame_rgb: np.ndarray):
-        if self._mode == 'native' and self._native is not None:
-            try:
-                return self._native.process(frame_rgb)
-            except Exception as _pe:
-                if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                    print(f"[Pose] native detect failed -> fallback: {_pe}")
-                # ネイティブ失敗時は後段へ
-        if self._mode == 'tasks' and self._landmarker is not None:
-            try:
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-                res = self._landmarker.detect(mp_image)
-                # デバッグ: Tasksの検出数を表示
-                if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                    try:
-                        _cnt = len(res.pose_landmarks) if res and getattr(res, 'pose_landmarks', None) is not None else 0
-                        print(f"[Pose] Tasks result: count={_cnt}")
-                    except Exception:
-                        pass
-                if res and getattr(res, 'pose_landmarks', None) and len(res.pose_landmarks) > 0:
-                    # 先頭人物のみ採用
-                    pts = res.pose_landmarks[0]
-                    lm_list = [_LM(x=p.x, y=p.y, z=getattr(p, 'z', 0.0), visibility=getattr(p, 'visibility', 0.0)) for p in pts]
-                    return _PoseResult(_NLList(lm_list))
-                return _PoseResult(None)
-            except Exception as _pe:
-                # 失敗時は空検出にする（ループ継続優先）
-                if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                    print(f"[Pose] detect failed: {_pe} -> fallback to Solutions this frame")
-                # 遅延フォールバック: Solutions を作成して処理
-                if self._pose is None:
-                    try:
-                        self._pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-                        self._mode = 'solutions'
-                    except Exception:
-                        return _PoseResult(None)
-                # Solutions にフォールバック実行
-                sol_res = self._pose.process(frame_rgb)  # type: ignore
-                # ここでは frame_rgb は縮小後（mp0/mp1）なので、必要であれば上位で補正してください
-                return sol_res
-        else:
-            # Solutions Pose と互換の results を返す
-            return self._pose.process(frame_rgb)  # type: ignore
-
-    def close(self):
-        try:
-            if self._mode == 'tasks' and self._landmarker is not None:
-                try:
-                    self._landmarker.close()
-                except Exception:
-                    pass
-            elif self._pose is not None:
-                try:
-                    self._pose.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
 # ================= HX711 Recorder (M5StampS3) 連携 追加インポート (オプション) =================
 HX_RECORDER_AVAILABLE = False
@@ -561,7 +394,8 @@ def load_or_create_m_max_part(path: str | None) -> dict:
 # できるだけ既存の引数体系に干渉しないため add_help=False で部分解析
 _ap = argparse.ArgumentParser(add_help=False)
 _ap.add_argument("--subject", "-s", dest="_subject_id", default=None, help="被験者番号 (例: S001)")
-SUBJECT_ID = 8#被験者番号
+_partial_args, _ = _ap.parse_known_args()
+SUBJECT_ID = _partial_args._subject_id or os.getenv("SUBJECT_ID")
 if not SUBJECT_ID:
     try:
         SUBJECT_ID = input("被験者番号を入力してください (例: S001): ").strip()
@@ -1223,139 +1057,15 @@ calculators = {
 }
 print("Calculators created")
 
-print("Video loaded")
-# 入力ストリーム解決ロジック
-
-def _find_latest_recordings(base_dir: str) -> Tuple[str | None, str | None]:
-    """最新の cam0_output_*.mp4 / cam1_output_*.mp4 を探して返す。なければ None。
-    時刻降順で最初のものを採用。
-    """
-    cam0_list = sorted(glob.glob(os.path.join(base_dir, "cam0_output_*.mp4")), reverse=True)
-    cam1_list = sorted(glob.glob(os.path.join(base_dir, "cam1_output_*.mp4")), reverse=True)
-    cam0 = cam0_list[0] if cam0_list else None
-    cam1 = cam1_list[0] if cam1_list else None
-    return cam0, cam1
-
-def _find_recording_pairs(base_dir: str) -> list[tuple[str, str]]:
-    """cam0_output_*.mp4 と cam1_output_*.mp4 の『共通サフィックス』でペアを作り、新しい順に返す。
-    例: cam0_output_0924_084204.mp4 と cam1_output_0924_084204.mp4
-    """
-    cam0_list = glob.glob(os.path.join(base_dir, "cam0_output_*.mp4"))
-    cam1_list = glob.glob(os.path.join(base_dir, "cam1_output_*.mp4"))
-    def suffix(p: str) -> str:
-        return os.path.basename(p).replace("cam0_output_", "").replace("cam1_output_", "")
-    m0 = {suffix(p): p for p in cam0_list}
-    m1 = {suffix(p): p for p in cam1_list}
-    common = sorted(set(m0.keys()) & set(m1.keys()), reverse=True)
-    return [(m0[s], m1[s]) for s in common]
-
-
-def _resolve_input_streams() -> Tuple[object, object, bool, str]:
-    """
-    入力ストリーム1/2 を決定する。
-    優先度: USE_SAMPLE_VIDEOS → 実カメラ → (失敗時) AUTO_FALLBACK_TO_FILES
-    戻り値: (s1, s2, file_mode, reason)
-    """
-    # 1) 強制サンプル
-    if USE_SAMPLE_VIDEOS:
-        if PREFER_RECORDING_PAIRS:
-            # まずは cam0/cam1 の『共通サフィックス』で一致する最新ペアを使用（長さ不一致による早期終了を避ける）
-            pairs = _find_recording_pairs(folder_path)
-            if pairs:
-                cam0_file, cam1_file = pairs[0]
-                return cam0_file, cam1_file, True, "USE_SAMPLE_VIDEOS=1 (pair)"
-        # 既知のメディアサンプルへフォールバック
-        cam0_file = os.path.join(folder_path, "media", "cam000_test.mp4")
-        cam1_file = os.path.join(folder_path, "media", "cam111_test.mp4")
-        print(f"[Info] Using sample videos: {cam0_file}, {cam1_file}")
-        return cam0_file, cam1_file, True, "USE_SAMPLE_VIDEOS=1 (media)"
-
-    # 2) 既定の設定（カメラ 0/1 か、configがパス指定ならそのまま）
-    s1, s2 = input_stream1, input_stream2
-
-    # s1, s2 が整数（カメラID）であれば一旦試す
-    def _try_open(pair: Tuple[object, object]) -> bool:
-        tmp0 = cv.VideoCapture(pair[0])
-        tmp1 = cv.VideoCapture(pair[1])
-        ok = tmp0.isOpened() and tmp1.isOpened()
-        tmp0.release()
-        tmp1.release()
-        return ok
-
-    # 2a) パス指定ならそのまま file_mode=True
-    if not (isinstance(s1, int) and isinstance(s2, int)):
-        return s1, s2, True, "config: file paths"
-
-    # 2b) カメラを試す
-    if _try_open((s1, s2)):
-        return s1, s2, False, "config: cameras 0/1"
-
-    # 3) カメラNGで自動フォールバック
-    if AUTO_FALLBACK_TO_FILES:
-        cam0_file, cam1_file = _find_latest_recordings(folder_path)
-        if cam0_file is None:
-            cam0_file = os.path.join(folder_path, "media", "cam000_test.mp4")
-        if cam1_file is None:
-            cam1_file = os.path.join(folder_path, "media", "cam111_test.mp4")
-        return cam0_file, cam1_file, True, "AUTO_FALLBACK_TO_FILES=1 (camera open failed)"
-
-    # 4) それでもダメなら元の設定のまま（失敗する可能性あり）
-    return s1, s2, not (s1 == 0 and s2 == 1), "no fallback"
-
-
-local_input_stream1, local_input_stream2, file_mode, resolve_reason = _resolve_input_streams()
+logger.info("Video loaded")
+local_input_stream1, local_input_stream2, file_mode, resolve_reason = resolve_input_streams()
 print(f"Input streams resolved: file_mode={file_mode}, reason={resolve_reason}")
 
 def _dbg(*args, **kwargs):
     if IO_DEBUG:
-        print("[IODBG]", *args, **kwargs)
+        logger.debug(" ".join(str(a) for a in args))
 
-def _open_capture_and_read_first(src: object) -> tuple[cv.VideoCapture, bool, object | None]:
-    """与えられた入力（カメラID or ファイルパス）について、複数バックエンドで VideoCapture を試し、
-    最初のフレームを読み込んで返す。戻り値: (cap, ret, frame)
-    """
-    # Backend 優先順位の決定
-    # ファイルパスの場合は FFMPEG 優先（MSMF がフレーム数を誤検出/早期終了する事例対策）
-    if isinstance(src, str):
-        backends = []
-        for b in (getattr(cv, 'CAP_FFMPEG', None), getattr(cv, 'CAP_MSMF', None), getattr(cv, 'CAP_DSHOW', None), cv.CAP_ANY):
-            if isinstance(b, int) and b not in backends:
-                backends.append(b)
-    else:
-        backends = [cv.CAP_ANY]
-        for b in (getattr(cv, 'CAP_FFMPEG', None), getattr(cv, 'CAP_MSMF', None), getattr(cv, 'CAP_DSHOW', None)):
-            if isinstance(b, int) and b not in backends:
-                backends.append(b)
-    # 文字列パスは正規化
-    src_to_use = src
-    if isinstance(src, str):
-        src_to_use = os.path.normpath(src)
-    last_err = None
-    for be in backends:
-        try:
-            cap = cv.VideoCapture(src_to_use, be) if be != cv.CAP_ANY else cv.VideoCapture(src_to_use)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    try:
-                        if isinstance(src, str):
-                            total = cap.get(cv.CAP_PROP_FRAME_COUNT)
-                        else:
-                            total = -1
-                        _dbg("opened backend=", be, "src=", src_to_use, "frames=", total)
-                    except Exception:
-                        pass
-                    return cap, True, frame
-                cap.release()
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            try:
-                cap.release()
-            except Exception:
-                pass
-    # 失敗時はダミー cap を返す
-    cap = cv.VideoCapture()
-    return cap, False, None
+ # moved to video_io.open_capture_and_read_first
 
 reps = 10
 one_rm_percentage = df_rm.loc[df_rm["反復回数"] == reps, "1RM%"].values[0] / 100
@@ -1380,8 +1090,8 @@ print("Projection matrices loaded")
 save_path0 = f"cam0_output_{timestamp}.mp4"
 save_path1 = f"cam1_output_{timestamp}.mp4"
 
-cap0, ok0, frame0 = _open_capture_and_read_first(local_input_stream1)
-cap1, ok1, frame1 = _open_capture_and_read_first(local_input_stream2)
+cap0, ok0, frame0 = open_capture_and_read_first(local_input_stream1)
+cap1, ok1, frame1 = open_capture_and_read_first(local_input_stream2)
 
 if not (ok0 and ok1) or frame0 is None or frame1 is None:
     print("❌ 入力の読み込みに失敗しました。解決理由:", resolve_reason)
@@ -1389,7 +1099,7 @@ if not (ok0 and ok1) or frame0 is None or frame1 is None:
     # 優先順に従って試す
     if PREFER_RECORDING_PAIRS:
         # 1) 録画ペア
-        pairs = _find_recording_pairs(folder_path)
+        pairs = find_recording_pairs(folder_path)
         if pairs:
             print(f"Trying pairs: {len(pairs)} found (newest first)")
         tried = 0
@@ -1400,8 +1110,8 @@ if not (ok0 and ok1) or frame0 is None or frame1 is None:
                 cap0.release(); cap1.release()
             except Exception:
                 pass
-            cap0, ok0, frame0 = _open_capture_and_read_first(p0)
-            cap1, ok1, frame1 = _open_capture_and_read_first(p1)
+            cap0, ok0, frame0 = open_capture_and_read_first(p0)
+            cap1, ok1, frame1 = open_capture_and_read_first(p1)
             if ok0 and ok1 and frame0 is not None and frame1 is not None:
                 print("OK: opened recording pair")
                 opened = True
@@ -1415,8 +1125,8 @@ if not (ok0 and ok1) or frame0 is None or frame1 is None:
                 cap0.release(); cap1.release()
             except Exception:
                 pass
-            cap0, ok0, frame0 = _open_capture_and_read_first(cam0_file)
-            cap1, ok1, frame1 = _open_capture_and_read_first(cam1_file)
+            cap0, ok0, frame0 = open_capture_and_read_first(cam0_file)
+            cap1, ok1, frame1 = open_capture_and_read_first(cam1_file)
             opened = ok0 and ok1 and frame0 is not None and frame1 is not None
     else:
         # 1) サンプル
@@ -1427,12 +1137,12 @@ if not (ok0 and ok1) or frame0 is None or frame1 is None:
             cap0.release(); cap1.release()
         except Exception:
             pass
-        cap0, ok0, frame0 = _open_capture_and_read_first(cam0_file)
-        cap1, ok1, frame1 = _open_capture_and_read_first(cam1_file)
+        cap0, ok0, frame0 = open_capture_and_read_first(cam0_file)
+        cap1, ok1, frame1 = open_capture_and_read_first(cam1_file)
         opened = ok0 and ok1 and frame0 is not None and frame1 is not None
         # 2) 録画ペア
         if not opened:
-            pairs = _find_recording_pairs(folder_path)
+            pairs = find_recording_pairs(folder_path)
             if pairs:
                 print(f"Trying pairs: {len(pairs)} found (newest first)")
             tried = 0
@@ -1443,15 +1153,15 @@ if not (ok0 and ok1) or frame0 is None or frame1 is None:
                     cap0.release(); cap1.release()
                 except Exception:
                     pass
-                cap0, ok0, frame0 = _open_capture_and_read_first(p0)
-                cap1, ok1, frame1 = _open_capture_and_read_first(p1)
+                cap0, ok0, frame0 = open_capture_and_read_first(p0)
+                cap1, ok1, frame1 = open_capture_and_read_first(p1)
                 if ok0 and ok1 and frame0 is not None and frame1 is not None:
                     print("OK: opened recording pair")
                     opened = True
                     break
     if not opened:
         # 見つかったペア一覧を提示
-        pairs = _find_recording_pairs(folder_path)
+        pairs = find_recording_pairs(folder_path)
         if pairs:
             print("Tried these pairs (all failed):")
             for p0, p1 in pairs:
@@ -1550,22 +1260,22 @@ if frame0 is None or frame1 is None:
             cap0.release(); cap1.release()
         except Exception:
             pass
-        cap0, ok0, frame0 = _open_capture_and_read_first(local_input_stream1)
-        cap1, ok1, frame1 = _open_capture_and_read_first(local_input_stream2)
+        cap0, ok0, frame0 = open_capture_and_read_first(local_input_stream1)
+        cap1, ok1, frame1 = open_capture_and_read_first(local_input_stream2)
         recovered = ok0 and ok1 and frame0 is not None and frame1 is not None
     # 3) サンプル／録画ペアへフォールバック
     if not recovered:
         print("[Input] Fallback: try sample media or recording pairs")
         opened = False
         if PREFER_RECORDING_PAIRS:
-            pairs = _find_recording_pairs(folder_path)
+            pairs = find_recording_pairs(folder_path)
             for p0, p1 in pairs:
                 try:
                     cap0.release(); cap1.release()
                 except Exception:
                     pass
-                cap0, ok0, frame0 = _open_capture_and_read_first(p0)
-                cap1, ok1, frame1 = _open_capture_and_read_first(p1)
+                cap0, ok0, frame0 = open_capture_and_read_first(p0)
+                cap1, ok1, frame1 = open_capture_and_read_first(p1)
                 if ok0 and ok1 and frame0 is not None and frame1 is not None:
                     opened = True
                     break
@@ -1576,8 +1286,8 @@ if frame0 is None or frame1 is None:
                 cap0.release(); cap1.release()
             except Exception:
                 pass
-            cap0, ok0, frame0 = _open_capture_and_read_first(cam0_file)
-            cap1, ok1, frame1 = _open_capture_and_read_first(cam1_file)
+            cap0, ok0, frame0 = open_capture_and_read_first(cam0_file)
+            cap1, ok1, frame1 = open_capture_and_read_first(cam1_file)
             opened = ok0 and ok1 and frame0 is not None and frame1 is not None
         if not opened:
             print("❌ 初期フレームが取得できませんでした。終了します。")
@@ -2748,8 +2458,8 @@ while True:
         v_fa_R = links["wrist_R"]          # 前腕方向（肘->手首）
         v_ua_L = links["elbow_L"]
         v_fa_L = links["wrist_L"]
-        th_R = _angle_between(v_ua_R, v_fa_R)
-        th_L = _angle_between(v_ua_L, v_fa_L)
+        th_R = angle_between(v_ua_R, v_fa_R)
+        th_L = angle_between(v_ua_L, v_fa_L)
         tau_R = float(locals_map.get("elbow_R", np.zeros(3))[1])
         tau_L = float(locals_map.get("elbow_L", np.zeros(3))[1])
         _E_buffers['elbow_R']['theta'].append(th_R)

@@ -7,7 +7,8 @@ def putText_jp(img, text, position, font_size, color, line_width):
     img_pil = Image.fromarray(img)
     draw = ImageDraw.Draw(img_pil)
     # 日本語対応フォントの指定
-    font = ImageFont.truetype("meiryo\meiryo.ttc", font_size)
+    # Windows のバックスラッシュでエスケープ警告が出ないよう raw 文字列に変更
+    font = ImageFont.truetype(r"meiryo\meiryo.ttc", font_size)
         # line_width = 20  # 1行あたりの最大文字数
 
     # テキストを指定幅で改行

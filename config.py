@@ -22,7 +22,9 @@ g = np.array([0, 0, -9.81])
 PADDING = 400  # 余白として追加するピクセル数
 # add here if you need more keypoints
 
-pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
+# MediaPipe Pose ランドマーク出力で使用するインデックス。
+# 手首向きを決めるための指ランドマーク（17,18,19,20）も含める。
+pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28, 20, 18, 19, 17]
 # this will load the sample videos if no camera ID is given
 # input_stream1 = folder_path + "\\media\\output1.mp4"
 # input_stream2 = folder_path + "\\media\\output2.mp4"

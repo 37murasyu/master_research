@@ -1,9 +1,9 @@
-"""Minimal serial test for HX711-logger DTR toggle and line I/O.
+r"""Minimal serial test for HX711-logger DTR toggle and line I/O.
 
 Usage (PowerShell):
-  $env:PORT="COM3"
-  python .\serial_dtr_test.py --port $env:PORT --baud 115200 --dtr on --send "STATUS"
-  python .\serial_dtr_test.py --port $env:PORT --dtr off
+    $env:PORT="COM3"
+    python .\serial_dtr_test.py --port $env:PORT --baud 115200 --dtr on --send "STATUS"
+    python .\serial_dtr_test.py --port $env:PORT --dtr off
 
 Notes:
 - No camera, no physics; safe to run standalone.

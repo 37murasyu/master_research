@@ -1,15 +1,32 @@
-opencv-python
+### Core numerical / vision
 numpy
 scipy
 pandas
+opencv-python
 matplotlib
 japanize-matplotlib
 mediapipe
 pygame
+pillow
 pyyaml
-wmi
-boto3
+
+### Networking / cloud / I/O
 requests
+boto3
 pyserial
 bleak
-comtypes
+
+### UI / visualization
+PyQt5
+pyqtgraph
+plotly
+wordcloud
+manim
+
+### ML / time-series
+scikit-learn
+tslearn
+
+### Windows-only helpers
+wmi; platform_system == "Windows"
+comtypes; platform_system == "Windows"

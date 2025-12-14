@@ -21,3 +21,16 @@ output_data/**/*.csv
 *.csv
 *.npy
 *.json
+# large data and build outputs
+*.mp4
+*.npy
+*.csv
+output_data/
+frames/
+frames_pair/
+videos/
+media/
+tmp_debug/
+build/
+.pio/
+.aws-sam/
