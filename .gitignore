@@ -34,3 +34,5 @@ tmp_debug/
 build/
 .pio/
 .aws-sam/
+.venv/
+wheelhouse/

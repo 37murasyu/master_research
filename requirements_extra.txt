@@ -1,0 +1,10 @@
+### UI / visualization
+PyQt5
+pyqtgraph
+plotly
+wordcloud
+manim
+
+### ML / time-series
+scikit-learn
+tslearn

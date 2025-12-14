@@ -1,0 +1,21 @@
+### Core numerical / vision
+numpy
+scipy
+pandas
+opencv-python
+matplotlib
+japanize-matplotlib
+mediapipe
+pygame
+pillow
+pyyaml
+
+### Networking / I/O
+requests
+boto3
+pyserial
+bleak
+
+### Platform-specific
+wmi; platform_system == "Windows"
+comtypes; platform_system == "Windows"
