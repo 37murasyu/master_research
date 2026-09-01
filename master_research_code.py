@@ -1217,7 +1217,30 @@ except Exception:
     POSE_MIN_TRACK = 0.5
 pose0 = PoseEstimator(USE_POSE_LANDMARKER, POSE_TASK_MODEL, min_det=POSE_MIN_DET, min_track=POSE_MIN_TRACK, num_threads=MP_THREADS)
 pose1 = PoseEstimator(USE_POSE_LANDMARKER, POSE_TASK_MODEL, min_det=POSE_MIN_DET, min_track=POSE_MIN_TRACK, num_threads=MP_THREADS)
-print("✅ Mediapipe・モデル準備 完了")
+
+# ---- 2カメラの姿勢推定を並列実行するためのワーカ ----
+# pose0 / pose1 は独立インスタンスで、process() は self のみを触るためスレッド安全。
+# ワーカは cam1 側だけを担当し、cam0 はメインスレッドで実行する（2並列に必要なのは1本）。
+# POSE_PARALLEL=0 で直列に戻せる（A/B比較用）。
+POSE_PARALLEL = os.getenv('POSE_PARALLEL', '1') not in ('0', 'false', 'False')
+_pose_pool = None
+if POSE_PARALLEL:
+    try:
+        from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+        _pose_pool = _ThreadPoolExecutor(max_workers=1, thread_name_prefix='pose1')
+    except Exception as _pp_e:  # pragma: no cover
+        print(f"[PosePar] スレッドプール生成に失敗 -> 直列実行: {_pp_e}")
+        _pose_pool = None
+
+
+def _pose_job(pose_estimator, frame_rgb, roi):
+    """姿勢推定1台分。所要時間も返す（_LoopPerf はスレッド安全でないため呼ばない）。"""
+    _t0 = time.perf_counter()
+    res, used = _pose_process_with_roi(pose_estimator, frame_rgb, roi)
+    return res, used, time.perf_counter() - _t0
+
+
+print(f"✅ Mediapipe・モデル準備 完了 (pose_parallel={'ON' if _pose_pool is not None else 'OFF'})")
 ## Gauge / Matplotlib 初期化（環境変数 DISABLE_MPL=1 で完全無効化可能）
 gauge = None  # type: ignore
 if (os.getenv('DISABLE_MPL', '0') not in ('1','true','True')) and not HEADLESS:
@@ -1463,6 +1486,15 @@ def _cleanup_resources():
                 globals()['hx_serial_client'] = None
         except Exception as e:
             _log(f'hx_serial_client close err: {e}')
+        # 4c) 姿勢推定ワーカスレッドの停止
+        try:
+            _pool = globals().get('_pose_pool')
+            if _pool is not None:
+                _pool.shutdown(wait=True)
+                _log('pose_pool.shutdown ok')
+                globals()['_pose_pool'] = None
+        except Exception as e:
+            _log(f'pose_pool shutdown err: {e}')
         # 5) 旧 Matplotlib 図のクローズ処理は不要（PyQtGraph に移行）
     finally:
         if _fatal_state["exception"] and verbose:
@@ -2856,7 +2888,25 @@ while True:
             roi0 = _expand_roi(roi0, frame0.shape, POSE_ROI_MISS_GROW_RATIO)
             if roi0 is None:
                 break
-    results0, _roi0_used = _pose_process_with_roi(pose0, frame0, roi0)
+    roi1 = _pose_roi1 if (POSE_ROI_ON and _pose_roi1_miss <= POSE_ROI_MAX_MISS) else None
+    if roi1 is not None and _pose_roi1_miss > 0:
+        for _ in range(_pose_roi1_miss):
+            roi1 = _expand_roi(roi1, frame1.shape, POSE_ROI_MISS_GROW_RATIO)
+            if roi1 is None:
+                break
+    # cam1 をワーカへ投げ、cam0 はメインスレッドで走らせて重ねる。
+    # MediaPipe の推論中は GIL が解放されるため実時間は max(cam0, cam1) に近づく。
+    if _pose_pool is not None:
+        _fut_pose1 = _pose_pool.submit(_pose_job, pose1, frame1, roi1)
+        results0, _roi0_used, _mp0_dt = _pose_job(pose0, frame0, roi0)
+        results1, _roi1_used, _mp1_dt = _fut_pose1.result()
+    else:
+        results0, _roi0_used, _mp0_dt = _pose_job(pose0, frame0, roi0)
+        results1, _roi1_used, _mp1_dt = _pose_job(pose1, frame1, roi1)
+    _perf.add('mediapipe0', _mp0_dt)
+    _perf.add('mediapipe1', _mp1_dt)
+    # 実時間（並列時は max(mp0,mp1) 相当、直列時は mp0+mp1 相当）
+    _perf.add('mediapipe_wall', time.perf_counter() - t_seg)
     if os.getenv('POSE_DEBUG', '0') in ('1','true','True') and (WHILE_COUNT % max(1, int(os.getenv('POSE_TRACE_EVERY','30'))) == 0):
         try:
             if _roi0_used and roi0 is not None:
@@ -2865,19 +2915,6 @@ while True:
                 print(f"[Pose] cam0 ROI used scale={MP_INPUT_SCALE} roi={roi0} roi_shape=({_rh0},{_rw0},3)")
             else:
                 print(f"[Pose] cam0 fullframe scale={MP_INPUT_SCALE} shape={tuple(frame0.shape)}")
-        except Exception:
-            pass
-    _perf.add('mediapipe0', time.perf_counter() - t_seg)
-    t_seg = time.perf_counter()
-    roi1 = _pose_roi1 if (POSE_ROI_ON and _pose_roi1_miss <= POSE_ROI_MAX_MISS) else None
-    if roi1 is not None and _pose_roi1_miss > 0:
-        for _ in range(_pose_roi1_miss):
-            roi1 = _expand_roi(roi1, frame1.shape, POSE_ROI_MISS_GROW_RATIO)
-            if roi1 is None:
-                break
-    results1, _roi1_used = _pose_process_with_roi(pose1, frame1, roi1)
-    if os.getenv('POSE_DEBUG', '0') in ('1','true','True') and (WHILE_COUNT % max(1, int(os.getenv('POSE_TRACE_EVERY','30'))) == 0):
-        try:
             if _roi1_used and roi1 is not None:
                 _rw1 = roi1[2] - roi1[0]
                 _rh1 = roi1[3] - roi1[1]
@@ -2886,7 +2923,6 @@ while True:
                 print(f"[Pose] cam1 fullframe scale={MP_INPUT_SCALE} shape={tuple(frame1.shape)}")
         except Exception:
             pass
-    _perf.add('mediapipe1', time.perf_counter() - t_seg)
     if STOP_AFTER.lower() in ("mediapipe", "mediapipe1",):
         _perf.next()
         break
