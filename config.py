@@ -23,8 +23,8 @@ PADDING = 400  # 余白として追加するピクセル数
 # add here if you need more keypoints
 
 # MediaPipe Pose ランドマーク出力で使用するインデックス。
-# 手首向きを決めるための指ランドマーク（17,18,19,20）も含める。
-pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28, 20, 18, 19, 17]
+# bodypose3d の順序に合わせて12点のみ（右手首→右肘→右肩→左肩→左肘→左手首→右/左腰→右/左膝→右/左足首）。
+pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
 # this will load the sample videos if no camera ID is given
 # input_stream1 = folder_path + "\\media\\output1.mp4"
 # input_stream2 = folder_path + "\\media\\output2.mp4"
@@ -75,7 +75,7 @@ IO_DEBUG = int(os.environ.get("IO_DEBUG", "0"))
 # カメラが開けない場合のフォールバック優先度
 # 0: サンプル動画 (media\cam000_test.mp4 / cam111_test.mp4) を優先（推奨・デフォルト）
 # 1: 最新の録画ペア (cam0/1_output_*.mp4) を優先
-PREFER_RECORDING_PAIRS = int(os.environ.get("PREFER_RECORDING_PAIRS", "0"))
+PREFER_RECORDING_PAIRS = int(os.environ.get("PREFER_RECORDING_PAIRS", "1"))
 # CSVファイルの絶対パス
 rm_path = folder_path + "\\rm_method.csv"
 # カメラの解像度を720pに設定
@@ -102,7 +102,7 @@ win_second = "SecondMonitor"
 
 win_main_point = [0, 0, 1280, 720]  # メインモニターのウィンドウ位置とサイズ
 win_second_point = [1200, -1080, 3120, 0]  # セカンドモニターのウィンドウ位置とサイズ
-SKIP_FRAMES = 0
+SKIP_FRAMES = int(os.environ.get("SKIP_FRAMES", "0"))
 WHILE_COUNT = 0
 z_value = 0
 cycle_switch = 0

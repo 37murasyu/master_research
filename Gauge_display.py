@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+import time as _time
 
 import numpy as np
 import cv2 as cv
@@ -64,6 +65,8 @@ class GaugeDisplay:
         self.energy_thresholds: dict[str, tuple[float, float]] = {}
         self._frame_index: int = 0
         self._last_angles: list[float] = []
+        self._direct_ratios: dict[str, float] | None = None
+        self._direct_fill_rgba: tuple[float, float, float, float] = (0.20, 0.80, 0.20, 0.90)
         try:
             self._event_every = max(1, int(os.getenv('GAUGE_EVENT_EVERY', '1')))
         except Exception:
@@ -200,7 +203,22 @@ class GaugeDisplay:
                         except Exception:
                             pass
                     img = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
-                    rotate_deg = float(self.config.get("image_rotate_deg", 0.0))
+                    env_rot = os.getenv("GAUGE_IMAGE_ROTATE", "").strip()
+                    rotate_deg = None
+                    if env_rot:
+                        try:
+                            rotate_deg = float(env_rot)
+                        except Exception:
+                            rotate_deg = None
+                    if rotate_deg is None:
+                        try:
+                            rotate_deg = float(self.config.get("image_rotate_deg", 0.0))
+                        except Exception:
+                            rotate_deg = 0.0
+                    if rotate_deg is None or rotate_deg == 0.0:
+                        # heuristic: known sideways asset
+                        if os.path.basename(self.image_path).lower().startswith("wheelchair"):
+                            rotate_deg = 90.0
                     if rotate_deg:
                         if self.debug:
                             print(f"[GaugeDebug] rotate image {rotate_deg} deg")
@@ -377,7 +395,21 @@ class GaugeDisplay:
             if k in self.current_impulses:
                 self.current_impulses[k] = float(v)
 
+    def set_direct_ratios(
+        self,
+        ratios: dict[str, float] | None,
+        fill_rgba: tuple[float, float, float, float] | None = None,
+    ) -> None:
+        if ratios is None:
+            self._direct_ratios = None
+            return
+        self._direct_ratios = {k: float(np.clip(v, 0.0, 1.0)) for k, v in ratios.items() if k in self.part_keys}
+        if fill_rgba is not None:
+            self._direct_fill_rgba = _to_rgba_tuple(fill_rgba, self._direct_fill_rgba)
+
     def get_angles(self) -> list[float]:
+        if self._direct_ratios is not None:
+            return [float(np.clip(180.0 - 120.0 * self._direct_ratios.get(pk, 0.0), 0.0, 180.0)) for pk in self.part_keys]
         if self.warmup_frames > 0 and self._frame_index < self.warmup_frames:
             if self.debug and self._frame_index == 0:
                 print(f"[GaugeDebug] warmup active ({self.warmup_frames} frames) -> all 180")
@@ -420,7 +452,9 @@ class GaugeDisplay:
             c = self.gauges[idx]["center"]
             pk = self.part_keys[idx]
             E = float(self.current_impulses.get(pk, 0.0))
-            if pk in self.energy_thresholds:
+            if self._direct_ratios is not None:
+                color = self._direct_fill_rgba
+            elif pk in self.energy_thresholds:
                 e_low, e_high = self.energy_thresholds[pk]
                 if E <= e_low:
                     color = (0.15, 0.25, 0.95, 0.90)
@@ -463,6 +497,68 @@ class GaugeDisplay:
         # Qt イベント処理を間引き
         if (self._frame_index % self._event_every) == 0:
             QApplication.processEvents()
+
+    def play_demo_fill(
+        self,
+        step_seconds: float = 2.0,
+        steps: int = 8,
+        low_steps: tuple[int, int] = (2, 6),
+        high_pct: float = 0.80,
+        low_pct: float = 0.15,
+        chunk_seconds: float = 0.25,
+    ) -> None:
+        """Fill gauges in a scripted pattern for demo videos.
+
+        2秒周期×8ステップ=16秒。指定ステップのみ低負荷(15%)、それ以外は高負荷(80%)へ0.25秒ごとの段階的インクリメント。
+        """
+
+        def _apply_percent(p: float) -> None:
+            ang = float(np.clip(180.0 - 120.0 * np.clip(p, 0.0, 1.0), 0.0, 180.0))
+            # 色を割合で切り替え: 20%以下は青、超えると緑
+            if p <= 0.20:
+                col_rgba = (0.15, 0.25, 0.95, 0.90)
+            else:
+                col_rgba = (0.20, 0.80, 0.20, 0.90)
+            pen_col = (
+                int(col_rgba[0] * 255),
+                int(col_rgba[1] * 255),
+                int(col_rgba[2] * 255),
+                int(col_rgba[3] * 255),
+            )
+            for idx, fill in enumerate(self.fill_items):
+                if fill is None:
+                    continue
+                c = self.gauges[idx]["center"]
+                pen = pg.mkPen(pen_col, width=float(self.stroke_px))
+                try:
+                    if Qt is not None and hasattr(Qt, "RoundCap"):
+                        pen.setCapStyle(Qt.RoundCap)  # type: ignore[attr-defined]
+                        pen.setJoinStyle(Qt.RoundJoin)  # type: ignore[attr-defined]
+                    if hasattr(pen, "setCosmetic"):
+                        pen.setCosmetic(True)
+                except Exception:
+                    pass
+                fill.setPen(pen)
+                end_deg = 360.0 - ang
+                path = self._arc_path(c, self.radius - self.ring_width / 2.0, 180.0, end_deg)
+                fill.setPath(path)
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+
+        pct_seq = [low_pct if (i + 1) in low_steps else high_pct for i in range(steps)]
+        dt_chunk = max(0.01, float(chunk_seconds))
+        chunks = max(1, int(round(step_seconds / dt_chunk)))
+        for target_pct in pct_seq:
+            # 明示リセットを入れて0%を確実に表示
+            _apply_percent(0.0)
+            _time.sleep(dt_chunk)
+            for i in range(chunks):
+                alpha = float(i + 1) / float(chunks)
+                _apply_percent(target_pct * alpha)
+                _time.sleep(dt_chunk)
+            _apply_percent(target_pct)
 
     def set_band_angles(self, angle_map: dict[str, list | tuple]) -> None:
         for idx, pk in enumerate(self.part_keys):
@@ -554,6 +650,54 @@ class GaugeDisplay:
                         self.win.setWindowFlags(self.win.windowFlags() | Qt.WindowStaysOnTopHint)  # type: ignore[attr-defined]
                 except Exception:
                     pass
+
+            # env overrides for window placement
+            try:
+                env_x = os.getenv("GAUGE_WIN_X")
+                env_y = os.getenv("GAUGE_WIN_Y")
+                env_w = os.getenv("GAUGE_WIN_W")
+                env_h = os.getenv("GAUGE_WIN_H")
+                env_screen = os.getenv("GAUGE_WIN_SCREEN")
+                if env_x is not None:
+                    x = int(env_x)
+                if env_y is not None:
+                    y = int(env_y)
+                if env_w is not None:
+                    w = int(env_w)
+                if env_h is not None:
+                    h = int(env_h)
+            except Exception:
+                pass
+
+            # auto-center on chosen screen if any coordinate/size missing
+            if not all(v is not None for v in (x, y, w, h)) and QtWidgets is not None:
+                try:
+                    screens = QtWidgets.QApplication.screens() if hasattr(QtWidgets.QApplication, "screens") else []  # type: ignore[attr-defined]
+                    screen_idx = 0
+                    try:
+                        if env_screen is not None:
+                            screen_idx = max(0, min(int(env_screen), len(screens) - 1))
+                    except Exception:
+                        screen_idx = 0
+                    screen = screens[screen_idx] if screens else (QtWidgets.QApplication.primaryScreen() if hasattr(QtWidgets.QApplication, "primaryScreen") else None)  # type: ignore[attr-defined]
+                    geo = screen.availableGeometry() if screen is not None else None
+                    if geo is not None:
+                        gw = geo.width()
+                        gh = geo.height()
+                        gx = geo.x()
+                        gy = geo.y()
+                        if w is None or h is None:
+                            w = int(gw * 0.6)
+                            h = int(gh * 0.6)
+                        if x is None:
+                            x = int(gx + (gw - w) / 2)
+                        if y is None:
+                            y = int(gy + (gh - h) / 2)
+                        if self.debug:
+                            print(f"[GaugeDebug] auto place screen={screen_idx} geom=({gx},{gy},{gw},{gh}) -> ({x},{y},{w},{h})")
+                except Exception:
+                    pass
+
             if all(v is not None for v in (x, y, w, h)):
                 try:
                     self.win.setGeometry(int(x), int(y), int(w), int(h))

@@ -36,3 +36,10 @@ build/
 .aws-sam/
 .venv/
 wheelhouse/
+!media/cam111_test.mp4
+!media/cam000_test.mp4
+!media/wheelchair_user.png
+
+# 生成物・ログ（履歴に入れない）
+fft_plots/
+*.log

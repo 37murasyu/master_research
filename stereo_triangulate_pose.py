@@ -139,6 +139,9 @@ def parse_args():
     ap.add_argument("--save-failed-mask", action="store_true", help="再構成失敗(全部 -1)フレームマスク保存")
     ap.add_argument("--model-complexity", type=int, choices=[0,1,2], default=1)
     ap.add_argument("--verbose", action="store_true")
+    # Optional post-scale: set median length of a joint pair (e.g., 12 14) to target units (e.g., meters)
+    ap.add_argument("--scale-pair", type=int, nargs=2, default=None, metavar=("J0","J1"), help="joint indices to measure length for scaling (median)" )
+    ap.add_argument("--scale-target", type=float, default=None, help="target length for --scale-pair (same unit as desired output, e.g., meters)")
     return ap.parse_args()
 
 
@@ -265,6 +268,28 @@ def run():
     cap1.release()
 
     arr3d = np.stack(frames3d, axis=0) if frames3d else np.zeros((0, 33, 3), dtype=np.float32)
+
+    # Optional global scaling to enforce a median segment length
+    if args.scale_pair is not None and args.scale_target is not None:
+        j0, j1 = args.scale_pair
+        if arr3d.size == 0:
+            print("warning: no 3D data to scale", file=sys.stderr)
+        elif not (0 <= j0 < arr3d.shape[1] and 0 <= j1 < arr3d.shape[1]):
+            print("warning: scale-pair indices out of range; skipping scale", file=sys.stderr)
+        else:
+            seg = arr3d[:, j0, :] - arr3d[:, j1, :]
+            seg = seg[np.isfinite(seg).all(axis=1)]
+            if seg.size == 0:
+                print("warning: no valid segments for scaling; skipping", file=sys.stderr)
+            else:
+                med = float(np.median(np.linalg.norm(seg, axis=1)))
+                if med <= 0:
+                    print("warning: median segment length is non-positive; skipping scale", file=sys.stderr)
+                else:
+                    scale = float(args.scale_target) / med
+                    arr3d = arr3d * scale
+                    if args.verbose:
+                        print(f"scaled 3D by {scale:.6f} so median |joint{j0}-joint{j1}| = {args.scale_target}")
 
     # 保存形式の決定
     def infer_format_and_path() -> tuple[str, str]:

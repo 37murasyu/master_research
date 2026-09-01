@@ -1,9 +1,9 @@
 """Prepare forearm & wrist torque npy files from existing CSV exports.
 
 Input expectations:
-  - kpts3d_<timestamp>.csv : columns frame, joint_0_x, joint_0_y, joint_0_z, ... joint_11_z (12 joints)
-    Index mapping expected to match main pipeline: (0: shoulder_base_R?, 2: elbow_R, 4: wrist_R, 3: elbow_L, 5: wrist_L ... )
-    We only need joints 2 and 4 for right forearm, 3 and 5 for left forearm.
+    - kpts3d_<timestamp>.csv : columns frame, joint_0_x, joint_0_y, joint_0_z, ... joint_11_z (12 joints)
+        Index mapping expected to match main pipeline: (0: shoulder_base_R, 1: shoulder_base_L, 2: elbow_R, 3: elbow_L, 4: wrist_R, 5: wrist_L)
+        We only need joints 2 and 4 for right forearm, 3 and 5 for left forearm, and (0,2,4)/(1,3) for upper-arm scaling when height is provided.
   - aim_torque_vec_<timestamp>.csv : columns frame, wrist_R_x,y,z, elbow_R_x,y,z, shoulder_R_x,y,z, wrist_L_x,y,z, ...
     We take wrist_R_y (local torque y) and wrist_L_y.
 
@@ -34,6 +34,10 @@ LEFT_ELBOW_IDX_LEG = 3
 LEFT_WRIST_IDX_LEG = 5
 RIGHT_SHOULDER_IDX_LEG = 0
 LEFT_SHOULDER_IDX_LEG = 1
+
+# Anthropometric length ratios (relative to stature; Dempster-like averages)
+UPPER_ARM_RATIO = 0.186  # shoulder->elbow
+FOREARM_RATIO = 0.146    # elbow->wrist
 
 # MediaPipe indices (preferred when available)
 RIGHT_ELBOW_ID_MP = 14
@@ -74,6 +78,26 @@ def _resolve_joint_cols(df: pd.DataFrame, jid: int):
 
 def has_joint(df: pd.DataFrame, jid: int) -> bool:
     return _resolve_joint_cols(df, jid) is not None
+
+
+def target_segment_lengths(height_cm: float) -> Dict[str, float]:
+    """Return target segment lengths (meters) given stature in cm."""
+    h_m = float(height_cm) / 100.0
+    return {
+        "upper_arm": UPPER_ARM_RATIO * h_m,
+        "forearm": FOREARM_RATIO * h_m,
+    }
+
+
+def scale_vectors_to_length(vecs: np.ndarray, target_len_m: float, label: str):
+    """Scale vectors so median length matches target_len_m. Returns (scaled, factor)."""
+    lens = np.linalg.norm(vecs, axis=1)
+    med = float(np.nanmedian(lens)) if lens.size else float('nan')
+    if not np.isfinite(med) or med < 1e-9:
+        print(f"[WARN] {label}: median length invalid (med={med}) -> skip scaling")
+        return vecs, None
+    factor = target_len_m / med
+    return vecs * factor, factor
 
 
 def extract_vector_series_df(df: pd.DataFrame, start_jid: int, end_jid: int) -> np.ndarray:
@@ -140,6 +164,8 @@ def main():
     ap.add_argument('--shoulder-z', action='store_true', help='Also output shoulder Z time series (R/L if --left).')
     ap.add_argument('--pose-unit', choices=['auto','m','cm','mm'], default='auto',
                     help='Unit of pose values in the CSV. auto: infer from magnitude (>|10| -> mm, >|1| -> cm). Used only for shoulder-Z export; values are saved in meters.')
+    ap.add_argument('--height-cm', type=float, default=None,
+                    help='If set (e.g., 170), scale arm segments to anthropometric lengths (upper-arm=0.186*H, forearm=0.146*H).')
     args = ap.parse_args()
 
     kpts_df = load_kpts3d_df(args.kpts)
@@ -164,9 +190,19 @@ def main():
         upperarm_R = extract_upper_arm_series_df(kpts_df, RIGHT_ELBOW_IDX_LEG, RIGHT_SHOULDER_IDX_LEG) if has_joint(kpts_df, RIGHT_SHOULDER_IDX_LEG) else None
     if upperarm_R is None:
         print("[WARN] Right shoulder joint not found; falling back to forearm vector for elbow torque localization")
-        upperarm_R = forearm_R
+        upperarm_R = forearm_R.copy()
     tau_R_series = extract_wrist_tau_series(torque_df, 'R')
     tau_elbow_R_series = extract_elbow_tau_series(torque_df, 'R')
+
+    # Optional anthropometric scaling (e.g., height 170 cm male)
+    if args.height_cm:
+        tgt = target_segment_lengths(args.height_cm)
+        forearm_R, sf_fr = scale_vectors_to_length(forearm_R, tgt["forearm"], "R forearm")
+        upperarm_R, sf_ur = scale_vectors_to_length(upperarm_R, tgt["upper_arm"], "R upper-arm")
+        if sf_fr:
+            print(f"[SCALE] R forearm median-> {tgt['forearm']:.4f} m (factor={sf_fr:.4f})")
+        if sf_ur:
+            print(f"[SCALE] R upper-arm median-> {tgt['upper_arm']:.4f} m (factor={sf_ur:.4f})")
 
     ts = infer_timestamp_from_name(args.kpts)
     prefix = (args.prefix + '_') if args.prefix else ''
@@ -274,7 +310,15 @@ def main():
             upperarm_L = extract_upper_arm_series_df(kpts_df, LEFT_ELBOW_IDX_LEG, LEFT_SHOULDER_IDX_LEG) if has_joint(kpts_df, LEFT_SHOULDER_IDX_LEG) else None
         if upperarm_L is None:
             print("[WARN] Left shoulder joint not found; falling back to forearm vector for elbow torque localization")
-            upperarm_L = forearm_L
+            upperarm_L = forearm_L.copy()
+        if args.height_cm:
+            tgt = target_segment_lengths(args.height_cm)
+            forearm_L, sf_fl = scale_vectors_to_length(forearm_L, tgt["forearm"], "L forearm")
+            upperarm_L, sf_ul = scale_vectors_to_length(upperarm_L, tgt["upper_arm"], "L upper-arm")
+            if sf_fl:
+                print(f"[SCALE] L forearm median-> {tgt['forearm']:.4f} m (factor={sf_fl:.4f})")
+            if sf_ul:
+                print(f"[SCALE] L upper-arm median-> {tgt['upper_arm']:.4f} m (factor={sf_ul:.4f})")
         tau_L_series = extract_wrist_tau_series(torque_df, 'L')
         tau_elbow_L_series = extract_elbow_tau_series(torque_df, 'L')
         out_forearm_L = os.path.join(args.out_dir, f"{prefix}forearm_L_{ts}.npy")

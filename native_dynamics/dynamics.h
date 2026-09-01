@@ -55,4 +55,40 @@ NDYN_API int dyn_compute_tau_chain(
     const double* r_x,
     double* tau_out);
 
+// Exponential low-pass filter with forward-backward pass (zero-phase like).
+// Inputs:
+//  N: number of samples
+//  x: input array (N)
+//  dt: sample period [s]
+//  fc: cutoff frequency [Hz]
+//  passes: number of forward-backward repetitions (>=1)
+// Output:
+//  y_out: filtered array (N)
+// Returns 0 on success
+NDYN_API int dyn_lpf_exp_fb(
+    int N,
+    const double* x,
+    double dt,
+    double fc,
+    int passes,
+    double* y_out);
+
+// Batch triangulation + coordinate transform with finite checks.
+// Inputs:
+//  N: number of keypoints
+//  P0, P1: projection matrices (3x4, row-major, 12 doubles each)
+//  pts0, pts1: 2D points arrays (N*2): [u, v, u, v, ...]
+//  scale: scale factor from triangulated space to output space (e.g., 0.01)
+// Output:
+//  out_xyz: transformed 3D points (N*3). Invalid points are written as NaN.
+// Returns 0 on success.
+NDYN_API int dyn_triangulate_transform_batch(
+    int N,
+    const double* P0,
+    const double* P1,
+    const double* pts0,
+    const double* pts1,
+    double scale,
+    double* out_xyz);
+
 }

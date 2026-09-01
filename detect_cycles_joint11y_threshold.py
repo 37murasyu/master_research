@@ -31,13 +31,12 @@ def _unit_scale(unit: str) -> float:
     return 1.0
 
 
-def find_cycles(y: np.ndarray, thresh_high: float, thresh_low: float) -> List[Cycle]:
+def find_cycles(y: np.ndarray, thresh_high: float, thresh_low: float, order: str = 'valley-peak-valley') -> List[Cycle]:
     """
-    ルール (valley -> peak -> valley):
-    - y が thresh_low 以下の極小点を谷とする
-    - その後 y が thresh_high 以上の極大点をピークとする
-    - さらに次の thresh_low 以下の極小点までを1サイクル
-    返り値は start_valley_idx, peak_idx, end_valley_idx のインデックス
+    order:
+      - 'valley-peak-valley' (従来)
+      - 'peak-valley-peak'   (山→谷→山)
+    返り値は start_valley_idx/peak_idx/end_valley_idx に区間境界を格納する（意味は order に依存）。
     """
     y = np.asarray(y, dtype=float)
     T = len(y)
@@ -70,39 +69,67 @@ def find_cycles(y: np.ndarray, thresh_high: float, thresh_low: float) -> List[Cy
     peaks = local_peaks(y, thresh_high)
     valleys = local_valleys(y, thresh_low)
 
-    # valley -> peak -> next valley
-    pi = 0
-    vi = 0
-    while vi < len(valleys):
-        v0 = valleys[vi]
-        # v0 以降のピークを探す
-        while pi < len(peaks) and peaks[pi] <= v0:
-            pi += 1
-        if pi >= len(peaks):
-            break
-        p = peaks[pi]
-        # p 以降の次の谷 v1 を探す
-        vj = vi + 1
-        while vj < len(valleys) and valleys[vj] <= p:
-            vj += 1
-        if vj >= len(valleys):
-            break
-        v1 = valleys[vj]
-        if v0 < p < v1:
-            cycles.append(Cycle(start_valley_idx=v0, peak_idx=p, end_valley_idx=v1))
-            vi = vj  # 次の探索は v1 以降
-            pi += 1
-        else:
-            vi += 1  # 整合しなければ次の谷へ
+    if order == 'valley-peak-valley':
+        pi = 0
+        vi = 0
+        while vi < len(valleys):
+            v0 = valleys[vi]
+            while pi < len(peaks) and peaks[pi] <= v0:
+                pi += 1
+            if pi >= len(peaks):
+                break
+            p = peaks[pi]
+            vj = vi + 1
+            while vj < len(valleys) and valleys[vj] <= p:
+                vj += 1
+            if vj >= len(valleys):
+                break
+            v1 = valleys[vj]
+            if v0 < p < v1:
+                cycles.append(Cycle(start_valley_idx=v0, peak_idx=p, end_valley_idx=v1))
+                vi = vj
+                pi += 1
+            else:
+                vi += 1
+    else:
+        # peak -> valley -> next peak
+        pi = 0
+        vi = 0
+        while pi < len(peaks):
+            p0 = peaks[pi]
+            while vi < len(valleys) and valleys[vi] <= p0:
+                vi += 1
+            if vi >= len(valleys):
+                break
+            v = valleys[vi]
+            pj = pi + 1
+            while pj < len(peaks) and peaks[pj] <= v:
+                pj += 1
+            if pj >= len(peaks):
+                break
+            p1 = peaks[pj]
+            if p0 < v < p1:
+                cycles.append(Cycle(start_valley_idx=p0, peak_idx=v, end_valley_idx=p1))
+                pi = pj
+                vi += 1
+            else:
+                pi += 1
 
     return cycles
 
 
-def plot_cycles(frames: np.ndarray, y: np.ndarray, cycles: List[Cycle], out_png: Optional[str] = None,
-                thr_high: Optional[float] = None, thr_low: Optional[float] = None,
-                y_unit_label: str = 'm') -> None:
+def plot_cycles(
+    frames: np.ndarray,
+    y: np.ndarray,
+    cycles: List[Cycle],
+    out_png: Optional[str] = None,
+    thr_high: Optional[float] = None,
+    thr_low: Optional[float] = None,
+    y_unit_label: str = 'm',
+    joint_id: int = 11,
+) -> None:
     plt.figure(figsize=(12, 4))
-    plt.plot(frames, y, label=f'joint_11_y ({y_unit_label})', color='tab:blue')
+    plt.plot(frames, y, label=f'joint_{joint_id}_y ({y_unit_label})', color='tab:blue')
     # 閾値線
     if thr_high is not None:
         plt.axhline(thr_high, color='green', linestyle='--', alpha=0.5, label=f'peak >= {thr_high:.3g} {y_unit_label}')
@@ -122,9 +149,9 @@ def plot_cycles(frames: np.ndarray, y: np.ndarray, cycles: List[Cycle], out_png:
         plt.axvline(x1, color='red', alpha=0.5, linestyle=':')
 
     plt.xlabel('frame')
-    plt.ylabel(f'joint_11_y ({y_unit_label})')
+    plt.ylabel(f'joint_{joint_id}_y ({y_unit_label})')
     plt.legend(loc='best')
-    plt.title('joint_11_y cycles (valley->peak->valley)')
+    plt.title(f'joint_{joint_id}_y cycles (valley->peak->valley)')
     plt.tight_layout()
     if out_png:
         plt.savefig(out_png, dpi=150)
@@ -173,20 +200,24 @@ def annotate_csv(csv_path: str, cycles: List[Cycle], out_csv: str) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description='joint_11_y の閾値ピーク・谷・ピークでサイクル検出')
-    ap.add_argument('--csv', required=True, help='入力CSV（joint_11_y_f または joint_11_y 列が必要）')
+    ap = argparse.ArgumentParser(description='joint_{id}_y の閾値ピーク・谷・ピークでサイクル検出')
+    ap.add_argument('--csv', required=True, help='入力CSV（joint_{id}_y_f または joint_{id}_y 列が必要）')
+    ap.add_argument('--joint-id', type=int, default=11, help='対象とする joint ID (default: 11)')
     ap.add_argument('--unit', default='m', choices=['auto','m','cm','mm'], help='CSVの長さ単位（m基準に換算）')
     # しきい値指定（--unit と同じ単位系で解釈）。例: --unit cm --valley-max 42 --peak-min 44
     ap.add_argument('--valley-max', type=float, default=None, help='谷の最大値（以下）で採用するしきい値')
     ap.add_argument('--peak-min', type=float, default=None, help='ピークの最小値（以上）で採用するしきい値')
     ap.add_argument('--out-png', default=None, help='検出結果の可視化PNGパス')
     ap.add_argument('--out-csv', default=None, help='cycle_indexを付与して保存するCSVパス（未指定時は *_with_cycles.csv）')
+    ap.add_argument('--order', default='valley-peak-valley', choices=['valley-peak-valley','peak-valley-peak'], help='サイクル定義 (default: valley-peak-valley)')
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
-    col = 'joint_11_y_f' if 'joint_11_y_f' in df.columns else 'joint_11_y'
+    jid = args.joint_id
+    col_f = f'joint_{jid}_y_f'
+    col = col_f if col_f in df.columns else f'joint_{jid}_y'
     if col not in df.columns:
-        raise SystemExit('CSVに joint_11_y_f も joint_11_y も見つかりません')
+        raise SystemExit(f'CSVに {col_f} も joint_{jid}_y も見つかりません')
 
     # 単位の自動判定（auto時）: 値の絶対中央値で m/cm/mm の目安を簡易推定
     unit = args.unit
@@ -211,7 +242,7 @@ def main():
         th_high_m = float(args.peak_min) * scale
     if args.valley_max is not None:
         th_low_m = float(args.valley_max) * scale
-    cycles = find_cycles(y_m, th_high_m, th_low_m)
+    cycles = find_cycles(y_m, th_high_m, th_low_m, order=args.order)
     print(f'[INFO] detected cycles: {len(cycles)}')
 
     # プロット
@@ -219,9 +250,16 @@ def main():
         # プロットは指定単位で表示したいので逆変換する
         inv_scale = 1.0 / max(scale, 1e-12)
         y_disp = y_m * inv_scale
-        plot_cycles(frames, y_disp, cycles, args.out_png,
-                    thr_high=(th_high_m * inv_scale), thr_low=(th_low_m * inv_scale),
-                    y_unit_label=(unit if unit != 'auto' else 'm'))
+        plot_cycles(
+            frames,
+            y_disp,
+            cycles,
+            args.out_png,
+            thr_high=(th_high_m * inv_scale),
+            thr_low=(th_low_m * inv_scale),
+            y_unit_label=(unit if unit != 'auto' else 'm'),
+            joint_id=jid,
+        )
 
     # CSV注釈
     out_csv = args.out_csv

@@ -5,7 +5,8 @@ Pose runtime abstraction:
 
 Environment variables:
 - USE_POSE_LANDMARKER (default 1)
-- USE_NATIVE_POSE (default 0)
+- USE_NATIVE_POSE_MODE (off/on/auto, default auto)
+- USE_NATIVE_POSE (legacy fallback toggle)
 - POSE_TASK_MODEL (fallback to pose_landmarker_lite.task in this folder)
 - MP_THREADS (auto-detect if not set)
 - MP_INPUT_SCALE (0.25..1.0; default 0.5)
@@ -45,7 +46,28 @@ def _detect_threads(default: int = 8) -> int:
 
 # ========== Env toggles ==========
 USE_POSE_LANDMARKER = str(os.getenv('USE_POSE_LANDMARKER', '1')).lower() in ('1', 'true', 'yes')
-USE_NATIVE_POSE = str(os.getenv('USE_NATIVE_POSE', '0')).lower() in ('1', 'true', 'yes')
+_native_mode = str(os.getenv('USE_NATIVE_POSE_MODE', '')).strip().lower()
+if _native_mode not in ('off', 'on', 'auto'):
+    if _native_mode:
+        USE_NATIVE_POSE = _native_mode in ('1', 'true', 'yes')
+        NATIVE_POSE_MODE = 'on' if USE_NATIVE_POSE else 'off'
+    else:
+        # 後方互換: 既存 USE_NATIVE_POSE を優先（未指定時は auto）
+        _legacy = os.getenv('USE_NATIVE_POSE')
+        if _legacy is None:
+            NATIVE_POSE_MODE = 'auto'
+            USE_NATIVE_POSE = (_native_pose is not None) and hasattr(_native_pose, 'NativePoseEstimator')
+        else:
+            USE_NATIVE_POSE = str(_legacy).lower() in ('1', 'true', 'yes')
+            NATIVE_POSE_MODE = 'on' if USE_NATIVE_POSE else 'off'
+else:
+    NATIVE_POSE_MODE = _native_mode
+    if NATIVE_POSE_MODE == 'on':
+        USE_NATIVE_POSE = True
+    elif NATIVE_POSE_MODE == 'off':
+        USE_NATIVE_POSE = False
+    else:
+        USE_NATIVE_POSE = (_native_pose is not None) and hasattr(_native_pose, 'NativePoseEstimator')
 DEFAULT_TASK_MODEL = os.path.join(os.path.dirname(__file__), 'pose_landmarker_lite.task')
 POSE_TASK_MODEL = os.getenv('POSE_TASK_MODEL', DEFAULT_TASK_MODEL)
 if not os.path.exists(POSE_TASK_MODEL):
@@ -90,6 +112,7 @@ if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
     print(f"[CPU] MP_THREADS={MP_THREADS}  physical={_phy}  logical={_log}  os.cpu_count()={os.cpu_count()}")
     print(f"[CPU] OpenCV: numCPUs={_cv_cpus}  numThreads={_cv_threads}")
     print(f"[PoseRT] USE_POSE_LANDMARKER={USE_POSE_LANDMARKER}  model={POSE_TASK_MODEL}  exists={os.path.exists(POSE_TASK_MODEL)}")
+    print(f"[PoseRT] NATIVE_POSE_MODE={NATIVE_POSE_MODE} use_native={USE_NATIVE_POSE} native_module={'yes' if _native_pose is not None else 'no'}")
     print(f"[PoseRT] MP_INPUT_SCALE={MP_INPUT_SCALE}")
     _ocv_thr_env = os.getenv('OPENCV_THREADS', '').strip()
     if _ocv_thr_env:

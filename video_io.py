@@ -57,11 +57,10 @@ def find_recording_pairs(base_dir: str) -> list[tuple[str, str]]:
 def resolve_input_streams() -> Tuple[object, object, bool, str]:
     # 1) Force sample
     if USE_SAMPLE_VIDEOS:
-        if PREFER_RECORDING_PAIRS:
-            pairs = find_recording_pairs(folder_path)
-            if pairs:
-                cam0_file, cam1_file = pairs[0]
-                return cam0_file, cam1_file, True, "USE_SAMPLE_VIDEOS=1 (pair)"
+        pairs = find_recording_pairs(folder_path)
+        if pairs:
+            cam0_file, cam1_file = pairs[0]
+            return cam0_file, cam1_file, True, "USE_SAMPLE_VIDEOS=1 (paired recording)"
         cam0_file = os.path.join(folder_path, "media", "cam000_test.mp4")
         cam1_file = os.path.join(folder_path, "media", "cam111_test.mp4")
         print(f"[Info] Using sample videos: {cam0_file}, {cam1_file}")
@@ -84,12 +83,13 @@ def resolve_input_streams() -> Tuple[object, object, bool, str]:
         return s1, s2, False, "config: cameras 0/1"
 
     if AUTO_FALLBACK_TO_FILES:
-        cam0_file, cam1_file = find_latest_recordings(folder_path)
-        if cam0_file is None:
-            cam0_file = os.path.join(folder_path, "media", "cam000_test.mp4")
-        if cam1_file is None:
-            cam1_file = os.path.join(folder_path, "media", "cam111_test.mp4")
-        return cam0_file, cam1_file, True, "AUTO_FALLBACK_TO_FILES=1 (camera open failed)"
+        pairs = find_recording_pairs(folder_path)
+        if pairs:
+            cam0_file, cam1_file = pairs[0]
+            return cam0_file, cam1_file, True, "AUTO_FALLBACK_TO_FILES=1 (paired recording)"
+        cam0_file = os.path.join(folder_path, "media", "cam000_test.mp4")
+        cam1_file = os.path.join(folder_path, "media", "cam111_test.mp4")
+        return cam0_file, cam1_file, True, "AUTO_FALLBACK_TO_FILES=1 (media pair)"
 
     return s1, s2, not (s1 == 0 and s2 == 1), "no fallback"
 

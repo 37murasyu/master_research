@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "C:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics"
+    "cmake.sourceDirectory": "C:/Users/villa/Desktop/master_Research/MAINCODE/native_dynamics",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

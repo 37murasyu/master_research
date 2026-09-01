@@ -5,6 +5,7 @@ import glob
 import os
 import time
 import argparse
+import json
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -28,6 +29,35 @@ calibration_settings = {}
 skip_manual_confirmation = True
 
 
+def _save_checkerboard_short_axis(vector_cam0: np.ndarray, rows: int, columns: int, out_path: str = "camera_parameters/checkerboard_short_axis.json"):
+    try:
+        v = np.asarray(vector_cam0, dtype=float).reshape(3)
+        n = float(np.linalg.norm(v))
+        if (not np.all(np.isfinite(v))) or n < 1e-12:
+            return
+        v = v / n
+
+        # master_research_code.py と同じ座標変換（raw -> transformed）
+        v_runtime = np.array([-v[0], -v[2], -v[1]], dtype=float)
+        nr = float(np.linalg.norm(v_runtime))
+        if nr > 1e-12 and np.isfinite(nr):
+            v_runtime = v_runtime / nr
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        payload = {
+            "rows": int(rows),
+            "columns": int(columns),
+            "short_side_axis_board": "x" if rows <= columns else "y",
+            "vector_cam0": [float(v[0]), float(v[1]), float(v[2])],
+            "vector_runtime": [float(v_runtime[0]), float(v_runtime[1]), float(v_runtime[2])],
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] saved checkerboard short-side axis -> {out_path}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] checkerboard short-side axis save failed: {e}")
+
+
 def _intrinsic_file_key(camera_name):
     if camera_name == "camera0":
         return "c0"
@@ -38,6 +68,44 @@ def _intrinsic_file_key(camera_name):
 
 def _get_setting(key, default=None):
     return calibration_settings.get(key, default)
+
+
+def _set_and_verify_resolution(cap, desired_w, desired_h, label="cam", warmup_frames=5):
+    """
+    Try to set resolution, then read a few frames to confirm the actual output size.
+    Warns if the camera cannot deliver the requested resolution.
+    Returns (actual_w, actual_h).
+    """
+    # Read once to know the default
+    ok0, f0 = cap.read()
+    if ok0 and f0 is not None:
+        print(f"[INFO] {label} default resolution: {f0.shape[1]}x{f0.shape[0]}")
+    else:
+        print(f"[WARN] {label} default read failed; will try to set resolution anyway")
+
+    cap.set(3, desired_w)
+    cap.set(4, desired_h)
+
+    actual_w = actual_h = None
+    for _ in range(max(1, warmup_frames)):
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            actual_w = frame.shape[1]
+            actual_h = frame.shape[0]
+        else:
+            continue
+    if actual_w is None:
+        print(f"[WARN] {label} failed to read frame after resolution set")
+        return desired_w, desired_h
+
+    if actual_w != desired_w or actual_h != desired_h:
+        print(
+            f"[WARN] {label} requested {desired_w}x{desired_h} but got {actual_w}x{actual_h} (using actual)"
+        )
+    else:
+        print(f"[INFO] {label} resolution set OK: {actual_w}x{actual_h}")
+
+    return actual_w, actual_h
 
 
 # Given Projection matrices P1 and P2, and pixel coordinates point1 and point2, return triangulated 3D point.
@@ -70,10 +138,23 @@ def parse_calibration_settings_file(filename):
 
     # print('Using for calibration settings: ', filename)
 
-    with open(filename) as f:
-        calibration_settings = yaml.safe_load(f)
+    # Try UTF-8 first (YAML with Japanese comments), then UTF-8 BOM, then locale fallback.
+    encodings = ["utf-8", "utf-8-sig", "cp932"]
+    last_error = None
+    for enc in encodings:
+        try:
+            with open(filename, encoding=enc) as f:
+                calibration_settings = yaml.safe_load(f)
+            break
+        except UnicodeDecodeError as e:  # noqa: PERF203
+            last_error = e
+            continue
+    else:  # no break
+        raise UnicodeDecodeError(
+            "", b"", 0, 0, f"Failed to decode settings file with encodings {encodings}: {last_error}"
+        )
 
-    # rudimentray check to make sure correct file was loaded
+    # rudimentary check to make sure correct file was loaded
     if "camera0" not in calibration_settings.keys():
         # print('camera0 key was not found in the settings file. Check if correct calibration_settings.yaml file was passed')
         quit()
@@ -94,11 +175,21 @@ def save_frames_single_camera(camera_name):
     view_resize = calibration_settings["view_resize"]
     cooldown_time = calibration_settings["cooldown"]
 
-    # open video stream and change resolution.
-    # Note: if unsupported resolution is used, this does NOT raise an error.
-    cap = cv.VideoCapture(camera_device_id)
-    cap.set(3, width)
-    cap.set(4, height)
+    # open video stream (prefer DSHOW to avoid MSMF stream failures)
+    cap = None
+    for be in [cv.CAP_DSHOW, cv.CAP_MSMF, cv.CAP_ANY]:
+        cap = cv.VideoCapture(camera_device_id, be)
+        if cap is not None and cap.isOpened():
+            print(f"[INFO] Opened {camera_name} index={camera_device_id} backend={be}")
+            break
+        if cap:
+            cap.release()
+            cap = None
+    if cap is None or not cap.isOpened():
+        raise RuntimeError(f"{camera_name} (index {camera_device_id}) をオープンできません。USB接続/他アプリ占有を確認してください。")
+
+    # change resolution (with verification)
+    width, height = _set_and_verify_resolution(cap, width, height, label=camera_name)
 
     cooldown = cooldown_time
     start = False
@@ -190,14 +281,15 @@ def calibrate_camera_for_intrinsic_parameters(images_prefix):
 
     rows = calibration_settings["checkerboard_rows"]
     columns = calibration_settings["checkerboard_columns"]
-    world_scaling = calibration_settings[
-        "checkerboard_box_size_scale"
-    ]  # this will change to user defined length scale
+    # checkerboard_box_size_scale は cm 単位で設定されているため m に換算してから使う
+    world_scaling_cm = calibration_settings["checkerboard_box_size_scale"]
+    world_scaling = world_scaling_cm * 0.01
 
     # coordinates of squares in the checkerboard world space
     objp = np.zeros((rows * columns, 3), np.float32)
     objp[:, :2] = np.mgrid[0:rows, 0:columns].T.reshape(-1, 2)
     objp = world_scaling * objp
+    short_axis_board = np.array([1.0, 0.0, 0.0], dtype=np.float64) if rows <= columns else np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
     # frame dimensions. Frames should be the same size.
     width = images[0].shape[1]
@@ -208,6 +300,7 @@ def calibrate_camera_for_intrinsic_parameters(images_prefix):
 
     # coordinates of the checkerboard in checkerboard world space.
     objpoints = []  # 3d point in real world space
+    short_axis_samples_cam0 = []
 
     for i, frame in enumerate(images):
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
@@ -313,17 +406,13 @@ def save_frames_two_cams(camera0_name, camera1_name):
     if cap0 is None or not cap0.isOpened() or cap1 is None or not cap1.isOpened():
         raise RuntimeError("カメラオープン失敗。インデックス/他アプリ占有/USB 接続を確認してください。")
 
-    # Warm-up: discard initial unstable frames
-    for _ in range(10):
-        cap0.read(); cap1.read()
-
-    # set camera resolutions
+    # Warm-up & resolution set/verify
     width = calibration_settings["frame_width"]
     height = calibration_settings["frame_height"]
-    cap0.set(3, width)
-    cap0.set(4, height)
-    cap1.set(3, width)
-    cap1.set(4, height)
+    width0, height0 = _set_and_verify_resolution(cap0, width, height, label=camera0_name)
+    width1, height1 = _set_and_verify_resolution(cap1, width, height, label=camera1_name)
+    if (width0, height0) != (width1, height1):
+        print(f"[WARN] Resolution mismatch between cams: {camera0_name}={width0}x{height0}, {camera1_name}={width1}x{height1}")
 
     cooldown = cooldown_time
     start = False
@@ -633,12 +722,19 @@ def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c
     # calibration pattern settings
     rows = calibration_settings["checkerboard_rows"]
     columns = calibration_settings["checkerboard_columns"]
-    world_scaling = calibration_settings["checkerboard_box_size_scale"]
+    # 設定は cm 単位。外部パラメータのスケールを正しくするため m に換算して使用。
+    world_scaling_cm = calibration_settings["checkerboard_box_size_scale"]
+    world_scaling = world_scaling_cm * 0.01
 
     # coordinates of squares in the checkerboard world space
     objp = np.zeros((rows * columns, 3), np.float32)
     objp[:, :2] = np.mgrid[0:rows, 0:columns].T.reshape(-1, 2)
     objp = world_scaling * objp
+    short_axis_board = (
+        np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if rows <= columns
+        else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    )
 
     # Pixel coordinates of checkerboards
     imgpoints_left = []  # 2d points in image plane.
@@ -646,6 +742,7 @@ def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c
 
     # coordinates of the checkerboard in checkerboard world space.
     objpoints = []  # 3d point in real world space
+    short_axis_samples_cam0 = []
 
     for frame0, frame1 in zip(c0_images, c1_images):
         gray1 = cv.cvtColor(frame0, cv.COLOR_BGR2GRAY)
@@ -694,6 +791,25 @@ def stereo_calibrate(mtx0, dist0, mtx1, dist1, frames_prefix_c0, frames_prefix_c
             objpoints.append(objp)
             imgpoints_left.append(corners1)
             imgpoints_right.append(corners2)
+
+            # camera0 画像で短辺方向ベクトルを推定して保持
+            try:
+                ok_pnp, rvec, tvec = cv.solvePnP(objp, corners1, mtx0, dist0)
+                if ok_pnp:
+                    R_cb, _ = cv.Rodrigues(rvec)
+                    v_cam0 = (R_cb @ short_axis_board.reshape(3, 1)).reshape(3)
+                    nv = float(np.linalg.norm(v_cam0))
+                    if np.all(np.isfinite(v_cam0)) and nv > 1e-12:
+                        short_axis_samples_cam0.append(v_cam0 / nv)
+            except Exception:
+                pass
+
+    if len(objpoints) == 0:
+        raise RuntimeError("チェッカーボード検出が1枚も成功しませんでした。パターンが映っているか、rows/cols設定を確認してください。")
+
+    if short_axis_samples_cam0:
+        v_med = np.median(np.stack(short_axis_samples_cam0, axis=0), axis=0)
+        _save_checkerboard_short_axis(v_med, rows, columns)
 
     stereocalibration_flags = cv.CALIB_FIX_INTRINSIC
     data = {
@@ -911,7 +1027,9 @@ def get_world_space_origin(cmtx, dist, img_path):
     # calibration pattern settings
     rows = calibration_settings["checkerboard_rows"]
     columns = calibration_settings["checkerboard_columns"]
-    world_scaling = calibration_settings["checkerboard_box_size_scale"]
+    # 設定値は cm。solvePnP で正しいワールドスケールを得るため m に換算。
+    world_scaling_cm = calibration_settings["checkerboard_box_size_scale"]
+    world_scaling = world_scaling_cm * 0.01
 
     # coordinates of squares in the checkerboard world space
     objp = np.zeros((rows * columns, 3), np.float32)
@@ -1120,6 +1238,7 @@ if __name__ == "__main__":
     parser.add_argument("--cam-pair", default=None, help="使用するカメラインデックスを '0,2' のように指定。指定時 calibration_settings の camera0/camera1 を上書き")
     parser.add_argument("--skip-save-frames", action="store_true", help="Step3 のペアフレーム保存をスキップ (既存 frames_pair 利用)")
     parser.add_argument("--skip-check", action="store_true", help="最終的な check_calibration 表示をスキップ")
+    parser.add_argument("--skip-gauge-demo", action="store_true", help="キャリブレーション完了後のデモ用ゲージ UI 表示をスキップ")
     parser.add_argument("--force-recapture", action="store_true", help="既存 frames_pair ディレクトリを削除して再キャプチャを強制")
     parser.add_argument("--expected-stereo-frames", type=int, default=None, help="ステレオキャプチャ期待枚数 (calibration_settings.stereo_calibration_frames を上書き)")
     parser.add_argument("--probe-cams", action="store_true", help="利用可能なカメラインデックスをスキャンして終了")
@@ -1317,5 +1436,19 @@ if __name__ == "__main__":
         check_calibration("camera0", camera0_data, "camera1", camera1_data, RMSE, _zshift=60.0)
     else:
         print("[INFO] Skipping visual check")
+
+    if not args.skip_gauge_demo:
+        try:
+            import time as _t
+            print("[INFO] Gauge demo will launch in 2 seconds...")
+            _t.sleep(2.0)
+            try:
+                from run_gauge_demo import main as gauge_demo_main
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] run_gauge_demo 読み込みに失敗しました: {e}")
+            else:
+                gauge_demo_main()
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Gauge demo 起動に失敗しました: {e}")
 
 # %%

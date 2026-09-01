@@ -7,9 +7,13 @@ import traceback
 import os
 import time
 import importlib  # Pylint E0601 対策: 後段で importlib.util を参照するため先行 import
-import serial
+try:
+    import serial
+except Exception:
+    serial = None
 import sys
 import datetime
+import collections
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -20,6 +24,7 @@ import numpy as np
 import pandas as pd
 import csv
 import json
+from extended_kalman_filter import EKFConfig, ExtendedKalman1D
 from pose_runtime import PoseEstimator
 from logging_setup import setup_logging, get_logger
 from video_io import (
@@ -41,6 +46,7 @@ from config import (
     m1,
     m2,
     m4,
+
     pose_keypoints,
     rm_path,
     save_dir,
@@ -77,8 +83,13 @@ from utils_dynamic import (
     calculate_inertia_tensor,
     calculate_M_and_F,
     compute_tau_chain_native,
+    compute_lpf_exp_fb_native,
+    compute_triangulate_transform_native,
 )
-from Gauge_display import GaugeDisplay
+try:
+    from Gauge_display import GaugeDisplay
+except Exception:
+    GaugeDisplay = None
 try:
     import py_native_overlay as _native_overlay
 except Exception:
@@ -94,7 +105,7 @@ import glob
 from typing import Optional, Tuple
 try:
     # 推奨: SciPy フィルタと補間
-    from scipy.signal import butter, filtfilt
+    from scipy.signal import butter, filtfilt, lfilter, lfilter_zi, welch
     from scipy.interpolate import PchipInterpolator
     _SCIPY_OK = True
 except Exception:
@@ -113,16 +124,272 @@ E_MAX_DTH = float(os.getenv('E_MAX_DTH', '0.25'))  # 角度ステップの上限
 E_WINSOR_PCTL_LOW = float(os.getenv('E_WLOW', '5'))  # トルクの下側ウィンズライジング
 E_WINSOR_PCTL_HIGH = float(os.getenv('E_WHIGH', '95'))
 E_DEBUG = os.getenv('E_DEBUG', '0') in ('1','true','True')
+E_LPF_NATIVE_ON = os.getenv('E_LPF_NATIVE_ON', '1') in ('1','true','True')
+TRIANG_NATIVE_ON = os.getenv('TRIANG_NATIVE_ON', '1') in ('1','true','True')
 
-# 肘の角度・トルクのフレーム蓄積バッファ（1サイクル分）
+# ===================== 重力向き検出/管理 設定 =====================
+GRAVITY_AUTO_DETECT = os.getenv('GRAVITY_AUTO_DETECT', '1') in ('1','true','True')
+GRAVITY_FROM_CHECKERBOARD_SHORT = os.getenv('GRAVITY_FROM_CHECKERBOARD_SHORT', '1') in ('1','true','True')
+GRAVITY_CHECKERBOARD_AXIS_FILE = os.getenv('GRAVITY_CHECKERBOARD_AXIS_FILE', 'camera_parameters/checkerboard_short_axis.json')
+GRAVITY_DETECT_FRAMES = int(os.getenv('GRAVITY_DETECT_FRAMES', '90'))  # 3秒@30fps目安
+GRAVITY_PREFERRED = os.getenv('GRAVITY_PREFERRED', 'Y-')  # フォールバック表示用
+GRAVITY_TAG_IN_CSV = os.getenv('GRAVITY_TAG_IN_CSV', '1') in ('1','true','True')
+# Webカメラは必ずしも水平でないため、平面拘束は既定OFF（必要時のみON）
+GRAVITY_LEVEL_PLANE_ON = os.getenv('GRAVITY_LEVEL_PLANE_ON', '0') in ('1','true','True')
+GRAVITY_LEVEL_PLANE = os.getenv('GRAVITY_LEVEL_PLANE', 'YZ').upper()  # XY/YZ/XZ
+GRAVITY_AMBIG_DELTA = float(os.getenv('GRAVITY_AMBIG_DELTA', '0.08'))  # 近接時はpreferred優先
+GRAVITY_LEVEL_PLANE_WEBCAM_OK = os.getenv('GRAVITY_LEVEL_PLANE_WEBCAM_OK', '0') in ('1','true','True')
+
+# ===================== 適応的LPF設定（リアルタイムf0追跡）=====================
+E_FC_ADAPTIVE_ON = int(os.getenv('E_FC_ADAPTIVE_ON', '0'))  # 0=固定fc, 1=適応fc
+E_FC_MIN = float(os.getenv('E_FC_MIN', '2.1'))  # fc下限 [Hz]
+E_FC_MAX = float(os.getenv('E_FC_MAX', '6.0'))  # fc上限 [Hz]
+E_FC_K = float(os.getenv('E_FC_K', '6.0'))  # f0→fc倍数（オフライン統計値）
+E_F0_WIN_SEC = float(os.getenv('E_F0_WIN_SEC', '4.0'))  # FFT窓長 [秒]
+E_FC_EMA_BETA = float(os.getenv('E_FC_EMA_BETA', '0.15'))  # fc平滑度 [0-1]
+E_FC_UPDATE_HZ = float(os.getenv('E_FC_UPDATE_HZ', '1.0'))  # fc更新レート [Hz]
+E_F0_FMIN = float(os.getenv('E_F0_FMIN', '0.3'))  # 最小検出周波数 [Hz]
+E_F0_SNR_THRESHOLD = float(os.getenv('E_F0_SNR_THRESHOLD', '3.0'))  # 信頼度 [dB]
+E_FPS_EMA_BETA = float(os.getenv('E_FPS_EMA_BETA', '0.20'))  # 実効fps追従EMA [0-1]
+E_FPS_MIN = float(os.getenv('E_FPS_MIN', '5.0'))  # 実効fps下限（異常値抑制）
+E_FPS_MAX = float(os.getenv('E_FPS_MAX', '120.0'))  # 実効fps上限（異常値抑制）
+
+# 拡張カルマンフィルタ設定（ランドマーク位置/速度/加速度）
+EKF_ENABLE = os.getenv('EKF_ENABLE', '1') in ('1', 'true', 'True')
+EKF_Q_ACC = float(os.getenv('EKF_Q_ACC', '1e-3'))
+EKF_R = float(os.getenv('EKF_R', '1e-3'))
+EKF_GATE_STD = float(os.getenv('EKF_GATE_STD', '3.0'))
+# バンドパス（任意）: low/high Hz を設定すると IIR で逐次前処理
+EKF_BPF_LOW = float(os.getenv('EKF_BPF_LOW', '0'))
+EKF_BPF_HIGH = float(os.getenv('EKF_BPF_HIGH', '0'))
+EKF_BPF_ORDER = int(os.getenv('EKF_BPF_ORDER', '2'))
+
+# 肘の角度・トルクのフレーム蓄積バッファ（1サイwクル分）
 _E_buffers = {
     'elbow_R': {'theta': [], 'tau': []},
     'elbow_L': {'theta': [], 'tau': []},
 }
 
+# ===================== 適応的LPFのグローバル状態 =====================
+_f0_estimator = None  # lazy init (OnlineF0Estimator instance)
+_fc_current = E_FC  # 現在のfc値（Hz）
+_fc_update_counter = 0  # 更新フレームカウンタ
+_fc_update_interval = None  # lazy set: int(fps / E_FC_UPDATE_HZ)
+_lpf_fps_ema = None  # 実効fps推定（loop_dt由来EMA）
+_e_dt_sec_current = float(dt) if (isinstance(dt, (int, float)) and dt > 0) else (1.0 / 30.0)
+
+# ===================== 重力推定のグローバル状態 =====================
+_grav_up_samples = collections.deque(maxlen=max(10, GRAVITY_DETECT_FRAMES))
+_gravity_label = GRAVITY_PREFERRED  # 重力向きラベル（例: Y-）
+_gravity_set = False
+_gravity_level_plane_on_runtime = GRAVITY_LEVEL_PLANE_ON
+
+# ===================== 適応的f0推定器 =====================
+class OnlineF0Estimator:
+    """短時間FFTでθから支配周波数(f0)を推定。"""
+    def __init__(self, fps: float, win_sec: float = 4.0, fmin: float = 0.3):
+        """
+        Args:
+            fps: フレームレート (Hz)
+            win_sec: 分析窓長 (秒)
+            fmin: 最小検出周波数 (Hz)
+        """
+        self.fps = fps
+        self.win_sec = float(win_sec)
+        self.win_len = max(64, int(fps * win_sec))  # FFTに最小64サンプル確保
+        self.fmin = fmin
+        self.buffer = collections.deque(maxlen=self.win_len)
+        self.update_counter = 0
+
+    def set_fps(self, fps_new: float) -> None:
+        """実効fps更新（窓長も秒ベースで追従）。"""
+        if (not np.isfinite(fps_new)) or fps_new <= 1e-6:
+            return
+        fps_use = float(np.clip(fps_new, E_FPS_MIN, E_FPS_MAX))
+        if abs(fps_use - self.fps) < 1e-6:
+            return
+        self.fps = fps_use
+        new_win_len = max(64, int(round(self.fps * self.win_sec)))
+        if new_win_len != self.win_len:
+            self.win_len = new_win_len
+            self.buffer = collections.deque(list(self.buffer), maxlen=self.win_len)
+    
+    def step(self, theta_sample: float) -> None:
+        """新しいθサンプルを受け取り、バッファに追加"""
+        if np.isfinite(theta_sample):
+            self.buffer.append(float(theta_sample))
+        self.update_counter += 1
+    
+    def estimate(self) -> tuple[float, float]:
+        """
+        FFT/Welchで周波数推定。
+        Returns: (f0_hz, confidence_db)
+        """
+        if len(self.buffer) < 64:
+            return 0.0, 0.0
+        
+        th_arr = np.array(list(self.buffer), dtype=np.float64)
+        th_arr = np.unwrap(th_arr)
+        
+        # Welch: 50% overlap, Hann window (or fallback to simple FFT)
+        try:
+            if _SCIPY_OK:
+                freqs, psd = welch(th_arr, fs=self.fps, window='hann', nperseg=min(256, len(th_arr)), noverlap=None)
+            else:
+                # Fallback: simple FFT (Hann windowed)
+                win = np.hanning(len(th_arr))
+                th_w = th_arr * win
+                fft_val = np.abs(np.fft.rfft(th_w)) ** 2
+                freqs = np.fft.rfftfreq(len(th_arr), 1.0 / self.fps)
+                psd = fft_val / np.sum(win ** 2)  # Normalize
+        except Exception:
+            return 0.0, 0.0
+        
+        # fmin以上のピークを検索
+        mask = freqs >= self.fmin
+        if not np.any(mask):
+            return 0.0, 0.0
+        
+        freqs_m = freqs[mask]
+        psd_m = psd[mask]
+        
+        if len(psd_m) == 0:
+            return 0.0, 0.0
+        
+        idx_peak = np.argmax(psd_m)
+        f0 = float(freqs_m[idx_peak])
+        
+        # SNR推定（ピーク vs. 平均背景）
+        bg_power = np.median(psd_m)
+        peak_power = psd_m[idx_peak]
+        snr_db = 10.0 * np.log10(max(1e-9, peak_power / max(1e-12, bg_power)))
+        
+        return f0, snr_db
+
+def _fc_scheduler(f0_hat: float, confidence_db: float, fc_prev: float, 
+                  fc_min: float, fc_max: float, fc_k: float, 
+                  ema_beta: float, snr_threshold: float) -> float:
+    """適応的fcスケジューラ。
+    
+    Args:
+        f0_hat: 推定周波数 (Hz)
+        confidence_db: 信頼度（SNR dB）
+        fc_prev: 前フレームのfc
+        fc_min, fc_max: fc範囲
+        fc_k: f0→fc倍数
+        ema_beta: 平滑係数 [0-1]
+        snr_threshold: 信頼度閾値（dB）
+    
+    Returns: 次のfc値 (Hz)
+    """
+    # 低信頼度ならfc_prevを維持
+    if confidence_db < snr_threshold or f0_hat <= 0:
+        return fc_prev
+    
+    # fc_raw = k * f0
+    fc_raw = fc_k * f0_hat
+    
+    # クリップ
+    fc_clipped = np.clip(fc_raw, fc_min, fc_max)
+    
+    # EMA平滑 (jitter低減)
+    fc_next = (1.0 - ema_beta) * fc_prev + ema_beta * fc_clipped
+    
+    return float(fc_next)
+
+def _axis_vec_from_label(label: str) -> np.ndarray:
+    mapping = {
+        'X+': np.array([ 1.0, 0.0, 0.0]), 'X-': np.array([-1.0, 0.0, 0.0]),
+        'Y+': np.array([ 0.0, 1.0, 0.0]), 'Y-': np.array([ 0.0,-1.0, 0.0]),
+        'Z+': np.array([ 0.0, 0.0, 1.0]), 'Z-': np.array([ 0.0, 0.0,-1.0]),
+    }
+    return mapping.get(label, np.array([0.0, -1.0, 0.0]))
+
+
+def _opposite_axis_label(label: str) -> str:
+    if label.endswith('+'):
+        return label[:-1] + '-'
+    if label.endswith('-'):
+        return label[:-1] + '+'
+    return label
+
+
+def _candidate_axis_labels() -> list[str]:
+    if not _gravity_level_plane_on_runtime:
+        return ['X+', 'X-', 'Y+', 'Y-', 'Z+', 'Z-']
+    plane = GRAVITY_LEVEL_PLANE
+    if plane == 'YZ':
+        return ['Y+', 'Y-', 'Z+', 'Z-']
+    if plane == 'XZ':
+        return ['X+', 'X-', 'Z+', 'Z-']
+    if plane == 'XY':
+        return ['X+', 'X-', 'Y+', 'Y-']
+    return ['X+', 'X-', 'Y+', 'Y-', 'Z+', 'Z-']
+
+
+def _pick_axis_from_vector(v: np.ndarray) -> tuple[str, np.ndarray, float]:
+    """肩→腰ベクトル(=上方向)から最も近い軸と符号を選ぶ。
+    GRAVITY_LEVEL_PLANE_ON=1 のとき、候補軸を指定平面に制限する。
+    Returns: (up_label like 'Y+', up_axis_unit_vec, cosine_abs)
+    """
+    pref_up_label = _opposite_axis_label(GRAVITY_PREFERRED)
+    pref_up_axis = _axis_vec_from_label(pref_up_label)
+    if v is None or not np.all(np.isfinite(v)):
+        return pref_up_label, pref_up_axis, 0.0
+    vn = np.array(v, dtype=float)
+    n = float(np.linalg.norm(vn))
+    if n < 1e-9:
+        return pref_up_label, pref_up_axis, 0.0
+    vn /= n
+
+    candidates = _candidate_axis_labels()
+    scored = []
+    for lab in candidates:
+        ax = _axis_vec_from_label(lab)
+        cabs = abs(float(np.dot(vn, ax)))
+        scored.append((cabs, lab, ax))
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    best_val, best_label, best_axis = scored[0]
+    # 上位2候補が近い場合は preferred を優先（軸ラベル一貫性を維持）
+    if len(scored) > 1 and (best_val - scored[1][0]) < GRAVITY_AMBIG_DELTA:
+        for _, lab, ax in scored:
+            if lab == pref_up_label:
+                return lab, ax, abs(float(np.dot(vn, ax)))
+    return best_label, best_axis, best_val
+
+
+def _load_checkerboard_short_axis_runtime(path: str) -> np.ndarray | None:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        cand = d.get('vector_runtime', None)
+        if cand is None:
+            cand = d.get('vector_cam0', None)
+            if cand is not None and len(cand) == 3:
+                cand = [-float(cand[0]), -float(cand[2]), -float(cand[1])]
+        if cand is None:
+            return None
+        v = np.asarray(cand, dtype=float).reshape(3)
+        if not np.all(np.isfinite(v)):
+            return None
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            return None
+        return v / n
+    except Exception:
+        return None
+
 def _butter_lowpass_filtfilt(x: np.ndarray, fs: float, fc: float, order: int) -> np.ndarray:
     if len(x) < max(8, 3*order+1):
         return x.copy()
+    if E_LPF_NATIVE_ON:
+        try:
+            dt_local = 1.0 / max(1e-6, float(fs))
+            passes = max(1, int(order))
+            return compute_lpf_exp_fb_native(np.asarray(x, dtype=np.float64), dt_local, float(fc), passes=passes)
+        except Exception:
+            pass
     if not _SCIPY_OK:
         # 簡易フォールバック: 移動平均
         k = max(3, min(9, len(x)//10*2+1))
@@ -172,6 +439,53 @@ def _angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
     crossn = np.linalg.norm(np.cross(a/na, b/nb))
     return math.atan2(crossn, dot)
 
+
+def _kp2d_valid(kpts, idx: int) -> Optional[np.ndarray]:
+    try:
+        x, y = kpts[idx]
+        x = float(x)
+        y = float(y)
+        if (x < 0) or (y < 0) or (not np.isfinite(x)) or (not np.isfinite(y)):
+            return None
+        return np.array([x, y], dtype=np.float64)
+    except Exception:
+        return None
+
+
+def _elbow_angle_deg_cam0(kpts_cam0, side: str) -> Optional[float]:
+    if side == 'R':
+        sh, el, wr = 2, 1, 0
+    else:
+        sh, el, wr = 3, 4, 5
+    p_sh = _kp2d_valid(kpts_cam0, sh)
+    p_el = _kp2d_valid(kpts_cam0, el)
+    p_wr = _kp2d_valid(kpts_cam0, wr)
+    if p_sh is None or p_el is None or p_wr is None:
+        return None
+    v1 = p_sh - p_el
+    v2 = p_wr - p_el
+    n1 = float(np.linalg.norm(v1))
+    n2 = float(np.linalg.norm(v2))
+    if n1 < 1e-9 or n2 < 1e-9:
+        return None
+    cs = float(np.dot(v1, v2) / (n1 * n2))
+    cs = float(np.clip(cs, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cs)))
+
+
+def _shoulder_world_y_m(results0, side: str) -> Optional[float]:
+    try:
+        if not getattr(results0, 'pose_world_landmarks', None):
+            return None
+        idx = 12 if side == 'R' else 11
+        lm = results0.pose_world_landmarks.landmark[idx]
+        y = float(lm.y)
+        if not np.isfinite(y):
+            return None
+        return y
+    except Exception:
+        return None
+
 def _winsorize(y: np.ndarray, p_low: float, p_high: float) -> np.ndarray:
     if len(y) < 4:
         return y.copy()
@@ -179,18 +493,101 @@ def _winsorize(y: np.ndarray, p_low: float, p_high: float) -> np.ndarray:
     hi = np.percentile(y, p_high)
     return np.clip(y, lo, hi)
 
-def compute_cycle_energy_filtered(theta: np.ndarray, tau: np.ndarray, dt_sec: float) -> tuple[float, float, dict]:
+
+class LandmarkEKF:
+    """Streaming EKF (per-axis) with optional band-pass prefilter for 3D landmarks."""
+
+    def __init__(
+        self,
+        n_points: int,
+        fs: float,
+        cfg: EKFConfig,
+        bpf_low: float = 0.0,
+        bpf_high: float = 0.0,
+        bpf_order: int = 2,
+    ) -> None:
+        self.n_points = int(n_points)
+        self.cfg = cfg
+        self.filters = [[ExtendedKalman1D(cfg) for _ in range(3)] for _ in range(self.n_points)]
+        # streaming band-pass (optional)
+        self._bpf_enabled = False
+        self._bpf_b = None
+        self._bpf_a = None
+        self._bpf_state = None
+        if _SCIPY_OK and bpf_low > 0 and bpf_high > 0 and bpf_high > bpf_low:
+            nyq = 0.5 * fs
+            low = max(1e-3, bpf_low / nyq)
+            high = min(0.99, bpf_high / nyq)
+            if low < high:
+                self._bpf_b, self._bpf_a = butter(bpf_order, [low, high], btype='band')
+                zi = lfilter_zi(self._bpf_b, self._bpf_a)
+                self._bpf_state = np.tile(zi, (self.n_points, 3, 1))
+                self._bpf_enabled = True
+
+    def _apply_bpf(self, arr: np.ndarray) -> np.ndarray:
+        if not self._bpf_enabled:
+            return arr
+        out = np.array(arr, dtype=float, copy=True)
+        for i in range(self.n_points):
+            for j in range(3):
+                x = arr[i, j]
+                if not np.isfinite(x):
+                    continue
+                y, zf = lfilter(self._bpf_b, self._bpf_a, [x], zi=self._bpf_state[i, j])
+                self._bpf_state[i, j] = zf
+                out[i, j] = y[-1]
+        return out
+
+    def step(self, meas: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if meas.shape != (self.n_points, 3):
+            raise ValueError(f"meas shape must be {(self.n_points, 3)}, got {meas.shape}")
+        if dt <= 0:
+            dt = 1e-3
+        arr = np.asarray(meas, dtype=float)
+        arr = self._apply_bpf(arr)
+        pos = np.zeros_like(arr)
+        vel = np.zeros_like(arr)
+        acc = np.zeros_like(arr)
+        for i in range(self.n_points):
+            for j in range(3):
+                z_val = arr[i, j]
+                meas_val = None if not np.isfinite(z_val) else float(z_val)
+                px, pv, pa = self.filters[i][j].step(meas_val, dt)
+                pos[i, j], vel[i, j], acc[i, j] = px, pv, pa
+        return pos, vel, acc
+
+def compute_cycle_energy_filtered(theta: np.ndarray, tau: np.ndarray, dt_sec: float, fc_override: float = None) -> tuple[float, float, dict]:
     """推奨パイプラインで E⁺/E⁻ を返す。
+    
+    Args:
+        theta: 肘角度配列 [rad]
+        tau: トルク配列 [N·m]
+        dt_sec: サンプリング間隔 [秒]
+        fc_override: フィルタ周波数上書き (Hz, デフォルト=None → E_FCを使用)
+    
     Returns: (E_pos, E_neg, info)
     """
-    n = len(theta)
+    th_arr = np.asarray(theta, dtype=np.float64).reshape(-1)
+    tau_arr = np.asarray(tau, dtype=np.float64).reshape(-1)
+    finite_mask = np.isfinite(th_arr) & np.isfinite(tau_arr)
+    th_arr = th_arr[finite_mask]
+    tau_arr = tau_arr[finite_mask]
+
+    n = len(th_arr)
     if n < 3:
-        return 0.0, 0.0, {'status': 'too_few', 'n': n}
+        return 0.0, 0.0, {'status': 'too_few', 'n': n, 'n_valid': int(np.sum(finite_mask))}
     fs = 1.0 / max(1e-6, dt_sec)
+    
+    # ===== 適応fc選択 =====
+    if E_FC_ADAPTIVE_ON and fc_override is not None and fc_override > 0:
+        fc_use = fc_override
+    else:
+        fc_use = E_FC
+    
     # 1) unwrap + LPF
-    th = np.unwrap(np.asarray(theta, dtype=np.float64))
-    th_f = _butter_lowpass_filtfilt(th, fs, E_FC, E_LPF_ORDER)
-    tau_f = _butter_lowpass_filtfilt(np.asarray(tau, dtype=np.float64), fs, E_FC, E_LPF_ORDER)
+    th = np.unwrap(th_arr)
+    th_f = _butter_lowpass_filtfilt(th, fs, fc_use, E_LPF_ORDER)
+    tau_f = _butter_lowpass_filtfilt(tau_arr, fs, fc_use, E_LPF_ORDER)
     # 2) 時間正規化（0..T を 0..1 に）
     t = np.arange(n, dtype=np.float64) * dt_sec
     ui, th_u = _interp_uniform(t, th_f, E_RESAMPLE_N)
@@ -204,7 +601,7 @@ def compute_cycle_energy_filtered(theta: np.ndarray, tau: np.ndarray, dt_sec: fl
     contrib = tau_mid * dth
     e_pos = float(np.sum(np.maximum(contrib, 0.0)))
     e_neg = float(np.sum(np.maximum(-contrib, 0.0)))
-    info = {'status': 'ok', 'n_u': int(len(th_u))}
+    info = {'status': 'ok', 'n_u': int(len(th_u)), 'n_valid': int(n)}
     if len(th_u) < 30:
         info['low_conf'] = True
     if E_DEBUG:
@@ -260,6 +657,18 @@ except Exception:
     MP_INPUT_SCALE = 0.5
 MP_INPUT_SCALE = max(0.25, min(MP_INPUT_SCALE, 1.0))
 
+# 前フレーム近傍ROIでPose推論を軽量化（人体が急変しない前提）
+POSE_ROI_ON = os.getenv('POSE_ROI_ON', '1') in ('1', 'true', 'True')
+POSE_ROI_MARGIN_RATIO = float(os.getenv('POSE_ROI_MARGIN_RATIO', '0.25'))
+POSE_ROI_MIN_SIDE_RATIO = float(os.getenv('POSE_ROI_MIN_SIDE_RATIO', '0.45'))
+POSE_ROI_MIN_VALID_KPTS = int(os.getenv('POSE_ROI_MIN_VALID_KPTS', '4'))
+POSE_ROI_MAX_MISS = int(os.getenv('POSE_ROI_MAX_MISS', '4'))
+POSE_ROI_MISS_GROW_RATIO = float(os.getenv('POSE_ROI_MISS_GROW_RATIO', '0.25'))
+POSE_X_CROP_MARGIN = int(os.getenv('POSE_X_CROP_MARGIN', '140'))
+POSE_X_CROP_MIN_WIDTH_RATIO = float(os.getenv('POSE_X_CROP_MIN_WIDTH_RATIO', '0.85'))
+DRAW_KEYPOINTS_ON = os.getenv('DRAW_KEYPOINTS', '1') not in ('0', 'false', 'False')
+KPS_FAST_ON = os.getenv('KPS_FAST_ON', '0') in ('1', 'true', 'True')
+
 # デバッグ出力: 使用コア数・モデルパスなど（POSE_DEBUG=1 で有効）
 if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
     try:
@@ -301,38 +710,40 @@ def _tasks_imports():
         return None, None, None, None
 
 # ================= HX711 Recorder (M5StampS3) 連携 追加インポート (オプション) =================
+HX711_ENABLE = os.getenv('HX711_ENABLE', '0') in ('1', 'true', 'True')
 HX_RECORDER_AVAILABLE = False
 BLE_RECORDER_AVAILABLE = False
 RecorderClient = None  # type: ignore
 BLERecorderClientSync = None  # type: ignore
-try:
-    # 依存: requests / bleak 等が内部で必要な場合がある
-    import importlib.util  # noqa: F401
-    from hx711_recorder import RecorderClient, BLERecorderClientSync  # type: ignore  # pylint: disable=import-error
-    HX_RECORDER_AVAILABLE = True
-    BLE_RECORDER_AVAILABLE = True
-except Exception as _hx_e:
-    # print(f"[HX711] インポート失敗(一次): {_hx_e}")
-    # 環境変数 HX711_CLIENT_DIR で外部パス指定可
+if HX711_ENABLE:
     try:
-        HX_CLIENT_DIR = os.getenv('HX711_CLIENT_DIR') or os.path.join(os.path.dirname(__file__), '..', 'wokwi', 'stamps3_force_logger1', 'python_client')
-        candidate_path = os.path.join(HX_CLIENT_DIR, 'hx711_recorder.py')
-        if os.path.isfile(candidate_path):
-            spec = importlib.util.spec_from_file_location('hx711_recorder', candidate_path)
-            if spec and spec.loader:
-                mod = spec.loader.load_module()  # type: ignore[attr-defined]
-                RecorderClient = getattr(mod, 'RecorderClient', None)
-                BLERecorderClientSync = getattr(mod, 'BLERecorderClientSync', None)
-                if RecorderClient:
-                    HX_RECORDER_AVAILABLE = True
-                    BLE_RECORDER_AVAILABLE = BLERecorderClientSync is not None
-                    # print('[HX711] 直接パス読み込みで RecorderClient 利用可能')
-        else:
-            # print('[HX711] 外部クライアントパスが見つかりませんでした')
+        # 依存: requests / bleak 等が内部で必要な場合がある
+        import importlib.util  # noqa: F401
+        from hx711_recorder import RecorderClient, BLERecorderClientSync  # type: ignore  # pylint: disable=import-error
+        HX_RECORDER_AVAILABLE = True
+        BLE_RECORDER_AVAILABLE = True
+    except Exception as _hx_e:
+        # print(f"[HX711] インポート失敗(一次): {_hx_e}")
+        # 環境変数 HX711_CLIENT_DIR で外部パス指定可
+        try:
+            HX_CLIENT_DIR = os.getenv('HX711_CLIENT_DIR') or os.path.join(os.path.dirname(__file__), '..', 'wokwi', 'stamps3_force_logger1', 'python_client')
+            candidate_path = os.path.join(HX_CLIENT_DIR, 'hx711_recorder.py')
+            if os.path.isfile(candidate_path):
+                spec = importlib.util.spec_from_file_location('hx711_recorder', candidate_path)
+                if spec and spec.loader:
+                    mod = spec.loader.load_module()  # type: ignore[attr-defined]
+                    RecorderClient = getattr(mod, 'RecorderClient', None)
+                    BLERecorderClientSync = getattr(mod, 'BLERecorderClientSync', None)
+                    if RecorderClient:
+                        HX_RECORDER_AVAILABLE = True
+                        BLE_RECORDER_AVAILABLE = BLERecorderClientSync is not None
+                        # print('[HX711] 直接パス読み込みで RecorderClient 利用可能')
+            else:
+                # print('[HX711] 外部クライアントパスが見つかりませんでした')
+                pass
+        except Exception as _hx_e2:  # pragma: no cover
+            # print(f"[HX711] Fallback インポート失敗: {_hx_e2}")
             pass
-    except Exception as _hx_e2:  # pragma: no cover
-        # print(f"[HX711] Fallback インポート失敗: {_hx_e2}")
-        pass
 
 # オプション依存 requests を遅延インポート (Pylint import-error 抑止用)
 def _lazy_requests():  # pragma: no cover - 単純ヘルパ
@@ -419,30 +830,31 @@ else:
 HX_CLIENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'wokwi', 'stamps3_force_logger1', 'python_client'))
 if os.path.isdir(HX_CLIENT_DIR) and HX_CLIENT_DIR not in sys.path:
     sys.path.append(HX_CLIENT_DIR)
-try:  # noqa: SIM105
-    from hx711_recorder import RecorderClient, BLERecorderClientSync  # type: ignore  # pylint: disable=import-error
-except Exception as _hx_e:  # pragma: no cover
-    RecorderClient = None  # type: ignore
-    BLERecorderClientSync = None  # type: ignore
-    # print(f"[HX711] インポート失敗(一次): {_hx_e}")
+if HX711_ENABLE:
+    try:  # noqa: SIM105
+        from hx711_recorder import RecorderClient, BLERecorderClientSync  # type: ignore  # pylint: disable=import-error
+    except Exception as _hx_e:  # pragma: no cover
+        RecorderClient = None  # type: ignore
+        BLERecorderClientSync = None  # type: ignore
+        # print(f"[HX711] インポート失敗(一次): {_hx_e}")
 
-    # --- Fallback: 直接ファイルパスからロードを試みる ---
-    try:
-        import importlib.util
-        candidate_path = os.path.join(HX_CLIENT_DIR, 'hx711_recorder.py')
-        if os.path.isfile(candidate_path):
-            spec = importlib.util.spec_from_file_location('hx711_recorder', candidate_path)
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)  # type: ignore[arg-type]
-                RecorderClient = getattr(module, 'RecorderClient', None)  # type: ignore
-                BLERecorderClientSync = getattr(module, 'BLERecorderClientSync', None)  # type: ignore
-                if RecorderClient is not None:
-                    # print('[HX711] 直接パス読み込みで RecorderClient 利用可能')
-                    pass
-    except Exception as _hx_e2:  # noqa: BLE001
-        # print(f"[HX711] Fallback インポート失敗: {_hx_e2}")
-        pass
+        # --- Fallback: 直接ファイルパスからロードを試みる ---
+        try:
+            import importlib.util
+            candidate_path = os.path.join(HX_CLIENT_DIR, 'hx711_recorder.py')
+            if os.path.isfile(candidate_path):
+                spec = importlib.util.spec_from_file_location('hx711_recorder', candidate_path)
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)  # type: ignore[arg-type]
+                    RecorderClient = getattr(module, 'RecorderClient', None)  # type: ignore
+                    BLERecorderClientSync = getattr(module, 'BLERecorderClientSync', None)  # type: ignore
+                    if RecorderClient is not None:
+                        # print('[HX711] 直接パス読み込みで RecorderClient 利用可能')
+                        pass
+        except Exception as _hx_e2:  # noqa: BLE001
+            # print(f"[HX711] Fallback インポート失敗: {_hx_e2}")
+            pass
 
 def _iso8601_utc_ms() -> str:
     """UTC 現在時刻を ISO8601 (ミリ秒) 文字列で返す。例: 2025-09-22T13:45:12.345Z"""
@@ -635,7 +1047,7 @@ class SafeSerialController:
     def __init__(self, baudrate: int = 115200, timeout: float = 0):
         self.baudrate = baudrate
         self.timeout = timeout
-        self.ser: serial.Serial | None = None
+        self.ser = None
         self.enabled = False
 
     def _detect_port(self) -> str | None:
@@ -668,6 +1080,11 @@ class SafeSerialController:
         return None
 
     def open(self) -> None:
+        if serial is None:
+            print("[Serial] pyserial 未導入のためシリアル制御を無効化します。")
+            self.enabled = False
+            self.ser = None
+            return
         port = self._detect_port()
         if not port:
             print("[Serial] 対象デバイスが見つかりませんでした。シリアル制御を無効化します。")
@@ -679,7 +1096,7 @@ class SafeSerialController:
             self.ser.dtr = False
             self.enabled = True
             print(f"[Serial] 接続: {port} @ {self.baudrate}bps")
-        except (serial.SerialException, OSError, ValueError) as e:
+        except (getattr(serial, 'SerialException', Exception), OSError, ValueError) as e:
             print(f"[Serial] オープン失敗: {e}. シリアル制御を無効化します。")
             self.enabled = False
             self.ser = None
@@ -706,7 +1123,8 @@ class SafeSerialController:
 
 # シリアル制御の初期化（見つからなければ無効化）
 serial_ctrl = SafeSerialController(baudrate=115200, timeout=0)
-serial_ctrl.open()
+if HX711_ENABLE:
+    serial_ctrl.open()
 
 # ================= 追加: Gauge 詳細デバッグダンプ =================
 # 目的: ゲージの初期化→毎フレーム更新→描画の各段階で、
@@ -913,6 +1331,30 @@ if not HEADLESS:
 
 # CSVファイルを読み込む
 df_rm = pd.read_csv(rm_path)
+
+# rm_method の列名ゆらぎ対策（例: 『反復回数』/『ダンベル反復回数』など）
+# 後続で統一的に参照できるよう、REP_COL_NAME を決定しておく
+REP_COL_NAME = None
+for cand in ["反復回数", "ダンベル反復回数", "reps", "回数"]:
+    if cand in df_rm.columns:
+        REP_COL_NAME = cand
+        break
+if REP_COL_NAME is None:
+    # 簡易あいまい一致（日本語/英語の表記ゆれ想定）
+    for _c in df_rm.columns:
+        try:
+            _lc = _c.lower()
+        except Exception:
+            _lc = str(_c)
+        if ("反復" in _c) or ("回数" in _c) or ("rep" in _lc):
+            REP_COL_NAME = _c
+            break
+
+if REP_COL_NAME is None:
+    raise KeyError(
+        f"rm_method: 反復回数の列が見つかりません。列候補: {list(df_rm.columns)}\n"
+        "例: ヘッダに『反復回数』または『ダンベル反復回数』を含めてください。"
+    )
 # ウィンドウの位置を設定 (x=100, y=100)
 
 if not HEADLESS:
@@ -1061,6 +1503,33 @@ logger.info("Video loaded")
 local_input_stream1, local_input_stream2, file_mode, resolve_reason = resolve_input_streams()
 print(f"Input streams resolved: file_mode={file_mode}, reason={resolve_reason}")
 
+# 平面拘束のランタイム有効化判定
+if GRAVITY_LEVEL_PLANE_ON:
+    _gravity_level_plane_on_runtime = bool(file_mode or GRAVITY_LEVEL_PLANE_WEBCAM_OK)
+else:
+    _gravity_level_plane_on_runtime = False
+if E_DEBUG:
+    print(
+        f"[GRAVITY] level_plane_runtime={_gravity_level_plane_on_runtime} "
+        f"(cfg_on={GRAVITY_LEVEL_PLANE_ON}, plane={GRAVITY_LEVEL_PLANE}, "
+        f"file_mode={file_mode}, webcam_ok={GRAVITY_LEVEL_PLANE_WEBCAM_OK})"
+    )
+
+# チェッカーボード短辺方向を優先した重力定義（初期キャリブレーション結果）
+if GRAVITY_FROM_CHECKERBOARD_SHORT and (not _gravity_set):
+    _v_cb = _load_checkerboard_short_axis_runtime(GRAVITY_CHECKERBOARD_AXIS_FILE)
+    if _v_cb is not None:
+        up_label, axis_unit, cosabs = _pick_axis_from_vector(_v_cb)
+        g_label = _opposite_axis_label(up_label)
+        g_mag = float(np.linalg.norm(g)) if np.all(np.isfinite(g)) else 9.80665
+        new_g = -axis_unit * g_mag
+        globals()['g'] = np.array(new_g, dtype=float)
+        globals()['_gravity_label'] = g_label
+        globals()['_gravity_set'] = True
+        print(f"[GRAVITY] checkerboard_short up={up_label} g={g_label} vec={new_g.tolist()} file='{GRAVITY_CHECKERBOARD_AXIS_FILE}'")
+    elif E_DEBUG:
+        print(f"[GRAVITY] checkerboard short-axis file not found/invalid: '{GRAVITY_CHECKERBOARD_AXIS_FILE}' -> fallback auto-detect")
+
 def _dbg(*args, **kwargs):
     if IO_DEBUG:
         logger.debug(" ".join(str(a) for a in args))
@@ -1068,7 +1537,13 @@ def _dbg(*args, **kwargs):
  # moved to video_io.open_capture_and_read_first
 
 reps = 10
-one_rm_percentage = df_rm.loc[df_rm["反復回数"] == reps, "1RM%"].values[0] / 100
+# REP_COL_NAME を使用して 1RM% を取得
+one_rm_row = df_rm.loc[df_rm[REP_COL_NAME] == reps]
+if one_rm_row.empty:
+    raise KeyError(
+        f"rm_method: {REP_COL_NAME} に {reps} 行が見つかりません。利用可能な値: {sorted(df_rm[REP_COL_NAME].dropna().unique().tolist())}"
+    )
+one_rm_percentage = one_rm_row["1RM%"].values[0] / 100
 # ファイルを読み込みモードで開く
 with open(folder_path + "\\max_value.txt", "r", encoding="utf-8") as file:
     # ファイルからデータを一行読み込む
@@ -1082,18 +1557,38 @@ with open(folder_path + "\\max_value.txt", "r", encoding="utf-8") as file:
         THRESHOLD = max_value / one_rm_percentage
 # get projection matrices
 # --- ユーザーに「準備OKで再開してね」と促す ---
-
-P0 = get_projection_matrix(0, file_mode)
-P1 = get_projection_matrix(1, file_mode)
+CALIB_BASE_DIR = os.getenv('CALIB_BASE_DIR', '').strip()
+if CALIB_BASE_DIR:
+    P0 = get_projection_matrix(0, file_mode, base_dir=CALIB_BASE_DIR)
+    P1 = get_projection_matrix(1, file_mode, base_dir=CALIB_BASE_DIR)
+    print(f"[CALIB] using CALIB_BASE_DIR={CALIB_BASE_DIR}")
+else:
+    P0 = get_projection_matrix(0, file_mode)
+    P1 = get_projection_matrix(1, file_mode)
+P0_F64 = np.asarray(P0, dtype=np.float64)
+P1_F64 = np.asarray(P1, dtype=np.float64)
 print("Projection matrices loaded")
 # %%
+# 参照順の都合で、デモ用フラグをここでも安全に初期化
+if 'DEMO_MONO_GAUGE_ON' not in globals():
+    DEMO_MONO_GAUGE_ON = os.getenv('DEMO_MONO_GAUGE_ON', '1') in ('1', 'true', 'True')
+if 'DEMO_MONO_CAM0_ONLY' not in globals():
+    DEMO_MONO_CAM0_ONLY = os.getenv('DEMO_MONO_CAM0_ONLY', '1') in ('1', 'true', 'True')
+
 save_path0 = f"cam0_output_{timestamp}.mp4"
 save_path1 = f"cam1_output_{timestamp}.mp4"
 
 cap0, ok0, frame0 = open_capture_and_read_first(local_input_stream1)
-cap1, ok1, frame1 = open_capture_and_read_first(local_input_stream2)
+if DEMO_MONO_GAUGE_ON and DEMO_MONO_CAM0_ONLY:
+    cap1, ok1 = None, ok0
+    frame1 = (None if frame0 is None else frame0.copy())
+else:
+    cap1, ok1, frame1 = open_capture_and_read_first(local_input_stream2)
 
 if not (ok0 and ok1) or frame0 is None or frame1 is None:
+    if DEMO_MONO_GAUGE_ON and DEMO_MONO_CAM0_ONLY:
+        print("❌ cam0 の入力読み込みに失敗しました（mono mode）。")
+        sys.exit(2)
     print("❌ 入力の読み込みに失敗しました。解決理由:", resolve_reason)
     opened = False
     # 優先順に従って試す
@@ -1194,9 +1689,12 @@ h0, w0 = frame0.shape[:2]
 h1, w1 = frame1.shape[:2]
 _dbg("first frame sizes:", (w0, h0), (w1, h1))
 try:
-    total0 = cap0.get(cv.CAP_PROP_FRAME_COUNT); total1 = cap1.get(cv.CAP_PROP_FRAME_COUNT)
-    fps0 = cap0.get(cv.CAP_PROP_FPS); fps1 = cap1.get(cv.CAP_PROP_FPS)
-    pos0 = cap0.get(cv.CAP_PROP_POS_FRAMES); pos1 = cap1.get(cv.CAP_PROP_POS_FRAMES)
+    total0 = cap0.get(cv.CAP_PROP_FRAME_COUNT)
+    total1 = (cap1.get(cv.CAP_PROP_FRAME_COUNT) if cap1 is not None else total0)
+    fps0 = cap0.get(cv.CAP_PROP_FPS)
+    fps1 = (cap1.get(cv.CAP_PROP_FPS) if cap1 is not None else fps0)
+    pos0 = cap0.get(cv.CAP_PROP_POS_FRAMES)
+    pos1 = (cap1.get(cv.CAP_PROP_POS_FRAMES) if cap1 is not None else pos0)
     print(f"[Input] stats: frames0={total0}, fps0={fps0}, pos0={pos0} | frames1={total1}, fps1={fps1}, pos1={pos1}")
 except Exception:
     pass
@@ -1205,7 +1703,8 @@ except Exception:
 if file_mode:
     try:
         cap0.set(cv.CAP_PROP_POS_FRAMES, 0)
-        cap1.set(cv.CAP_PROP_POS_FRAMES, 0)
+        if cap1 is not None:
+            cap1.set(cv.CAP_PROP_POS_FRAMES, 0)
         print("[Input] file_mode: rewind to frame 0")
     except Exception as _rew_e:
         print(f"[Input] rewind failed (non-fatal): {_rew_e}")
@@ -1229,6 +1728,16 @@ if not writer1.isOpened():
 kpts_3d = []  # 3Dキーポイントデータを格納するリスト
 mono3d_records = []  # 単眼(Mediapipe world) 3D 座標の記録
 
+landmark_ekf = None
+if EKF_ENABLE:
+    try:
+        _ekf_cfg = EKFConfig(q_acc=EKF_Q_ACC, r=EKF_R, gate_std=EKF_GATE_STD)
+        landmark_ekf = LandmarkEKF(len(pose_keypoints), fs=fps, cfg=_ekf_cfg, bpf_low=EKF_BPF_LOW, bpf_high=EKF_BPF_HIGH, bpf_order=EKF_BPF_ORDER)
+        print(f"[EKF] enabled: q_acc={EKF_Q_ACC} r={EKF_R} gate={EKF_GATE_STD} bpf=({EKF_BPF_LOW},{EKF_BPF_HIGH})")
+    except Exception as _ekf_init_e:
+        print(f"[EKF] disabled (init failed): {_ekf_init_e}")
+        landmark_ekf = None
+
 DEBUG_LOGS = os.getenv('DEBUG_LOGS', '0') not in ('0','false','False')
 # 追加: 動力学＆姿勢デバッグの詳細トグル（必要時のみON）
 TRACE_DYN = os.getenv('TRACE_DYN', '0') not in ('0','false','False')
@@ -1241,7 +1750,10 @@ print("Starting loop")
 
 # 姿勢推定のための初期フレーム取得（再実行してOK）
 ret0, frame0 = cap0.read()
-ret1, frame1 = cap1.read()
+if cap1 is not None:
+    ret1, frame1 = cap1.read()
+else:
+    ret1, frame1 = ret0, (None if frame0 is None else frame0.copy())
 
 # Mediapipe用にRGB化 & 推定
 if frame0 is None or frame1 is None:
@@ -1249,7 +1761,11 @@ if frame0 is None or frame1 is None:
     # 1) 数回リトライ
     recovered = False
     for _i in range(10):
-        ret0, frame0 = cap0.read(); ret1, frame1 = cap1.read()
+        ret0, frame0 = cap0.read()
+        if cap1 is not None:
+            ret1, frame1 = cap1.read()
+        else:
+            ret1, frame1 = ret0, (None if frame0 is None else frame0.copy())
         if ret0 and ret1 and frame0 is not None and frame1 is not None:
             recovered = True
             break
@@ -1333,21 +1849,211 @@ def get_valid_x_range(kpts, frame_width):
     return local_x_min, local_x_max
 
 
+def _resize_mp_input(frame_rgb):
+    if MP_INPUT_SCALE < 1.0:
+        return cv.resize(frame_rgb, None, fx=MP_INPUT_SCALE, fy=MP_INPUT_SCALE, interpolation=cv.INTER_AREA)
+    return frame_rgb
+
+
+def _pose_has_landmarks(results) -> bool:
+    try:
+        pl = getattr(results, 'pose_landmarks', None)
+        return (pl is not None) and hasattr(pl, 'landmark') and (len(pl.landmark) > 0)
+    except Exception:
+        return False
+
+
+def _roi_from_keypoints(kpts, frame_shape):
+    h, w = frame_shape[:2]
+    valid = [(int(x), int(y)) for x, y in kpts if x >= 0 and y >= 0]
+    if len(valid) < max(1, POSE_ROI_MIN_VALID_KPTS):
+        return None
+
+    xs = [p[0] for p in valid]
+    ys = [p[1] for p in valid]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+
+    margin_x = int(round((x1 - x0 + 1) * POSE_ROI_MARGIN_RATIO))
+    margin_y = int(round((y1 - y0 + 1) * POSE_ROI_MARGIN_RATIO))
+    x0 -= margin_x
+    x1 += margin_x
+    y0 -= margin_y
+    y1 += margin_y
+
+    min_side = int(round(max(1, min(w, h)) * POSE_ROI_MIN_SIDE_RATIO))
+    cx = (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+    half = max(min_side // 2, (x1 - x0 + 1) // 2, (y1 - y0 + 1) // 2)
+
+    x0 = max(0, cx - half)
+    x1 = min(w, cx + half)
+    y0 = max(0, cy - half)
+    y1 = min(h, cy + half)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _expand_roi(roi, frame_shape, grow_ratio=0.25):
+    if roi is None:
+        return None
+    h, w = frame_shape[:2]
+    x0, y0, x1, y1 = roi
+    rw = max(1, int(x1 - x0))
+    rh = max(1, int(y1 - y0))
+    grow_x = int(round(rw * max(0.0, grow_ratio)))
+    grow_y = int(round(rh * max(0.0, grow_ratio)))
+
+    nx0 = max(0, x0 - grow_x)
+    ny0 = max(0, y0 - grow_y)
+    nx1 = min(w, x1 + grow_x)
+    ny1 = min(h, y1 + grow_y)
+    if nx1 <= nx0 or ny1 <= ny0:
+        return None
+    return int(nx0), int(ny0), int(nx1), int(ny1)
+
+
+def _remap_landmarks_to_fullframe(results, roi, full_shape):
+    if not _pose_has_landmarks(results):
+        return False
+    x0, y0, x1, y1 = roi
+    h, w = full_shape[:2]
+    rw = max(1, int(x1 - x0))
+    rh = max(1, int(y1 - y0))
+    try:
+        for lm in results.pose_landmarks.landmark:
+            lx = float(lm.x)
+            ly = float(lm.y)
+            lm.x = (x0 + lx * rw) / float(w)
+            lm.y = (y0 + ly * rh) / float(h)
+        return True
+    except Exception:
+        return False
+
+
+def _pose_process_with_roi(pose_estimator, frame_rgb, roi):
+    if (not POSE_ROI_ON) or (roi is None):
+        return pose_estimator.process(_resize_mp_input(frame_rgb)), False
+
+    x0, y0, x1, y1 = roi
+    crop = frame_rgb[y0:y1, x0:x1]
+    if crop is None or crop.size == 0:
+        return pose_estimator.process(_resize_mp_input(frame_rgb)), False
+
+    res = pose_estimator.process(_resize_mp_input(crop))
+    if _pose_has_landmarks(res):
+        _remap_landmarks_to_fullframe(res, roi, frame_rgb.shape)
+    return res, True
+
+
+def _triangulate_points_batch(P0_f64, P1_f64, keypoints0, keypoints1):
+    n = len(keypoints0)
+    out = np.full((n, 3), -1.0, dtype=np.float64)
+    valid_idx = [i for i, (uv0, uv1) in enumerate(zip(keypoints0, keypoints1)) if uv0[0] != -1 and uv1[0] != -1]
+    if not valid_idx:
+        return out
+
+    pts0 = np.array([[float(keypoints0[i][0]), float(keypoints0[i][1])] for i in valid_idx], dtype=np.float64).T
+    pts1 = np.array([[float(keypoints1[i][0]), float(keypoints1[i][1])] for i in valid_idx], dtype=np.float64).T
+
+    Xh = cv.triangulatePoints(P0_f64, P1_f64, pts0, pts1)
+    wv = Xh[3, :]
+
+    for j, idx in enumerate(valid_idx):
+        wj = float(wv[j])
+        if (not np.isfinite(wj)) or abs(wj) < 1e-12:
+            continue
+        Xj = (Xh[:3, j] / wj).astype(np.float64)
+        if np.all(np.isfinite(Xj)):
+            out[idx] = Xj
+    return out
+
+
+def _triangulate_transform_batch(P0_f64, P1_f64, keypoints0, keypoints1):
+    k0 = np.asarray(keypoints0, dtype=np.float64)
+    k1 = np.asarray(keypoints1, dtype=np.float64)
+
+    if TRIANG_NATIVE_ON:
+        try:
+            out_native = compute_triangulate_transform_native(P0_f64, P1_f64, k0, k1, scale=0.01)
+            if isinstance(out_native, np.ndarray) and out_native.ndim == 2 and out_native.shape[1] == 3:
+                return out_native
+        except Exception as _tri_e:  # noqa: BLE001
+            if DEBUG_LOGS and (WHILE_COUNT % 120 == 0):
+                print(f"[TRIANG] native failed; fallback to python batch: {_tri_e}")
+
+    frame_p3ds = _triangulate_points_batch(P0_f64, P1_f64, keypoints0, keypoints1)
+    temp_np = np.asarray(frame_p3ds, dtype=np.float64).reshape((-1, 3)) * 0.01
+    transformed_p3ds = np.empty_like(temp_np)
+    transformed_p3ds[:, 0] = -temp_np[:, 0]
+    transformed_p3ds[:, 1] = -temp_np[:, 2]
+    transformed_p3ds[:, 2] = -temp_np[:, 1]
+
+    # Fallback path uses -1 sentinel for missing points; convert to NaN for finite checks.
+    invalid_mask = np.all(np.isclose(frame_p3ds, -1.0), axis=1) | (~np.all(np.isfinite(frame_p3ds), axis=1))
+    transformed_p3ds[invalid_mask] = np.nan
+    return transformed_p3ds
+
+
+def _extract_keypoints_fast_single(results, pose_ids, frame_shape):
+    try:
+        pl = getattr(results, 'pose_landmarks', None)
+        if pl is None:
+            return [[-1, -1]] * len(pose_ids)
+        lm_list = pl.landmark
+        if lm_list is None or len(lm_list) == 0:
+            return [[-1, -1]] * len(pose_ids)
+    except Exception:
+        return [[-1, -1]] * len(pose_ids)
+
+    h, w = frame_shape[:2]
+    out = []
+    for pid in pose_ids:
+        lm = lm_list[pid]
+        out.append([int(round(float(lm.x) * w)), int(round(float(lm.y) * h))])
+    return out
+
+
+def _extract_keypoints_pair(results0, results1, pose_ids, frame0_bgr, frame1_bgr):
+    if KPS_FAST_ON and (not DRAW_KEYPOINTS_ON):
+        return (
+            _extract_keypoints_fast_single(results0, pose_ids, frame0_bgr.shape),
+            _extract_keypoints_fast_single(results1, pose_ids, frame1_bgr.shape),
+        )
+    return extract_keypoints(results0, results1, pose_ids, frame0_bgr, frame1_bgr)
+
+
 x0_min, x0_max = get_valid_x_range(frame0_kpts, frame0.shape[1])
 x1_min, x1_max = get_valid_x_range(frame1_kpts, frame1.shape[1])
 
 x_min = min(x0_min, x1_min)
 x_max = max(x0_max, x1_max)
-x_margin = 50
+x_margin = max(0, int(POSE_X_CROP_MARGIN))
 
 # 2カメラで共通に安全なトリミング範囲を設定
 width_min = min(frame0.shape[1], frame1.shape[1])
 x_start = max(0, x_min - x_margin)
 x_end = min(width_min, x_max + x_margin)
+
+# 推定範囲が狭すぎると検出ロストを誘発するため、最低幅を確保
+_min_crop_w = int(round(width_min * max(0.3, min(1.0, POSE_X_CROP_MIN_WIDTH_RATIO))))
+if (x_end - x_start) < _min_crop_w:
+    _cx = (x_start + x_end) // 2
+    _half = _min_crop_w // 2
+    x_start = max(0, _cx - _half)
+    x_end = min(width_min, _cx + _half)
+
 if x_end <= x_start:
     # フォールバック: 全幅
     x_start, x_end = 0, width_min
 print(f"✅ トリミング範囲: x = {x_start} ～ {x_end}")
+
+# Pose ROIトラッキング状態（2カメラ）
+_pose_roi0 = _roi_from_keypoints(frame0_kpts, frame0.shape) if POSE_ROI_ON else None
+_pose_roi1 = _roi_from_keypoints(frame1_kpts, frame1.shape) if POSE_ROI_ON else None
+_pose_roi0_miss = 0
+_pose_roi1_miss = 0
 
 
 # %%
@@ -1468,7 +2174,7 @@ HX_BASE_URL = os.getenv('HX711_BASE_URL', 'http://192.168.4.1')  # Wi-Fi 経由�
 # 追加: HX711 クイック診断設定（最初の使用箇所より前に配置）
 HX_DIAG = os.getenv('HX_DIAG', '1') in ('1','true','True')
 
-if RecorderClient is not None:
+if HX711_ENABLE and (RecorderClient is not None):
     # シリアルポート推定: まずは環境変数 M5_PORT、無ければ COM3 を採用
     _m5_port = os.getenv('M5_PORT') or 'COM3'
     if _m5_port:
@@ -1548,7 +2254,10 @@ if RecorderClient is not None:
     else:
         print('[HX711] シリアルポート不明のため開始スキップ')
 else:
-    print('[HX711] モジュール未インポートのため開始スキップ')
+    if HX711_ENABLE:
+        print('[HX711] モジュール未インポートのため開始スキップ')
+    else:
+        print('[HX711] disabled by config (HX711_ENABLE=0)')
 
 
 # サイクル内のトルクとパワー履歴（ゲージ集計用）
@@ -1556,6 +2265,7 @@ keys_for_hist = (gauge.part_keys if ('gauge' in globals() and gauge is not None)
 current_power_history = {k: [] for k in keys_for_hist}
 # 新: トルク成分ベースのエネルギー集計履歴（上腕=肘トルクy負, 前腕=手首トルクy正）
 current_energy_component_history = {k: [] for k in keys_for_hist}
+cycle_energy_debug_rows = []
 
 # 上腕(=肘トルク)と前腕(=手首トルク)のキー集合（肩・体幹は未定のため除外）
 ELBOW_KEYS = {"elbow_R", "elbow_L"}
@@ -1563,6 +2273,9 @@ WRIST_KEYS = {"wrist_R", "wrist_L"}
 # 連続表示用 肘エネルギー(J)積算バッファ (Σ τ·dθ)
 _continuous_last_theta = {"elbow_R": None, "elbow_L": None}
 _continuous_energy_J = {"elbow_R": 0.0, "elbow_L": 0.0}
+_demo_shoulder_base_y = {"R": None, "L": None}
+_demo_elbow_base_deg = {"R": None, "L": None}
+_demo_gauge_ratio = {"R": 0.0, "L": 0.0}
 hx_csv_collected = False  # 途中停止時などで二重取得を防ぐ（シリアルCSV取得済みフラグ）
 print("entering main loop")
 
@@ -1662,6 +2375,48 @@ LOOP_FILE_PLAYBACK = bool(int(os.getenv('LOOP_FILE_PLAYBACK', '0')))
 # ステージ切り分け用: このステージ名の直後でループを早期終了（計測用）
 # 例: STOP_AFTER=mediapipe / kps2d / triang / calc / run_specs / torques / local_torque / imshow / gauge / retrieve / write / crop / preproc / postproc
 STOP_AFTER = os.getenv('STOP_AFTER', '').strip()
+# 追加: デバッグ・バッチ用 フレーム上限（0: 無制限）
+try:
+    MAX_FRAMES = int(os.getenv('MAX_FRAMES', '0'))
+except Exception:
+    MAX_FRAMES = 0
+
+# 追加: リアルタイム遅延反映スキップ（処理時間に応じて次フレームを間引く）
+# 例: 30fps入力で1.0秒かかった場合、約30フレーム先を次の処理対象にする
+RT_DELAY_SKIP_ON = os.getenv('RT_DELAY_SKIP_ON', '0') in ('1', 'true', 'True')
+RT_DELAY_SKIP_GAIN = float(os.getenv('RT_DELAY_SKIP_GAIN', '1.0'))
+RT_DELAY_SKIP_MIN = int(os.getenv('RT_DELAY_SKIP_MIN', '0'))
+RT_DELAY_SKIP_MAX = int(os.getenv('RT_DELAY_SKIP_MAX', '300'))
+# 立ち上がり区間だけ高密度に処理するバーストモード
+RT_RISE_BURST_ON = os.getenv('RT_RISE_BURST_ON', '1') in ('1', 'true', 'True')
+RT_RISE_ZVEL_THR = float(os.getenv('RT_RISE_ZVEL_THR', '0.0008'))  # [m/frame] 目安
+RT_RISE_BURST_FRAMES = int(os.getenv('RT_RISE_BURST_FRAMES', '12'))
+RT_RISE_BURST_COOLDOWN = int(os.getenv('RT_RISE_BURST_COOLDOWN', '18'))
+RT_RISE_ZDIST_MARGIN = float(os.getenv('RT_RISE_ZDIST_MARGIN', '0.0035'))  # cycle閾値近傍で先行発火
+RT_RISE_BURST_SKIP = int(os.getenv('RT_RISE_BURST_SKIP', '7'))  # burst中skip=7 -> 約4Hz @ 30fps
+RT_POSE_FIXED_HZ_ON = os.getenv('RT_POSE_FIXED_HZ_ON', '1') in ('1', 'true', 'True')
+RT_POSE_FIXED_HZ = float(os.getenv('RT_POSE_FIXED_HZ', '4.0'))
+RT_DYN_ON_RISE_ONLY = os.getenv('RT_DYN_ON_RISE_ONLY', '1') in ('1', 'true', 'True')
+RT_DYN_PREV_FRAMES = int(os.getenv('RT_DYN_PREV_FRAMES', '1'))
+RT_SIT_ZDIST_MARGIN = float(os.getenv('RT_SIT_ZDIST_MARGIN', '0.0060'))
+RT_SIT_CONSEC_FRAMES = int(os.getenv('RT_SIT_CONSEC_FRAMES', '2'))
+RT_CYCLE_AXIS = os.getenv('RT_CYCLE_AXIS', 'y').strip().lower()  # x/y/z
+RT_CYCLE_NEGATIVE_DOWN = os.getenv('RT_CYCLE_NEGATIVE_DOWN', '1') in ('1', 'true', 'True')
+RT_DROP_VEL_THR = float(os.getenv('RT_DROP_VEL_THR', '0.0008'))
+RT_DROP_DIST_MARGIN = float(os.getenv('RT_DROP_DIST_MARGIN', '0.0010'))
+
+# デモ向け: トルク解析を使わず、単眼(cam0)の肩上昇/肘角変化でゲージを制御
+DEMO_MONO_GAUGE_ON = os.getenv('DEMO_MONO_GAUGE_ON', '1') in ('1', 'true', 'True')
+DEMO_SHOULDER_RISE_FULL_M = float(os.getenv('DEMO_SHOULDER_RISE_FULL_M', '0.10'))
+DEMO_ELBOW_DELTA_FULL_DEG = float(os.getenv('DEMO_ELBOW_DELTA_FULL_DEG', '45.0'))
+DEMO_SHOULDER_RISE_PARTIAL_M = float(os.getenv('DEMO_SHOULDER_RISE_PARTIAL_M', '0.02'))
+DEMO_ELBOW_DELTA_PARTIAL_DEG = float(os.getenv('DEMO_ELBOW_DELTA_PARTIAL_DEG', '8.0'))
+DEMO_RATIO_FULL = float(os.getenv('DEMO_RATIO_FULL', '0.80'))
+DEMO_RATIO_PARTIAL = float(os.getenv('DEMO_RATIO_PARTIAL', '0.30'))
+DEMO_RATIO_UP_STEP = float(os.getenv('DEMO_RATIO_UP_STEP', '0.025'))
+DEMO_RATIO_DOWN_STEP = float(os.getenv('DEMO_RATIO_DOWN_STEP', '0.035'))
+DEMO_BASELINE_EMA = float(os.getenv('DEMO_BASELINE_EMA', '0.01'))
+DEMO_MONO_CAM0_ONLY = os.getenv('DEMO_MONO_CAM0_ONLY', '1') in ('1', 'true', 'True')
 
 class _LoopPerf:
     def __init__(self, enabled: bool, interval: int):
@@ -1882,10 +2637,31 @@ def _apply_camera_controls(name: str, cap: 'cv.VideoCapture') -> None:
 
 # ライブカメラの設定固定（AE/AWB/AFオフ＋任意設定）→ 反映後のプロパティ出力
 _apply_camera_controls('cam0', cap0)
-_apply_camera_controls('cam1', cap1)
+if cap1 is not None:
+    _apply_camera_controls('cam1', cap1)
 # オープン済みキャプチャのプロパティ出力（最終状態）
 _print_cap_props('cam0', cap0)
-_print_cap_props('cam1', cap1)
+if cap1 is not None:
+    _print_cap_props('cam1', cap1)
+
+# 入力ソースfps（遅延反映スキップで使用）
+try:
+    _src_fps0 = float(cap0.get(cv.CAP_PROP_FPS))
+except Exception:
+    _src_fps0 = 0.0
+try:
+    _src_fps1 = float(cap1.get(cv.CAP_PROP_FPS))
+except Exception:
+    _src_fps1 = _src_fps0
+_src_fps_candidates = [v for v in (_src_fps0, _src_fps1, float(fps)) if v and np.isfinite(v) and v > 1e-6]
+_src_fps = float(_src_fps_candidates[0]) if _src_fps_candidates else 30.0
+_rt_fixed_skip = int(max(0, round(_src_fps / max(RT_POSE_FIXED_HZ, 1e-6)) - 1))
+_lpf_fps_ema = float(np.clip(_src_fps, E_FPS_MIN, E_FPS_MAX))
+_e_dt_sec_current = 1.0 / max(_lpf_fps_ema, 1e-6)
+if E_DEBUG:
+    print(f"[RTSKIP] src_fps={_src_fps:.3f} (cam0={_src_fps0:.3f}, cam1={_src_fps1:.3f})")
+    if RT_POSE_FIXED_HZ_ON:
+        print(f"[RTFIX] target_hz={RT_POSE_FIXED_HZ:.3f}, fixed_skip={_rt_fixed_skip}")
 
 # カメラごとの時刻・間隔・直近の取得時間（効果測定用）
 _cam0_last_ts = None
@@ -1894,6 +2670,13 @@ _cam0_last_dt = None
 _cam1_last_dt = None
 _cam0_last_shape = None
 _cam1_last_shape = None
+_rt_skip_remaining = 0
+_rt_burst_remaining = 0
+_rt_burst_cooldown = 0
+_rt_prev_z_cycle = None
+_dyn_active = (not RT_DYN_ON_RISE_ONLY)
+_dyn_sit_consec = 0
+_dyn_start_frame = None
 
 while True:
     start_time = time.perf_counter()
@@ -1905,7 +2688,7 @@ while True:
     # まずは grab でフレームを進める（軽量・スキップ時にデコードしない）
     t_seg = time.perf_counter()
     okg0 = cap0.grab()
-    okg1 = cap1.grab()
+    okg1 = (cap1.grab() if cap1 is not None else okg0)
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
         #print(f"[TRACE]] grab ok0={okg0} ok1={okg1}")
         pass
@@ -1921,7 +2704,8 @@ while True:
         # いずれかが終端
         try:
             p0 = cap0.get(cv.CAP_PROP_POS_FRAMES); t0 = cap0.get(cv.CAP_PROP_FRAME_COUNT)
-            p1 = cap1.get(cv.CAP_PROP_POS_FRAMES); t1 = cap1.get(cv.CAP_PROP_FRAME_COUNT)
+            p1 = (cap1.get(cv.CAP_PROP_POS_FRAMES) if cap1 is not None else p0)
+            t1 = (cap1.get(cv.CAP_PROP_FRAME_COUNT) if cap1 is not None else t0)
             print(f"Video ended (grab fail) pos0/total0={p0}/{t0}, pos1/total1={p1}/{t1}")
         except Exception:
             print("Video ended")
@@ -1929,15 +2713,23 @@ while True:
         if LOOP_FILE_PLAYBACK and file_mode:
             try:
                 cap0.set(cv.CAP_PROP_POS_FRAMES, 0)
-                cap1.set(cv.CAP_PROP_POS_FRAMES, 0)
+                if cap1 is not None:
+                    cap1.set(cv.CAP_PROP_POS_FRAMES, 0)
                 print("[Playback] rewind to frame 0 and continue")
                 _perf.next()
                 continue
             except Exception as e:
                 print(f"[Playback] rewind failed: {e}")
         break
+    # 固定Hz/遅延反映のスキップ
+    if _rt_skip_remaining > 0:
+        _rt_skip_remaining -= 1
+        if E_DEBUG and (WHILE_COUNT % 30 == 0):
+            print(f"[RTSKIP] skipping frame, remaining={_rt_skip_remaining}")
+        _perf.next()
+        continue
     # スキップ判定（デコード不要なフレームはここで続行）
-    if skip_counter % skip_mod != 0:
+    if (skip_counter % skip_mod != 0) and (_rt_burst_remaining <= 0):
         _perf.next()
         continue
     # このタイミングのフレームのみ retrieve してデコード
@@ -1945,9 +2737,14 @@ while True:
     t_seg0 = time.perf_counter()
     ret0, frame0 = cap0.retrieve()
     dt_ret0 = time.perf_counter() - t_seg0
-    t_seg1 = time.perf_counter()
-    ret1, frame1 = cap1.retrieve()
-    dt_ret1 = time.perf_counter() - t_seg1
+    if cap1 is not None:
+        t_seg1 = time.perf_counter()
+        ret1, frame1 = cap1.retrieve()
+        dt_ret1 = time.perf_counter() - t_seg1
+    else:
+        ret1 = ret0
+        frame1 = (None if frame0 is None else frame0.copy())
+        dt_ret1 = 0.0
     if DEBUG_LOGS:
         print("frame0", type(frame0), "frame1", type(frame1))
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
@@ -2053,27 +2850,40 @@ while True:
         _perf.next()
         break
     t_seg = time.perf_counter()
-    # MediaPipe 入力を縮小（推論専用バッファ）。元の frame0/1 は BGR 戻しや描画のため保持
-    if MP_INPUT_SCALE < 1.0:
-        mp0 = cv.resize(frame0, None, fx=MP_INPUT_SCALE, fy=MP_INPUT_SCALE, interpolation=cv.INTER_AREA)
-    else:
-        mp0 = frame0
-    results0 = pose0.process(mp0)
+    roi0 = _pose_roi0 if (POSE_ROI_ON and _pose_roi0_miss <= POSE_ROI_MAX_MISS) else None
+    if roi0 is not None and _pose_roi0_miss > 0:
+        for _ in range(_pose_roi0_miss):
+            roi0 = _expand_roi(roi0, frame0.shape, POSE_ROI_MISS_GROW_RATIO)
+            if roi0 is None:
+                break
+    results0, _roi0_used = _pose_process_with_roi(pose0, frame0, roi0)
     if os.getenv('POSE_DEBUG', '0') in ('1','true','True') and (WHILE_COUNT % max(1, int(os.getenv('POSE_TRACE_EVERY','30'))) == 0):
         try:
-            print(f"[Pose] input scale={MP_INPUT_SCALE} mp0_shape={tuple(mp0.shape)}")
+            if _roi0_used and roi0 is not None:
+                _rw0 = roi0[2] - roi0[0]
+                _rh0 = roi0[3] - roi0[1]
+                print(f"[Pose] cam0 ROI used scale={MP_INPUT_SCALE} roi={roi0} roi_shape=({_rh0},{_rw0},3)")
+            else:
+                print(f"[Pose] cam0 fullframe scale={MP_INPUT_SCALE} shape={tuple(frame0.shape)}")
         except Exception:
             pass
     _perf.add('mediapipe0', time.perf_counter() - t_seg)
     t_seg = time.perf_counter()
-    if MP_INPUT_SCALE < 1.0:
-        mp1 = cv.resize(frame1, None, fx=MP_INPUT_SCALE, fy=MP_INPUT_SCALE, interpolation=cv.INTER_AREA)
-    else:
-        mp1 = frame1
-    results1 = pose1.process(mp1)
+    roi1 = _pose_roi1 if (POSE_ROI_ON and _pose_roi1_miss <= POSE_ROI_MAX_MISS) else None
+    if roi1 is not None and _pose_roi1_miss > 0:
+        for _ in range(_pose_roi1_miss):
+            roi1 = _expand_roi(roi1, frame1.shape, POSE_ROI_MISS_GROW_RATIO)
+            if roi1 is None:
+                break
+    results1, _roi1_used = _pose_process_with_roi(pose1, frame1, roi1)
     if os.getenv('POSE_DEBUG', '0') in ('1','true','True') and (WHILE_COUNT % max(1, int(os.getenv('POSE_TRACE_EVERY','30'))) == 0):
         try:
-            print(f"[Pose] input scale={MP_INPUT_SCALE} mp1_shape={tuple(mp1.shape)}")
+            if _roi1_used and roi1 is not None:
+                _rw1 = roi1[2] - roi1[0]
+                _rh1 = roi1[3] - roi1[1]
+                print(f"[Pose] cam1 ROI used scale={MP_INPUT_SCALE} roi={roi1} roi_shape=({_rh1},{_rw1},3)")
+            else:
+                print(f"[Pose] cam1 fullframe scale={MP_INPUT_SCALE} shape={tuple(frame1.shape)}")
         except Exception:
             pass
     _perf.add('mediapipe1', time.perf_counter() - t_seg)
@@ -2100,9 +2910,27 @@ while True:
         _perf.next()
         break
     t_seg = time.perf_counter()
-    frame0_keypoints, frame1_keypoints = extract_keypoints(
+    frame0_keypoints, frame1_keypoints = _extract_keypoints_pair(
         results0, results1, pose_keypoints, frame0, frame1
     )
+    if POSE_ROI_ON:
+        _next_roi0 = _roi_from_keypoints(frame0_keypoints, frame0.shape)
+        if _next_roi0 is None:
+            _pose_roi0_miss += 1
+            if _pose_roi0_miss > POSE_ROI_MAX_MISS:
+                _pose_roi0 = None
+        else:
+            _pose_roi0 = _next_roi0
+            _pose_roi0_miss = 0
+
+        _next_roi1 = _roi_from_keypoints(frame1_keypoints, frame1.shape)
+        if _next_roi1 is None:
+            _pose_roi1_miss += 1
+            if _pose_roi1_miss > POSE_ROI_MAX_MISS:
+                _pose_roi1 = None
+        else:
+            _pose_roi1 = _next_roi1
+            _pose_roi1_miss = 0
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
         v0 = sum(1 for x, y in frame0_keypoints if x >= 0 and y >= 0)
         v1 = sum(1 for x, y in frame1_keypoints if x >= 0 and y >= 0)
@@ -2132,26 +2960,17 @@ while True:
     #     # フレーム欠損でも行数合わせのため NaN 行を積む
     #     mono3d_records.append([[float('nan')]*3 for _ in pose_keypoints])
 
-    frame_p3ds = []
-
-    nan_3d = 0
     t_seg = time.perf_counter()
-    for uv1, uv2 in zip(frame0_keypoints, frame1_keypoints):
-        if uv1[0] == -1 or uv2[0] == -1:
-            _p3d = [-1, -1, -1]
-        else:
-            _p3d = DLT(P0, P1, uv1, uv2)
-        if not np.all(np.isfinite(_p3d)):
-            nan_3d += 1
-        frame_p3ds.append(_p3d)
+    transformed_p3ds = _triangulate_transform_batch(P0_F64, P1_F64, frame0_keypoints, frame1_keypoints)
+    nan_3d = int(np.sum(~np.all(np.isfinite(transformed_p3ds), axis=1)))
     if DEBUG_LOGS and WHILE_COUNT % 30 == 0 and nan_3d:
         print(f"[DBG] frame {WHILE_COUNT}: non-finite 3D points={nan_3d}")
-    temp_np = np.array(frame_p3ds).reshape((12, 3)) * 0.01
-    transformed_p3ds = np.zeros_like(temp_np)
-    # ファイル/カメラの別に係らず同一変換を適用
-    transformed_p3ds[:, 0] = -temp_np[:, 0]
-    transformed_p3ds[:, 1] = -temp_np[:, 2]
-    transformed_p3ds[:, 2] = -temp_np[:, 1]
+    if landmark_ekf is not None:
+        try:
+            transformed_p3ds, _vel_filt, _acc_filt = landmark_ekf.step(transformed_p3ds, dt)
+        except Exception as _ekf_step_e:  # noqa: BLE001
+            if WHILE_COUNT % 120 == 0:
+                print(f"[EKF] step failed (frame={WHILE_COUNT}): {_ekf_step_e}")
     kpts_3d.append(transformed_p3ds)
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
         #print(f"[TRACE] triang+transform done")
@@ -2160,10 +2979,77 @@ while True:
     if STOP_AFTER.lower() in ("triang", "triangulate", "triang+transform", "transform"):
         _perf.next()
         break
+    _cycle_axis_idx = 1 if RT_CYCLE_AXIS == 'y' else (2 if RT_CYCLE_AXIS == 'z' else 0)
+    _cycle_value_now = transformed_p3ds[0][_cycle_axis_idx]
     if 4 < WHILE_COUNT < 15:
-        z_value += (transformed_p3ds[0][2]) / 10
+        z_value += _cycle_value_now / 10
     elif WHILE_COUNT == 15:
-        detector = PushCycleDetector(z_value)
+        detector = PushCycleDetector(
+            z_value,
+            threshold=0.015,
+            velocity_epsilon=0.01,
+            min_interval=10,
+            mode='rise_to_rise',
+            negative_down=RT_CYCLE_NEGATIVE_DOWN,
+        )
+
+    # 立ち上がり/着座イベントに応じた逆動力学ゲート制御
+    _z_cycle = _cycle_value_now
+    if WHILE_COUNT > 15 and np.isfinite(_z_cycle):
+        if RT_RISE_BURST_ON:
+            _burst_reason = None
+            if _rt_prev_z_cycle is not None and np.isfinite(_rt_prev_z_cycle):
+                _dz_cycle = float(_z_cycle - _rt_prev_z_cycle)
+                if RT_CYCLE_NEGATIVE_DOWN:
+                    _drop_vel_hit = (_dz_cycle <= -abs(RT_DROP_VEL_THR))
+                else:
+                    _drop_vel_hit = (_dz_cycle >= abs(RT_DROP_VEL_THR))
+                if _drop_vel_hit and _rt_burst_cooldown <= 0:
+                    _burst_reason = f"drop_d={_dz_cycle:.6f} thr={RT_DROP_VEL_THR:.6f}"
+            try:
+                if RT_CYCLE_NEGATIVE_DOWN:
+                    _z_th = float(detector.initial_z - RT_DROP_DIST_MARGIN)
+                    _drop_dist_hit = (_z_cycle < _z_th)
+                else:
+                    _z_th = float(detector.initial_z + RT_DROP_DIST_MARGIN)
+                    _drop_dist_hit = (_z_cycle > _z_th)
+                if (_burst_reason is None) and (_rt_burst_cooldown <= 0) and _drop_dist_hit:
+                    _burst_reason = f"drop_v={float(_z_cycle):.6f} th={_z_th:.6f}"
+            except Exception:
+                _z_th = None
+            if _burst_reason is not None:
+                _rt_burst_remaining = max(_rt_burst_remaining, RT_RISE_BURST_FRAMES)
+                _rt_burst_cooldown = max(_rt_burst_cooldown, RT_RISE_BURST_COOLDOWN)
+                _rt_skip_remaining = 0
+                if RT_DYN_ON_RISE_ONLY and (not _dyn_active):
+                    _dyn_active = True
+                    _dyn_sit_consec = 0
+                    _dyn_start_frame = max(0, WHILE_COUNT - max(0, RT_DYN_PREV_FRAMES))
+                    print(f"[DYNGATE] start frame={WHILE_COUNT} (analyze_from={_dyn_start_frame}) reason={_burst_reason} axis={RT_CYCLE_AXIS}")
+                if E_DEBUG:
+                    print(
+                        f"[RTBURST] frame={WHILE_COUNT} trigger {_burst_reason}, "
+                        f"burst={_rt_burst_remaining}, cooldown={_rt_burst_cooldown}"
+                    )
+        if RT_DYN_ON_RISE_ONLY and _dyn_active:
+            try:
+                if RT_CYCLE_NEGATIVE_DOWN:
+                    _z_sit_th = float(detector.initial_z + RT_SIT_ZDIST_MARGIN)
+                    _sit_hit = (_z_cycle > _z_sit_th)
+                else:
+                    _z_sit_th = float(detector.initial_z - RT_SIT_ZDIST_MARGIN)
+                    _sit_hit = (_z_cycle < _z_sit_th)
+                if _sit_hit:
+                    _dyn_sit_consec += 1
+                else:
+                    _dyn_sit_consec = 0
+                if _dyn_sit_consec >= max(1, RT_SIT_CONSEC_FRAMES):
+                    _dyn_active = False
+                    _dyn_sit_consec = 0
+                    print(f"[DYNGATE] stop frame={WHILE_COUNT} (sit axis={RT_CYCLE_AXIS} v={float(_z_cycle):.6f} th={_z_sit_th:.6f})")
+            except Exception:
+                pass
+        _rt_prev_z_cycle = float(_z_cycle)
 
     t_seg = time.perf_counter()
     for part_name, calculator in calculators.items():
@@ -2245,6 +3131,33 @@ while True:
         part_data["upper_Leg_R"],
         part_data["upper_Leg_L"],
     ]
+
+    # ======== 重力向きの自動検出（初期フレーム） ========
+    if GRAVITY_AUTO_DETECT and not _gravity_set:
+        try:
+            if part_data["both_shoulder"] and part_data["both_hip"]:
+                c_sh = np.array(part_data["both_shoulder"][-1]["centroid"], dtype=float)
+                c_hp = np.array(part_data["both_hip"][-1]["centroid"], dtype=float)
+                v_up = c_sh - c_hp  # 上方向推定
+                if np.all(np.isfinite(v_up)):
+                    _grav_up_samples.append(v_up)
+            if len(_grav_up_samples) >= GRAVITY_DETECT_FRAMES:
+                v_med = np.median(np.stack(_grav_up_samples, axis=0), axis=0)
+                up_label, axis_unit, cosabs = _pick_axis_from_vector(v_med)
+                g_label = _opposite_axis_label(up_label)
+                # gの大きさは既存gのノルムを保持
+                g_mag = float(np.linalg.norm(g)) if np.all(np.isfinite(g)) else 9.80665
+                # 上方向axis_unitに対して、重力は下向き
+                new_g = -axis_unit * g_mag
+                # ランタイムの g を更新
+                globals()['g'] = np.array(new_g, dtype=float)
+                globals()['_gravity_label'] = g_label
+                globals()['_gravity_set'] = True
+                if E_DEBUG:
+                    print(f"[GRAVITY] up={up_label} g={g_label} vec={new_g.tolist()} cos={cosabs:.3f} plane={GRAVITY_LEVEL_PLANE if GRAVITY_LEVEL_PLANE_ON else 'ANY'}")
+        except Exception as _ge:
+            if E_DEBUG:
+                print(f"[GRAVITY] detect failed: {_ge}")
     if any((lst is None) or (len(lst) == 0) for lst in required_lists):
         continue
     # トルクと力の計算（右/左）をループで簡潔に構築
@@ -2262,17 +3175,24 @@ while True:
         (I4, w, part_data["both_hip"], {"add_part_data": part_data["both_shoulder"], "Imode": 4}),
         (I5, m4, part_data["upper_Leg_L"], {}),
     ]
+    _dyn_should_run = ((not RT_DYN_ON_RISE_ONLY) or _dyn_active) and (not DEMO_MONO_GAUGE_ON)
     t_seg = time.perf_counter()
-    MsR, FsR, partsR = run_specs(right_specs)
-    MsL, FsL, partsL = run_specs(left_specs)
-    if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
-        def _safe_norm_list(lst):
-            try:
-                return float(np.linalg.norm(np.array(lst, dtype=np.float64)))
-            except Exception:
-                return float('nan')
-        print(f"[DYN:run_specs] R | M_norm={_safe_norm_list(MsR):.6f} F_norm={_safe_norm_list(FsR):.6f} parts={len(partsR)}")
-        print(f"[DYN:run_specs] L | M_norm={_safe_norm_list(MsL):.6f} F_norm={_safe_norm_list(FsL):.6f} parts={len(partsL)}")
+    if _dyn_should_run:
+        MsR, FsR, partsR = run_specs(right_specs)
+        MsL, FsL, partsL = run_specs(left_specs)
+        if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
+            def _safe_norm_list(lst):
+                try:
+                    return float(np.linalg.norm(np.array(lst, dtype=np.float64)))
+                except Exception:
+                    return float('nan')
+            print(f"[DYN:run_specs] R | M_norm={_safe_norm_list(MsR):.6f} F_norm={_safe_norm_list(FsR):.6f} parts={len(partsR)}")
+            print(f"[DYN:run_specs] L | M_norm={_safe_norm_list(MsL):.6f} F_norm={_safe_norm_list(FsL):.6f} parts={len(partsL)}")
+    else:
+        MsR, FsR, partsR = [], [], []
+        MsL, FsL, partsL = [], [], []
+        if E_DEBUG and (WHILE_COUNT % 30 == 0):
+            print(f"[DYNGATE] paused frame={WHILE_COUNT} (waiting rise trigger)")
     _perf.add('run_specs', time.perf_counter() - t_seg)
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
         #print(f"[TRACE] run_specs done R/L")
@@ -2327,53 +3247,58 @@ while True:
     ]
 
     t_seg = time.perf_counter()
-    USE_NATIVE_DYNAMICS = os.getenv('USE_NATIVE_DYNAMICS', '1') in ('1','true','True')
-    if USE_NATIVE_DYNAMICS:
-        try:
-            # p1sは各部位の関節位置を並べたものが必要。storageから取得。
-            def _collect_p1s(parts: list[str]) -> np.ndarray:
-                p1s = []
-                for part in parts:
-                    data_list = storage.get_data(part)
-                    if data_list:
-                        p1s.append(data_list[-1]['p1'])
-                    else:
-                        p1s.append(np.zeros(3))
-                return np.array(p1s, dtype=np.float64)
+    if _dyn_should_run:
+        USE_NATIVE_DYNAMICS = os.getenv('USE_NATIVE_DYNAMICS', '1') in ('1','true','True')
+        if USE_NATIVE_DYNAMICS:
+            try:
+                # p1sは各部位の関節位置を並べたものが必要。storageから取得。
+                def _collect_p1s(parts: list[str]) -> np.ndarray:
+                    p1s = []
+                    for part in parts:
+                        data_list = storage.get_data(part)
+                        if data_list:
+                            p1s.append(data_list[-1]['p1'])
+                        else:
+                            p1s.append(np.zeros(3))
+                    return np.array(p1s, dtype=np.float64)
 
-            p1sR = _collect_p1s(partsR)
-            p1sL = _collect_p1s(partsL)
-            r_g_R_arr = np.array(r_g_R, dtype=np.float64)
-            r_g_L_arr = np.array(r_g_L, dtype=np.float64)
+                p1sR = _collect_p1s(partsR)
+                p1sL = _collect_p1s(partsL)
+                r_g_R_arr = np.array(r_g_R, dtype=np.float64)
+                r_g_L_arr = np.array(r_g_L, dtype=np.float64)
 
-            tauR = compute_tau_chain_native(np.array(MsR, dtype=np.float64), np.array(FsR, dtype=np.float64), r_g_R_arr, p1sR, np.array(tau_E, dtype=np.float64), np.array(f_E, dtype=np.float64), np.array(r_x, dtype=np.float64))
-            tauL = compute_tau_chain_native(np.array(MsL, dtype=np.float64), np.array(FsL, dtype=np.float64), r_g_L_arr, p1sL, np.array(tau_E, dtype=np.float64), np.array(f_E, dtype=np.float64), np.array(r_x, dtype=np.float64))
-            if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
-                # レバーアーム |r_g - p1| のノルム統計でゼロ・ミスアラインを検知
-                try:
-                    rg_minus_p1_R = np.linalg.norm(r_g_R_arr - p1sR, axis=1)
-                    rg_minus_p1_L = np.linalg.norm(r_g_L_arr - p1sL, axis=1)
-                    print(f"[DYN:TAU] lever R | min={float(np.min(rg_minus_p1_R)):.4f} max={float(np.max(rg_minus_p1_R)):.4f} L | min={float(np.min(rg_minus_p1_L)):.4f} max={float(np.max(rg_minus_p1_L)):.4f}")
-                except Exception:
-                    pass
-            if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
-                print(f"[DYN:TAU] R | tau_norm={float(np.linalg.norm(tauR)):.6f}  L | tau_norm={float(np.linalg.norm(tauL)):.6f}")
-                # 詳細を見たい場合は下記を一時的に解除
-                # print('[DYN:TAU] tauR=', tauR)
-                # print('[DYN:TAU] tauL=', tauL)
+                tauR = compute_tau_chain_native(np.array(MsR, dtype=np.float64), np.array(FsR, dtype=np.float64), r_g_R_arr, p1sR, np.array(tau_E, dtype=np.float64), np.array(f_E, dtype=np.float64), np.array(r_x, dtype=np.float64))
+                tauL = compute_tau_chain_native(np.array(MsL, dtype=np.float64), np.array(FsL, dtype=np.float64), r_g_L_arr, p1sL, np.array(tau_E, dtype=np.float64), np.array(f_E, dtype=np.float64), np.array(r_x, dtype=np.float64))
+                if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
+                    # レバーアーム |r_g - p1| のノルム統計でゼロ・ミスアラインを検知
+                    try:
+                        rg_minus_p1_R = np.linalg.norm(r_g_R_arr - p1sR, axis=1)
+                        rg_minus_p1_L = np.linalg.norm(r_g_L_arr - p1sL, axis=1)
+                        print(f"[DYN:TAU] lever R | min={float(np.min(rg_minus_p1_R)):.4f} max={float(np.max(rg_minus_p1_R)):.4f} L | min={float(np.min(rg_minus_p1_L)):.4f} max={float(np.max(rg_minus_p1_L)):.4f}")
+                    except Exception:
+                        pass
+                if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
+                    print(f"[DYN:TAU] R | tau_norm={float(np.linalg.norm(tauR)):.6f}  L | tau_norm={float(np.linalg.norm(tauL)):.6f}")
+                    # 詳細を見たい場合は下記を一時的に解除
+                    # print('[DYN:TAU] tauR=', tauR)
+                    # print('[DYN:TAU] tauL=', tauL)
 
-            # 既存構造 (値, 部位名) の形に合わせる
-            torquesR = [(tauR[i], partsR[i]) for i in range(len(partsR))]
-            torquesL = [(tauL[i], partsL[i]) for i in range(len(partsL))]
-        except (RuntimeError, ValueError, TypeError, AttributeError) as _nd_e:
-            if os.getenv('POSE_DEBUG','0') in ('1','true','True'):
-                print(f"[Dyn] native tau fallback due to: {_nd_e}")
-            # フォールバック
+                # 既存構造 (値, 部位名) の形に合わせる
+                torquesR = [(tauR[i], partsR[i]) for i in range(len(partsR))]
+                torquesL = [(tauL[i], partsL[i]) for i in range(len(partsL))]
+            except (RuntimeError, ValueError, TypeError, AttributeError) as _nd_e:
+                if os.getenv('POSE_DEBUG','0') in ('1','true','True'):
+                    print(f"[Dyn] native tau fallback due to: {_nd_e}")
+                # フォールバック
+                torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage)
+                torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage)
+        else:
             torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage)
             torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage)
     else:
-        torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage)
-        torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage)
+        _zero = np.zeros(3, dtype=np.float64)
+        torquesR = [(_zero.copy(), "wrist_R"), (_zero.copy(), "elbow_R"), (_zero.copy(), "shoulder_R")]
+        torquesL = [(_zero.copy(), "wrist_L"), (_zero.copy(), "elbow_L"), (_zero.copy(), "shoulder_L")]
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
         print(f"[TRACE] torques computed R/L")
     _perf.add('torques', time.perf_counter() - t_seg)
@@ -2407,11 +3332,20 @@ while True:
         except Exception:
             gn = {k: float('nan') for k in globals_map.keys()}
         print(f"[DYN:GLOBAL TAU] norms={gn}")
+    # parent linkを定義（ローカル軸y安定化: 肘面基準）
+    parent_links = {
+        "wrist_R": links["elbow_R"],
+        "elbow_R": links["shoulder_R"],
+        "shoulder_R": None,
+        "wrist_L": links["elbow_L"],
+        "elbow_L": links["shoulder_L"],
+        "shoulder_L": None,
+    }
     locals_map = {}
     t_seg = time.perf_counter()
     for _k in globals_map.keys():
         try:
-            locals_map[_k] = compute_local_torque(globals_map[_k], links[_k])
+            locals_map[_k] = compute_local_torque(globals_map[_k], links[_k], parent_vec=parent_links[_k])
         except Exception as e:
             if DEBUG_LOGS:
                 print(f"[DBG] compute_local_torque failed for {_k}: {e}")
@@ -2466,6 +3400,42 @@ while True:
         _E_buffers['elbow_R']['tau'].append(tau_R)
         _E_buffers['elbow_L']['theta'].append(th_L)
         _E_buffers['elbow_L']['tau'].append(tau_L)
+        
+        # ======== 適応的fc: f0推定ステップ ========
+        if E_FC_ADAPTIVE_ON:
+            fps_for_lpf = float(_lpf_fps_ema) if (_lpf_fps_ema is not None and np.isfinite(_lpf_fps_ema)) else 30.0
+            fps_for_lpf = float(np.clip(fps_for_lpf, E_FPS_MIN, E_FPS_MAX))
+            # lazy init: 初回フレームのみ実効fpsで初期化
+            if _f0_estimator is None:
+                _f0_estimator = OnlineF0Estimator(fps=fps_for_lpf, win_sec=E_F0_WIN_SEC, fmin=E_F0_FMIN)
+            else:
+                _f0_estimator.set_fps(fps_for_lpf)
+
+            _e_dt_sec_current = 1.0 / max(fps_for_lpf, 1e-6)
+            _fc_update_interval = max(1, int(round(fps_for_lpf / max(E_FC_UPDATE_HZ, 1e-6))))
+
+            # 各フレームでtheta値をestimatorに供給（左右平均を1サンプルとして使用）
+            if np.isfinite(th_R) and np.isfinite(th_L):
+                _theta_for_f0 = 0.5 * (th_R + th_L)
+            elif np.isfinite(th_R):
+                _theta_for_f0 = th_R
+            else:
+                _theta_for_f0 = th_L
+            _f0_estimator.step(_theta_for_f0)
+            _fc_update_counter += 1
+            
+            # E_FC_UPDATE_HZ頻度で f0推定とfc更新
+            if _fc_update_counter >= _fc_update_interval:
+                f0_hat, conf_db = _f0_estimator.estimate()
+                _fc_current = _fc_scheduler(
+                    f0_hat, conf_db, _fc_current,
+                    E_FC_MIN, E_FC_MAX, E_FC_K,
+                    E_FC_EMA_BETA, E_F0_SNR_THRESHOLD
+                )
+                if E_DEBUG:
+                    print(f"[ADAPTIVE_FC] fps={fps_for_lpf:.2f} f0={f0_hat:.2f}Hz conf={conf_db:.1f}dB fc={_fc_current:.3f}Hz")
+                _fc_update_counter = 0
+        
         # 連続表示用: 正仕事のみ Σ τ·dθ を積算
         for _side, _th_now, _tau_now in (("elbow_R", th_R, tau_R), ("elbow_L", th_L, tau_L)):
             th_prev = _continuous_last_theta[_side]
@@ -2576,7 +3546,8 @@ while True:
             p_val = float(np.dot(tau_g, omg))
         current_power_history[key].append(p_val)
     if WHILE_COUNT > 15:
-        if detector.update(transformed_p3ds[0][2], WHILE_COUNT):
+        _z_cycle = transformed_p3ds[0][_cycle_axis_idx]
+        if np.isfinite(_z_cycle) and detector.update(_z_cycle, WHILE_COUNT):
             hist_len = len(current_torque_history[part_keys[0]])
             print("detected")
             if prev_cycle_frame is not None and hist_len >= min_history_len:
@@ -2586,8 +3557,20 @@ while True:
                 for pk in keys_now:
                     if pk in ELBOW_KEYS:
                         buf = _E_buffers.get(pk, {'theta': [], 'tau': []})
-                        e_pos, e_neg, info = compute_cycle_energy_filtered(np.array(buf['theta']), np.array(buf['tau']), dt)
+                        e_pos, e_neg, info = compute_cycle_energy_filtered(
+                            np.array(buf['theta']), np.array(buf['tau']), _e_dt_sec_current,
+                            fc_override=_fc_current if E_FC_ADAPTIVE_ON else None
+                        )
                         energy = e_pos  # ゲージ用途: 正仕事
+                        cycle_energy_debug_rows.append({
+                            'frame': int(WHILE_COUNT),
+                            'part': str(pk),
+                            'e_pos': float(e_pos),
+                            'e_neg': float(e_neg),
+                            'fc_current': float(_fc_current),
+                            'dt_sec': float(_e_dt_sec_current),
+                            'n_u': int(info.get('n_u', 0)) if isinstance(info, dict) else 0,
+                        })
                         if E_DEBUG:
                             print(f"[EPIPE] {pk} E+= {energy:.4f} info={info}")
                     elif pk in WRIST_KEYS:
@@ -2628,33 +3611,88 @@ while True:
             current_torque_history[key].append(vec[2])
     else:
         pass
-    # 連続エネルギー値をゲージへ毎フレーム反映
+    # 連続エネルギー値/単眼デモ判定をゲージへ毎フレーム反映
     if gauge is not None:
-        keys_now = list(current_power_history.keys())
-        for pk in keys_now:
-            if pk in ELBOW_KEYS:
-                # 正しいJ単位の連続エネルギー
-                energy_cont = float(_continuous_energy_J.get(pk, 0.0))
-            elif pk in WRIST_KEYS:
-                # 暫定: 旧トルク成分の時間積分をスケールダウン
-                raw_sum = float(sum(current_energy_component_history.get(pk, [])) * dt)
-                energy_cont = raw_sum / 50.0
-                if energy_cont == 0.0:
-                    # 微小代替: ローカルトルクy絶対値で最初の僅かな動きを可視化
-                    try:
-                        lt = locals_map.get(pk)
-                        ty_abs = abs(float(lt[1])) if lt is not None and np.all(np.isfinite(lt)) else 0.0
-                    except Exception:
-                        ty_abs = 0.0
-                    energy_cont = float(ty_abs * dt)
-            else:
-                energy_cont = float(sum(current_power_history.get(pk, [])) * dt)
-            current_impulses[pk] = energy_cont
-        gauge.update_impulses(current_impulses)
-        try:
-            _gauge_log_state(tag="after_update_impulses")
-        except Exception:
-            pass
+        if DEMO_MONO_GAUGE_ON:
+            ratio_map = {}
+            for _side in ("R", "L"):
+                y_now = _shoulder_world_y_m(results0, _side)
+                th_now = _elbow_angle_deg_cam0(frame0_keypoints, _side)
+
+                y_base = _demo_shoulder_base_y[_side]
+                th_base = _demo_elbow_base_deg[_side]
+                if y_now is not None:
+                    if y_base is None:
+                        y_base = y_now
+                    else:
+                        y_base = float((1.0 - DEMO_BASELINE_EMA) * y_base + DEMO_BASELINE_EMA * y_now)
+                    _demo_shoulder_base_y[_side] = y_base
+                if th_now is not None:
+                    if th_base is None:
+                        th_base = th_now
+                    else:
+                        th_base = float((1.0 - DEMO_BASELINE_EMA) * th_base + DEMO_BASELINE_EMA * th_now)
+                    _demo_elbow_base_deg[_side] = th_base
+
+                shoulder_rise_m = 0.0
+                elbow_delta_deg = 0.0
+                if (y_now is not None) and (_demo_shoulder_base_y[_side] is not None):
+                    shoulder_rise_m = float(_demo_shoulder_base_y[_side] - y_now)
+                if (th_now is not None) and (_demo_elbow_base_deg[_side] is not None):
+                    elbow_delta_deg = float(abs(th_now - _demo_elbow_base_deg[_side]))
+
+                full_ok = (shoulder_rise_m >= DEMO_SHOULDER_RISE_FULL_M) and (elbow_delta_deg >= DEMO_ELBOW_DELTA_FULL_DEG)
+                partial_ok = (shoulder_rise_m >= DEMO_SHOULDER_RISE_PARTIAL_M) and (elbow_delta_deg >= DEMO_ELBOW_DELTA_PARTIAL_DEG)
+
+                if full_ok:
+                    target_ratio = DEMO_RATIO_FULL
+                elif partial_ok:
+                    target_ratio = DEMO_RATIO_PARTIAL
+                else:
+                    target_ratio = 0.0
+
+                cur_ratio = float(_demo_gauge_ratio[_side])
+                if target_ratio > cur_ratio:
+                    cur_ratio = min(target_ratio, cur_ratio + DEMO_RATIO_UP_STEP)
+                else:
+                    cur_ratio = max(target_ratio, cur_ratio - DEMO_RATIO_DOWN_STEP)
+                cur_ratio = float(np.clip(cur_ratio, 0.0, 1.0))
+                _demo_gauge_ratio[_side] = cur_ratio
+
+                ratio_map[f"wrist_{_side}"] = cur_ratio
+                ratio_map[f"elbow_{_side}"] = cur_ratio
+
+            try:
+                gauge.set_direct_ratios(ratio_map, fill_rgba=(0.20, 0.80, 0.20, 0.90))
+            except Exception as _gdir_e:
+                if DEBUG_LOGS and (WHILE_COUNT % 30 == 0):
+                    print(f"[GaugeDemo] set_direct_ratios failed: {_gdir_e}")
+        else:
+            keys_now = list(current_power_history.keys())
+            for pk in keys_now:
+                if pk in ELBOW_KEYS:
+                    # 正しいJ単位の連続エネルギー
+                    energy_cont = float(_continuous_energy_J.get(pk, 0.0))
+                elif pk in WRIST_KEYS:
+                    # 暫定: 旧トルク成分の時間積分をスケールダウン
+                    raw_sum = float(sum(current_energy_component_history.get(pk, [])) * dt)
+                    energy_cont = raw_sum / 50.0
+                    if energy_cont == 0.0:
+                        # 微小代替: ローカルトルクy絶対値で最初の僅かな動きを可視化
+                        try:
+                            lt = locals_map.get(pk)
+                            ty_abs = abs(float(lt[1])) if lt is not None and np.all(np.isfinite(lt)) else 0.0
+                        except Exception:
+                            ty_abs = 0.0
+                        energy_cont = float(ty_abs * dt)
+                else:
+                    energy_cont = float(sum(current_power_history.get(pk, [])) * dt)
+                current_impulses[pk] = energy_cont
+            gauge.update_impulses(current_impulses)
+            try:
+                _gauge_log_state(tag="after_update_impulses")
+            except Exception:
+                pass
     # ノルムだけ取り出してプロット用に
     temp_norms = [np.linalg.norm(v) for v in temp_local]
     aim_torque.append(temp_local)
@@ -2824,12 +3862,44 @@ while True:
     _perf.add('loop_total', frame_dt)
     _perf.next()
     _perf.end_loop(WHILE_COUNT, frame_dt)
+    if _rt_burst_remaining > 0:
+        _rt_burst_remaining -= 1
+    if _rt_burst_cooldown > 0:
+        _rt_burst_cooldown -= 1
+    if frame_dt > 1e-6:
+        _fps_inst = float(np.clip(1.0 / frame_dt, E_FPS_MIN, E_FPS_MAX))
+        if _lpf_fps_ema is None or (not np.isfinite(_lpf_fps_ema)):
+            _lpf_fps_ema = _fps_inst
+        else:
+            _lpf_fps_ema = (1.0 - E_FPS_EMA_BETA) * float(_lpf_fps_ema) + E_FPS_EMA_BETA * _fps_inst
     # 5ループに1回の実行時間表示
     try:
         if WHILE_COUNT % 5 == 0:
             print(f"[LOOP] #{WHILE_COUNT} dt={frame_dt:.4f}s fps={(1.0/frame_dt if frame_dt>0 else 0):.1f}")
     except Exception:
         pass
+    # 次回処理までのスキップ量を、直近処理時間から算出
+    if RT_POSE_FIXED_HZ_ON:
+        _rt_skip_remaining = _rt_fixed_skip
+        if E_DEBUG and (WHILE_COUNT % 5 == 0):
+            print(f"[RTFIX] fixed_hz={RT_POSE_FIXED_HZ:.3f} -> set skip_next={_rt_skip_remaining}")
+    elif RT_DELAY_SKIP_ON:
+        if _rt_burst_remaining > 0:
+            _rt_skip_remaining = RT_RISE_BURST_SKIP
+            if E_DEBUG and (WHILE_COUNT % 5 == 0):
+                print(f"[RTBURST] active={_rt_burst_remaining} -> force skip_next={RT_RISE_BURST_SKIP} (burst mode)")
+        else:
+            raw_interval_frames = int(round(frame_dt * _src_fps * max(0.0, RT_DELAY_SKIP_GAIN)))
+            # 例: interval=30フレーム相当 -> 既に1フレーム進んでいるため残り29をskip
+            skip_next = max(0, raw_interval_frames - 1)
+            skip_next = int(np.clip(skip_next, RT_DELAY_SKIP_MIN, RT_DELAY_SKIP_MAX))
+            _rt_skip_remaining = skip_next
+            if E_DEBUG and (WHILE_COUNT % 5 == 0):
+                print(f"[RTSKIP] frame_dt={frame_dt:.4f}s -> interval={raw_interval_frames}f, set skip_next={_rt_skip_remaining}")
+    # 早期終了: フレーム上限
+    if MAX_FRAMES and WHILE_COUNT >= MAX_FRAMES:
+        print(f"[STOP] Reached MAX_FRAMES={MAX_FRAMES} -> exiting loop")
+        break
     # キー入力で終了（HEADLESS ではスキップ）
     if not HEADLESS:
         key = cv.waitKey(1) & 0xFF
@@ -2933,7 +4003,8 @@ for frame_idx, frame in enumerate(kpts_3d):
     flattened_rows.append(row)
 
 df_coords = pd.DataFrame(flattened_rows)
-df_coords.to_csv(os.path.join(save_dir, f"kpts3d_{timestamp}.csv"), index=False)
+_grav_tag = f"_g{_gravity_label}" if GRAVITY_TAG_IN_CSV else ""
+df_coords.to_csv(os.path.join(save_dir, f"kpts3d_{timestamp}{_grav_tag}.csv"), index=False)
 print("✅ 3D座標データを保存しました")
 
 # -------------------------------
@@ -2973,10 +4044,21 @@ for frame_idx, frame_data in enumerate(aim_torque):
 
 # DataFrameにして保存
 df = pd.DataFrame(csv_rows)
-save_path = os.path.join(save_dir, f"aim_torque_vec_{timestamp}.csv")
+save_path = os.path.join(save_dir, f"aim_torque_vec_{timestamp}{_grav_tag}.csv")
 df.to_csv(save_path, index=False, encoding="utf-8-sig")
 
 print(f"✅ aim_torque（ベクトル形式）を保存しました: {save_path}")
+
+# -------------------------------
+# ②-2 サイクルエネルギー診断データを保存（LPFチューニング用）
+# -------------------------------
+if cycle_energy_debug_rows:
+    df_cycle_dbg = pd.DataFrame(cycle_energy_debug_rows)
+    cycle_dbg_path = os.path.join(save_dir, f"cycle_energy_debug_{timestamp}{_grav_tag}.csv")
+    df_cycle_dbg.to_csv(cycle_dbg_path, index=False, encoding="utf-8-sig")
+    print(f"✅ cycle_energy_debug を保存しました: {cycle_dbg_path}")
+else:
+    print("[INFO] cycle_energy_debug: 有効サイクルが無いため出力なし")
 
 # -------------------------------
 # ⑤ Offline wrist capture NPY 保存 (任意)

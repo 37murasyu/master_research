@@ -80,8 +80,11 @@ def _convert_to_homogeneous(pts):
         return np.concatenate([pts, [1]], axis=0)
 
 
-def get_projection_matrix(camera_id, file_mode):
-    base = folder_path + ("\\camera_parameters\\Param_for_MYvideo\\" if file_mode else "\\camera_parameters\\")
+def get_projection_matrix(camera_id, file_mode, base_dir=None):
+    if base_dir:
+        base = os.path.join(base_dir, "")
+    else:
+        base = folder_path + ("\\camera_parameters\\Param_for_MYvideo\\" if file_mode else "\\camera_parameters\\")
     cmtx, _ = read_camera_parameters(camera_id, base)
     rvec, tvec = read_rotation_translation(camera_id, base)
     return cmtx @ _make_homogeneous_rep_matrix(rvec, tvec)[:3]
@@ -128,19 +131,19 @@ def extract_keypoints(results0, results1, pose_keypoints, frame0, frame1):
     draw_kpts = os.getenv('DRAW_KEYPOINTS', '1') not in ('0','false','False')
 
     def _extract(results, frame):
+        # pose_keypoints の並び順で返す（ランドマークIDを明示するため）
         if not results.pose_landmarks:
             return [[-1, -1]] * len(pose_keypoints)
         out = []
-        for i, landmark in enumerate(results.pose_landmarks.landmark):
-            if i not in pose_keypoints:
-                continue
-            px = int(round(landmark.x * frame.shape[1]))
-            py = int(round(landmark.y * frame.shape[0]))
+        for pid in pose_keypoints:
+            lm = results.pose_landmarks.landmark[pid]
+            px = int(round(lm.x * frame.shape[1]))
+            py = int(round(lm.y * frame.shape[0]))
             if draw_kpts:
                 cv.circle(frame, (px, py), 3, (0, 0, 255), -1)
-                cv.putText(frame, str(i), (px + 5, py - 5), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv.putText(frame, str(pid), (px + 5, py - 5), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             out.append([px, py])
-        return out or [[-1, -1]] * len(pose_keypoints)
+        return out
 
     return _extract(results0, frame0), _extract(results1, frame1)
 
@@ -391,7 +394,13 @@ def compute_local_torque(torque_global, link_vec, parent_vec=None):
 
 class PushCycleDetector:
     def __init__(
-        self, initial_z, threshold=0.015, velocity_epsilon=0.01, min_interval=10
+        self,
+        initial_z,
+        threshold=0.015,
+        velocity_epsilon=0.01,
+        min_interval=10,
+        mode='legacy',
+        negative_down=True,
     ):
         """
         Parameters
@@ -409,10 +418,13 @@ class PushCycleDetector:
         self.threshold = threshold
         self.velocity_epsilon = velocity_epsilon
         self.min_interval = min_interval
+        self.mode = mode
+        self.negative_down = bool(negative_down)
 
         self.prev_z = None
         self.last_cycle_frame = -min_interval
         self.cycles = []
+        self._seen_drop = False
 
     def update(self, z_current, frame_idx):
         if self.prev_z is None:
@@ -420,8 +432,34 @@ class PushCycleDetector:
             return False
 
         # z軸速度（前フレームとの差分）
-        dz = z_current - self.prev_z
+        z_prev = self.prev_z
+        dz = z_current - z_prev
         self.prev_z = z_current
+
+        if self.mode == 'rise_to_rise':
+            # たち下がり（drop）を一度経由した後に、立ち上がり境界（rise）でサイクル確定
+            if self.negative_down:
+                drop_cond = (z_current < self.initial_z - self.threshold) or (dz < -abs(self.velocity_epsilon))
+                rise_level = self.initial_z - 0.25 * self.threshold
+                rise_cross = (z_prev < rise_level <= z_current)
+            else:
+                drop_cond = (z_current > self.initial_z + self.threshold) or (dz > abs(self.velocity_epsilon))
+                rise_level = self.initial_z + 0.25 * self.threshold
+                rise_cross = (z_prev > rise_level >= z_current)
+
+            if drop_cond:
+                self._seen_drop = True
+
+            if self._seen_drop and rise_cross:
+                if frame_idx - self.last_cycle_frame > self.min_interval:
+                    self.last_cycle_frame = frame_idx
+                    self.cycles.append(frame_idx)
+                    self._seen_drop = False
+                    print(
+                        f"[Cycle Detected] Frame: {frame_idx}, sig: {z_current:.3f}, sig_init: {self.initial_z:.4f} (rise_to_rise)"
+                    )
+                    return True
+            return False
 
         # 閾値条件 & 速度条件
         z_condition = z_current < self.initial_z + self.threshold

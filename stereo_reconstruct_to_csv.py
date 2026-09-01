@@ -40,26 +40,55 @@ def _open_caps(path0: str, path1: str):
     return cap0, cap1
 
 
-def _write_kpts3d_csv(frames_xyz: List[np.ndarray], out_csv: str, float_ndigits: int = 4):
+def _auto_discover_inputs(input_dir: str):
+    video_exts = (".mp4", ".mov", ".avi", ".mkv", ".mpg", ".m4v")
+    dat_names = ["c0.dat", "c1.dat", "rot_trans_c0.dat", "rot_trans_c1.dat"]
+    dir_path = os.path.abspath(input_dir)
+
+    missing = [name for name in dat_names if not os.path.isfile(os.path.join(dir_path, name))]
+    if missing:
+        raise FileNotFoundError(f"Missing calibration files in {dir_path}: {', '.join(missing)}")
+
+    videos = []
+    for fname in sorted(os.listdir(dir_path)):
+        if fname.lower().endswith(video_exts):
+            videos.append(os.path.join(dir_path, fname))
+
+    if len(videos) < 2:
+        raise FileNotFoundError(f"Expected at least two video files in {dir_path}")
+
+    cam0_path, cam1_path = videos[0], videos[1]
+    return cam0_path, cam1_path, dir_path
+
+
+def _write_kpts3d_csv(frames_xyz: List[np.ndarray], out_csv: str, pose_ids: List[int], float_ndigits: int = 4):
+    """
+    Write 3D keypoints as bodypose3d order (kpt_0..kpt_11).
+    Adds a leading comment line documenting the landmark IDs used.
+    """
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     rows = []
     for fidx, xyz in enumerate(frames_xyz):
         row = {"frame": fidx}
         if xyz is None:
-            # 欠損の場合は -1 を入れる
-            for jid in range(12):
-                row[f"joint_{jid}_x"] = -1.0
-                row[f"joint_{jid}_y"] = -1.0
-                row[f"joint_{jid}_z"] = -1.0
+            for jid in range(len(pose_ids)):
+                row[f"kpt_{jid}_x"] = -1.0
+                row[f"kpt_{jid}_y"] = -1.0
+                row[f"kpt_{jid}_z"] = -1.0
         else:
-            for jid in range(xyz.shape[0]):
+            for jid in range(len(pose_ids)):
                 x, y, z = xyz[jid]
-                row[f"joint_{jid}_x"] = round(float(x), float_ndigits)
-                row[f"joint_{jid}_y"] = round(float(y), float_ndigits)
-                row[f"joint_{jid}_z"] = round(float(z), float_ndigits)
+                row[f"kpt_{jid}_x"] = round(float(x), float_ndigits)
+                row[f"kpt_{jid}_y"] = round(float(y), float_ndigits)
+                row[f"kpt_{jid}_z"] = round(float(z), float_ndigits)
         rows.append(row)
     df = pd.DataFrame(rows)
-    df.to_csv(out_csv, index=False, encoding="utf-8")
+
+    # 先頭に bodypose3d 順序のメタ情報をコメントとして書く
+    meta = "# order=bodypose3d kpt_0..kpt_11 -> mp_ids " + ",".join(map(str, pose_ids)) + "\n"
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write(meta)
+    df.to_csv(out_csv, mode="a", index=False, encoding="utf-8")
     return out_csv
 
 
@@ -73,11 +102,12 @@ def run(
     file_mode: bool = True,
     det_conf: float = 0.5,
     track_conf: float = 0.5,
+    calib_dir: str | None = None,
 ):
     t0 = time.time()
     print("[INFO] loading projection matrices (camera_parameters)")
-    P0 = get_projection_matrix(0, file_mode)
-    P1 = get_projection_matrix(1, file_mode)
+    P0 = get_projection_matrix(0, file_mode, calib_dir)
+    P1 = get_projection_matrix(1, file_mode, calib_dir)
     if P0 is None or P1 is None:
         raise RuntimeError("Projection matrices not found. Please run stereo calibration to create camera_parameters.")
 
@@ -144,15 +174,16 @@ def run(
         pass
 
     print(f"[INFO] writing CSV -> {out_csv}")
-    saved = _write_kpts3d_csv(frames_xyz, out_csv)
+    saved = _write_kpts3d_csv(frames_xyz, out_csv, pose_keypoints)
     elapsed = time.time() - t0
     print(f"[DONE] frames: {len(frames_xyz)} saved: {saved} elapsed: {elapsed:.2f}s")
 
 
 def main(argv: List[str]):
     parser = argparse.ArgumentParser(description="Stereo 3D pose reconstruction to CSV from two videos")
-    parser.add_argument("--cam0", required=True, help="Camera 0 video file path (left)")
-    parser.add_argument("--cam1", required=True, help="Camera 1 video file path (right)")
+    parser.add_argument("--cam0", default=None, help="Camera 0 video file path (left)")
+    parser.add_argument("--cam1", default=None, help="Camera 1 video file path (right)")
+    parser.add_argument("--input-dir", default=None, help="Directory containing two videos and calibration dat files")
     parser.add_argument("--out-csv", default="output_data/poses/kpts3d_stereo.csv", help="Output CSV path")
     parser.add_argument("--stride", type=int, default=1, help="Process every Nth frame")
     parser.add_argument("--max-frames", type=int, default=-1, help="Limit number of frames to process (-1=all)")
@@ -172,9 +203,21 @@ def main(argv: List[str]):
     parser.add_argument("--track-conf", type=float, default=0.5, help="MediaPipe min_tracking_confidence")
     args = parser.parse_args(argv)
 
+    calib_dir = None
+    cam0_path = args.cam0
+    cam1_path = args.cam1
+
+    if args.input_dir:
+        cam0_path, cam1_path, calib_dir = _auto_discover_inputs(args.input_dir)
+        print(f"[INFO] auto-selected cam0={cam0_path}")
+        print(f"[INFO] auto-selected cam1={cam1_path}")
+
+    if not cam0_path or not cam1_path:
+        parser.error("--cam0 and --cam1 are required when --input-dir is not given")
+
     run(
-        cam0_path=args.cam0,
-        cam1_path=args.cam1,
+        cam0_path=cam0_path,
+        cam1_path=cam1_path,
         out_csv=args.out_csv,
         stride=args.stride,
         max_frames=args.max_frames,
@@ -182,6 +225,7 @@ def main(argv: List[str]):
         file_mode=bool(args.file_mode),
         det_conf=args.det_conf,
         track_conf=args.track_conf,
+        calib_dir=calib_dir,
     )
 
 

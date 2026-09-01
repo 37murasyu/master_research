@@ -5,6 +5,7 @@ frame_height: 720
 mono_calibration_frames: 5
 stereo_calibration_frames: 10
 view_resize: 1
+# チェッカーボード1マスの一辺長 [cm]（値はcm、コード側でmに換算）
 checkerboard_box_size_scale : 3.00
 checkerboard_rows: 4
 checkerboard_columns: 7

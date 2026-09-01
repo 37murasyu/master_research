@@ -43,7 +43,9 @@ def calculate_inertia_tensor(k, mass, l):
     csv_path = folder_path + "\\Moment of inertia estimation coefficient boys.csv"
 
     row = pd.read_csv(csv_path).iloc[k]
-    ax, bx, cx, ay, by, cy, az, bz, cz = [row.iloc[i] for i in range(1, 10)]
+    coeffs = np.array([row.iloc[i] for i in range(1, 10)], dtype=np.float64)
+    coeffs *= 1e-4  # CSV values are in units of 1e-4 kg*m^2
+    ax, bx, cx, ay, by, cy, az, bz, cz = coeffs
     I_tensor = np.diag([
         ax * mass + bx * l + cx,
         ay * mass + by * l + cy,
@@ -301,10 +303,12 @@ def compute_impulse(series: pd.Series, dt: float):
 _NDLL = None
 _NDYN_MF = None
 _NDYN_TAU = None
+_NDYN_LPF = None
+_NDYN_TRIANG = None
 
 def _load_native_dynamics() -> bool:  # pragma: no cover - thin loader
-    global _NDLL, _NDYN_MF, _NDYN_TAU
-    if _NDYN_MF is not None and _NDYN_TAU is not None:
+    global _NDLL, _NDYN_MF, _NDYN_TAU, _NDYN_LPF, _NDYN_TRIANG
+    if _NDYN_MF is not None and _NDYN_TAU is not None and _NDYN_LPF is not None and _NDYN_TRIANG is not None:
         return True
     import os as _os
     import ctypes as _ct
@@ -342,8 +346,31 @@ def _load_native_dynamics() -> bool:  # pragma: no cover - thin loader
     ]
     _NDLL.dyn_compute_tau_chain.restype = _c_int
 
+    _NDLL.dyn_lpf_exp_fb.argtypes = [
+        _c_int,
+        _POINTER(_c_double),
+        _c_double,
+        _c_double,
+        _c_int,
+        _POINTER(_c_double),
+    ]
+    _NDLL.dyn_lpf_exp_fb.restype = _c_int
+
+    _NDLL.dyn_triangulate_transform_batch.argtypes = [
+        _c_int,
+        _POINTER(_c_double),
+        _POINTER(_c_double),
+        _POINTER(_c_double),
+        _POINTER(_c_double),
+        _c_double,
+        _POINTER(_c_double),
+    ]
+    _NDLL.dyn_triangulate_transform_batch.restype = _c_int
+
     _NDYN_MF = _NDLL.dyn_compute_mf_batch
     _NDYN_TAU = _NDLL.dyn_compute_tau_chain
+    _NDYN_LPF = _NDLL.dyn_lpf_exp_fb
+    _NDYN_TRIANG = _NDLL.dyn_triangulate_transform_batch
     if _trace:
         try:
             _path = getattr(_NDLL, '_name', 'native_dynamics.dll')
@@ -476,4 +503,134 @@ def compute_tau_chain_native(Ms: np.ndarray,
         t -= np.cross(r_x - p1j, f_E)
         tau[j] = t
     return tau
+
+
+def compute_lpf_exp_fb_native(x: np.ndarray,
+                              dt: float,
+                              fc: float,
+                              passes: int = 2) -> np.ndarray:
+    """Exponential forward-backward LPF using native DLL if available.
+
+    Args:
+      x: input signal (1-D)
+      dt: sampling period [s]
+      fc: cutoff frequency [Hz]
+      passes: forward-backward repetitions
+    """
+    import os as _os
+    _trace = _os.getenv('NDYN_TRACE', '0') not in ('0','false','False')
+    x_c = np.ascontiguousarray(np.asarray(x, dtype=np.float64).reshape(-1), dtype=np.float64)
+    n = int(x_c.shape[0])
+    if n < 2:
+        return x_c.copy()
+
+    if _load_native_dynamics():
+        try:
+            from ctypes import c_double as _c_double, c_int as _c_int, POINTER as _POINTER
+            y_out = np.empty_like(x_c)
+            ret = _NDYN_LPF(
+                n,
+                x_c.ctypes.data_as(_POINTER(_c_double)),
+                _c_double(float(dt)),
+                _c_double(float(fc)),
+                _c_int(int(max(1, passes))),
+                y_out.ctypes.data_as(_POINTER(_c_double)),
+            )
+            if ret == 0:
+                if _trace:
+                    print(f'[NDYN:LPF] native ok (N={n}, dt={dt:.6f}, fc={fc:.3f}, passes={passes})')
+                return y_out
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            if _trace:
+                print('[NDYN:LPF] native failed; fallback to numpy')
+
+    # numpy fallback (same algorithm)
+    rc = 1.0 / (2.0 * np.pi * max(1e-9, float(fc)))
+    alpha = float(dt) / (rc + float(dt))
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    y = x_c.copy()
+    for _ in range(max(1, int(passes))):
+        fwd = np.empty_like(y)
+        fwd[0] = y[0]
+        for i in range(1, n):
+            fwd[i] = fwd[i - 1] + alpha * (y[i] - fwd[i - 1])
+        bwd = np.empty_like(y)
+        bwd[-1] = fwd[-1]
+        for i in range(n - 2, -1, -1):
+            bwd[i] = bwd[i + 1] + alpha * (fwd[i] - bwd[i + 1])
+        y = bwd
+    return y
+
+
+def compute_triangulate_transform_native(P0: np.ndarray,
+                                         P1: np.ndarray,
+                                         keypoints0: np.ndarray,
+                                         keypoints1: np.ndarray,
+                                         scale: float = 0.01) -> np.ndarray:
+    """Batch triangulate + transform via native DLL if available.
+
+    Returns transformed points with shape (N, 3). Invalid points become NaN.
+    Fallback uses OpenCV triangulatePoints batch + same transform.
+    """
+    import os as _os
+    _trace = _os.getenv('NDYN_TRACE', '0') not in ('0','false','False')
+
+    k0 = np.asarray(keypoints0, dtype=np.float64)
+    k1 = np.asarray(keypoints1, dtype=np.float64)
+    if k0.ndim != 2 or k1.ndim != 2 or k0.shape[1] != 2 or k1.shape[1] != 2:
+        raise ValueError('keypoints must be shaped (N, 2)')
+    if k0.shape[0] != k1.shape[0]:
+        raise ValueError('keypoints length mismatch')
+
+    n = int(k0.shape[0])
+    out = np.full((n, 3), np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+
+    P0_c = np.ascontiguousarray(np.asarray(P0, dtype=np.float64).reshape(3, 4), dtype=np.float64)
+    P1_c = np.ascontiguousarray(np.asarray(P1, dtype=np.float64).reshape(3, 4), dtype=np.float64)
+    k0_c = np.ascontiguousarray(k0.reshape(n, 2), dtype=np.float64)
+    k1_c = np.ascontiguousarray(k1.reshape(n, 2), dtype=np.float64)
+
+    if _load_native_dynamics():
+        try:
+            from ctypes import c_double as _c_double, c_int as _c_int, POINTER as _POINTER
+            ret = _NDYN_TRIANG(
+                _c_int(n),
+                P0_c.ctypes.data_as(_POINTER(_c_double)),
+                P1_c.ctypes.data_as(_POINTER(_c_double)),
+                k0_c.ctypes.data_as(_POINTER(_c_double)),
+                k1_c.ctypes.data_as(_POINTER(_c_double)),
+                _c_double(float(scale)),
+                out.ctypes.data_as(_POINTER(_c_double)),
+            )
+            if ret == 0:
+                if _trace:
+                    valid = int(np.sum(np.all(np.isfinite(out), axis=1)))
+                    print(f'[NDYN:TRI] native ok (N={n}, valid={valid})')
+                return out
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            if _trace:
+                print('[NDYN:TRI] native failed; fallback to OpenCV batch')
+
+    # OpenCV fallback
+    valid_idx = [i for i in range(n) if np.all(np.isfinite(k0_c[i])) and np.all(np.isfinite(k1_c[i])) and k0_c[i, 0] >= 0 and k0_c[i, 1] >= 0 and k1_c[i, 0] >= 0 and k1_c[i, 1] >= 0]
+    if not valid_idx:
+        return out
+
+    pts0 = np.array([[k0_c[i, 0], k0_c[i, 1]] for i in valid_idx], dtype=np.float64).T
+    pts1 = np.array([[k1_c[i, 0], k1_c[i, 1]] for i in valid_idx], dtype=np.float64).T
+    Xh = cv.triangulatePoints(P0_c, P1_c, pts0, pts1)
+    wv = Xh[3, :]
+    for j, idx in enumerate(valid_idx):
+        wj = float(wv[j])
+        if (not np.isfinite(wj)) or abs(wj) < 1e-12:
+            continue
+        Xj = (Xh[:3, j] / wj).astype(np.float64)
+        if not np.all(np.isfinite(Xj)):
+            continue
+        out[idx, 0] = -Xj[0] * float(scale)
+        out[idx, 1] = -Xj[2] * float(scale)
+        out[idx, 2] = -Xj[1] * float(scale)
+    return out
 

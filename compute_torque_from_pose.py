@@ -135,6 +135,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=7, help="Savitzky-Golay window length (odd >=5)")
     parser.add_argument("--poly", type=int, default=3, help="Savitzky-Golay polynomial order")
     parser.add_argument("--debug", action="store_true", help="Verbose diagnostics")
+    parser.add_argument("--pos-scale", type=float, default=1.0, help="Scale factor applied to positions (e.g., 0.01 if CSV is cm)")
+    parser.add_argument("--dumbbell-mass-right", type=float, default=0.0, help="External load mass at right wrist [kg]")
+    parser.add_argument("--dumbbell-mass-left", type=float, default=0.0, help="External load mass at left wrist [kg]")
     parser.add_argument(
         "--wrist-base",
         action="store_true",
@@ -151,6 +154,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Override torso mass [kg] treated as external load in wrist-base mode",
+    )
+    parser.add_argument(
+        "--torque-scale",
+        type=float,
+        default=0.01,
+        help="Scale factor applied to all output torques (use 0.01 if upstream produces N-cm)",
     )
     return parser.parse_args(argv)
 
@@ -579,6 +588,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gravity = np.array([0.0, 0.0, -gravity_mag], dtype=np.float64)
 
     frames, pose_full = load_pose_csv(args.pose_csv)
+    pos_scale = max(1e-6, float(args.pos_scale))
+    if pos_scale != 1.0:
+        pose_full = pose_full * pos_scale
+        if args.debug:
+            print(f"[DEBUG] position scaled by {pos_scale}")
     pose_interp = interpolate_and_smooth(
         pose_full,
         skip_smoothing=args.skip_smoothing,
@@ -605,8 +619,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wrist_segments_right = WRIST_BASE_SEGMENTS_RIGHT
         wrist_segments_left = WRIST_BASE_SEGMENTS_LEFT
 
-    tau_g_right, tau_l_right = compute_side_torques(pose_interp, right_segments, body_mass, dt, gravity)
-    tau_g_left, tau_l_left = compute_side_torques(pose_interp, left_segments, body_mass, dt, gravity)
+    def _build_external(mass_kg: float, segs: Sequence[SegmentSpec]):
+        if mass_kg <= 0:
+            return None, None
+        fvec = np.array([0.0, 0.0, -mass_kg * gravity_mag], dtype=np.float64)
+        T = pose_interp.shape[0]
+        farr = np.repeat(fvec[np.newaxis, :], T, axis=0)
+        wrist_idx = segs[-1].distal_joint
+        point = np.asarray(pose_interp[:, wrist_idx, :], dtype=np.float64)
+        return farr, point
+
+    ext_force_right, ext_point_right = _build_external(args.dumbbell_mass_right, right_segments)
+    ext_force_left, ext_point_left = _build_external(args.dumbbell_mass_left, left_segments)
+
+    tau_g_right, tau_l_right = compute_side_torques(
+        pose_interp,
+        right_segments,
+        body_mass,
+        dt,
+        gravity,
+        external_force=ext_force_right,
+        external_point=ext_point_right,
+    )
+    tau_g_left, tau_l_left = compute_side_torques(
+        pose_interp,
+        left_segments,
+        body_mass,
+        dt,
+        gravity,
+        external_force=ext_force_left,
+        external_point=ext_point_left,
+    )
+
+    torque_scale = float(args.torque_scale)
+    if torque_scale != 1.0:
+        tau_g_right *= torque_scale
+        tau_l_right *= torque_scale
+        tau_g_left *= torque_scale
+        tau_l_left *= torque_scale
 
     override_global: Dict[str, np.ndarray] = {}
     override_local: Dict[str, np.ndarray] = {}
@@ -645,6 +695,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             external_force=external_force_arr,
             external_point=external_point_left,
         )
+
+        if torque_scale != 1.0:
+            tau_g_right_wrist *= torque_scale
+            tau_l_right_wrist *= torque_scale
+            tau_g_left_wrist *= torque_scale
+            tau_l_left_wrist *= torque_scale
 
         for idx, seg in enumerate(wrist_segments_right):
             part = SEGMENT_TO_OUTPUT_WRIST_BASE.get(seg.name)
