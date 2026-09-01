@@ -2049,18 +2049,31 @@ def _remap_landmarks_to_fullframe(results, roi, full_shape):
         return False
 
 
-def _pose_process_with_roi(pose_estimator, frame_rgb, roi):
+def _mp_input_rgb(frame_bgr):
+    """MediaPipe へ渡す RGB 入力を作る。
+
+    従来はフレーム全体を BGR->RGB に変換してから ROI を切り出していたが、
+    MediaPipe が実際に見るのは ROI を縮小したものだけなので、
+    「切り出し -> 縮小 -> 色変換」の順にして変換画素数を最小化する。
+    チャンネル入れ替えは切り出し・per-channel な縮小と可換なので結果は同一。
+    """
+    small = _resize_mp_input(frame_bgr)
+    return cv.cvtColor(small, cv.COLOR_BGR2RGB)
+
+
+def _pose_process_with_roi(pose_estimator, frame_bgr, roi):
+    """frame_bgr は BGR のまま受け取る（RGB 変換は ROI 縮小後に行う）。"""
     if (not POSE_ROI_ON) or (roi is None):
-        return pose_estimator.process(_resize_mp_input(frame_rgb)), False
+        return pose_estimator.process(_mp_input_rgb(frame_bgr)), False
 
     x0, y0, x1, y1 = roi
-    crop = frame_rgb[y0:y1, x0:x1]
+    crop = frame_bgr[y0:y1, x0:x1]
     if crop is None or crop.size == 0:
-        return pose_estimator.process(_resize_mp_input(frame_rgb)), False
+        return pose_estimator.process(_mp_input_rgb(frame_bgr)), False
 
-    res = pose_estimator.process(_resize_mp_input(crop))
+    res = pose_estimator.process(_mp_input_rgb(crop))
     if _pose_has_landmarks(res):
-        _remap_landmarks_to_fullframe(res, roi, frame_rgb.shape)
+        _remap_landmarks_to_fullframe(res, roi, frame_bgr.shape)
     return res, True
 
 
@@ -3047,12 +3060,11 @@ while True:
         break
 
     t_seg = time.perf_counter()
-    frame0 = cv.cvtColor(frame0, cv.COLOR_BGR2RGB)
-    frame1 = cv.cvtColor(frame1, cv.COLOR_BGR2RGB)
-    frame0.flags.writeable = False
-    frame1.flags.writeable = False
+    # フレームは BGR のまま保持する。MediaPipe 用の RGB 変換は
+    # _mp_input_rgb() が ROI を縮小した後に行うため、ここでの
+    # フル解像度 BGR<->RGB 往復（1フレームあたり4回）は不要。
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
-        print("[TRACE] preproc RGB -> writeable False")
+        print("[TRACE] preproc: keep BGR (RGB conversion deferred to ROI)")
     _perf.add('preproc', time.perf_counter() - t_seg)
     if STOP_AFTER.lower() in ("preproc",):
         _perf.next()
@@ -3110,12 +3122,10 @@ while True:
             lm0 = lm1 = '?'
         #print(f"[TRACE] mediapipe processed lm0={lm0} lm1={lm1}")
     t_seg = time.perf_counter()
-    frame0.flags.writeable = True
-    frame1.flags.writeable = True
-    frame0 = cv.cvtColor(frame0, cv.COLOR_RGB2BGR)
-    frame1 = cv.cvtColor(frame1, cv.COLOR_RGB2BGR)
+    # preproc で RGB 化しなくなったため、ここでの BGR 復帰も不要。
+    # 以降の描画・extract_keypoints は従来どおり BGR を前提にできる。
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
-        #print(f"[TRACE] postproc back to BGR")
+        #print(f"[TRACE] postproc: already BGR (no conversion)")
         pass
     _perf.add('postproc', time.perf_counter() - t_seg)
     if STOP_AFTER.lower() in ("postproc",):
@@ -3713,11 +3723,12 @@ while True:
         except Exception as e:
             if WHILE_COUNT % 100 == 0:
                 print(f"[axes_debug] 描画失敗: {e}")
-    # キートグル処理
-    k = cv.waitKey(1) & 0xFF
-    if k == ord('a'):
-        ENABLE_AXES_DEBUG = not ENABLE_AXES_DEBUG
-        print(f"[axes_debug] ENABLE_AXES_DEBUG -> {ENABLE_AXES_DEBUG}")
+    # キートグル処理（HEADLESS ではウィンドウが無く waitKey は待ち時間だけのコストになる）
+    if not HEADLESS:
+        k = cv.waitKey(1) & 0xFF
+        if k == ord('a'):
+            ENABLE_AXES_DEBUG = not ENABLE_AXES_DEBUG
+            print(f"[axes_debug] ENABLE_AXES_DEBUG -> {ENABLE_AXES_DEBUG}")
 
     _perf.add('axes+waitkey', time.perf_counter() - t_u_wait)
 
