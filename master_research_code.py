@@ -163,6 +163,8 @@ EKF_GATE_STD = float(os.getenv('EKF_GATE_STD', '3.0'))
 EKF_BPF_LOW = float(os.getenv('EKF_BPF_LOW', '0'))
 EKF_BPF_HIGH = float(os.getenv('EKF_BPF_HIGH', '0'))
 EKF_BPF_ORDER = int(os.getenv('EKF_BPF_ORDER', '2'))
+# n_points x 3 本のスカラーEKFを配列演算で一括処理する（0 で従来のPythonループ）
+EKF_VECTORIZED = os.getenv('EKF_VECTORIZED', '1') not in ('0', 'false', 'False')
 
 # 肘の角度・トルクのフレーム蓄積バッファ（1サイwクル分）
 _E_buffers = {
@@ -508,7 +510,18 @@ class LandmarkEKF:
     ) -> None:
         self.n_points = int(n_points)
         self.cfg = cfg
-        self.filters = [[ExtendedKalman1D(cfg) for _ in range(3)] for _ in range(self.n_points)]
+        # ベクトル化パス: (n_points*3) 本の独立スカラーEKFを配列で保持
+        #   _X: (N,3) 状態 [x,v,a] / _P: (N,3,3) 共分散 / _init: (N,) 初期化済みフラグ
+        # 逐次パス（従来）: ExtendedKalman1D のリスト
+        self.vectorized = bool(EKF_VECTORIZED)
+        if self.vectorized:
+            _n = self.n_points * 3
+            self._X = np.zeros((_n, 3), dtype=float)
+            self._P = np.tile(np.eye(3, dtype=float), (_n, 1, 1))
+            self._init = np.zeros(_n, dtype=bool)
+            self.filters = None
+        else:
+            self.filters = [[ExtendedKalman1D(cfg) for _ in range(3)] for _ in range(self.n_points)]
         # streaming band-pass (optional)
         self._bpf_enabled = False
         self._bpf_b = None
@@ -538,6 +551,69 @@ class LandmarkEKF:
                 out[i, j] = y[-1]
         return out
 
+    def _step_vectorized(self, arr: np.ndarray, dt: float):
+        """ExtendedKalman1D.step を (n_points*3) 本まとめて配列演算で実行する。
+
+        逐次版と同一の分岐を再現する:
+          - 未初期化 かつ 欠測      -> NaN を返し、未初期化のまま
+          - 未初期化 かつ 観測あり  -> x=[z,0,0], P=I で初期化（predict も update もしない）
+          - 初期化済み              -> predict。欠測 / S<=0 / ゲート外 なら predict のみ
+        """
+        cfg = self.cfg
+        X, P, init = self._X, self._P, self._init
+        z = arr.reshape(-1)
+        valid = np.isfinite(z)
+
+        # 1) 今フレームで初期化されるもの
+        new = (~init) & valid
+        if new.any():
+            X[new] = 0.0
+            X[new, 0] = z[new]
+            P[new] = np.eye(3, dtype=float)
+            init[new] = True
+
+        # 2) 既に初期化済みだったものだけ predict（今回初期化した分は除く）
+        pred = init & ~new
+        pi = np.flatnonzero(pred)
+        if pi.size:
+            dt2 = dt * dt
+            dt3 = dt2 * dt
+            F = np.array([[1.0, dt, 0.5 * dt2],
+                          [0.0, 1.0, dt],
+                          [0.0, 0.0, 1.0]], dtype=float)
+            Q = cfg.q_acc * np.array(
+                [[dt3 * dt2 / 20.0, dt3 * dt / 8.0, dt3 / 6.0],
+                 [dt3 * dt / 8.0, dt3 / 3.0, dt2 / 2.0],
+                 [dt3 / 6.0, dt2 / 2.0, dt]], dtype=float)
+            X[pi] = X[pi] @ F.T
+            P[pi] = F @ P[pi] @ F.T + Q
+
+            # 3) 観測がある行だけ update（H = [1,0,0] なので行列積は不要）
+            ui = pi[valid[pi]]
+            if ui.size:
+                y = z[ui] - X[ui, 0]
+                S = P[ui, 0, 0] + cfg.r
+                ok = S > 0.0
+                if cfg.gate_std > 0:
+                    ok[ok] &= np.abs(y[ok]) <= cfg.gate_std * np.sqrt(S[ok])
+                si = ui[ok]
+                if si.size:
+                    Ps = P[si]
+                    K = Ps[:, :, 0] / S[ok][:, None]          # (m,3) = P H^T / S
+                    X[si] = X[si] + K * y[ok][:, None]
+                    # Joseph 形式: (I-KH) P (I-KH)^T + K r K^T
+                    A = np.tile(np.eye(3, dtype=float), (si.size, 1, 1))
+                    A[:, :, 0] -= K
+                    P[si] = A @ Ps @ np.transpose(A, (0, 2, 1)) \
+                        + cfg.r * (K[:, :, None] * K[:, None, :])
+
+        # 未初期化のものは NaN（逐次版と同じ）
+        out = X if init.all() else np.where(init[:, None], X, np.nan)
+        n = self.n_points
+        return (out[:, 0].reshape(n, 3).copy(),
+                out[:, 1].reshape(n, 3).copy(),
+                out[:, 2].reshape(n, 3).copy())
+
     def step(self, meas: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if meas.shape != (self.n_points, 3):
             raise ValueError(f"meas shape must be {(self.n_points, 3)}, got {meas.shape}")
@@ -545,6 +621,8 @@ class LandmarkEKF:
             dt = 1e-3
         arr = np.asarray(meas, dtype=float)
         arr = self._apply_bpf(arr)
+        if self.vectorized:
+            return self._step_vectorized(arr, dt)
         pos = np.zeros_like(arr)
         vel = np.zeros_like(arr)
         acc = np.zeros_like(arr)
@@ -1384,13 +1462,20 @@ if not HEADLESS:
     cv.moveWindow("MyWindow", 0, 0)
 
 # ================= 追加: ヘルスモニタ & 例外診断 =================
-tracemalloc.start(25)
+# tracemalloc は全メモリ確保に Python トレースバック(25段)を記録するため、
+# numpy の小さな配列演算が 2us -> 900us と約400倍遅くなる。ループ全体を支配する
+# ほどのコストなので既定では無効。メモリ調査時のみ HEALTH_TRACEMALLOC=1 で有効化する。
+HEALTH_TRACEMALLOC = os.getenv('HEALTH_TRACEMALLOC', '0') in ('1', 'true', 'True')
+if HEALTH_TRACEMALLOC:
+    tracemalloc.start(25)
 _HEALTH_LOG_INTERVAL = int(os.getenv('HEALTH_INTERVAL', '150'))
 _GAUGE_UPDATE_INTERVAL = int(os.getenv('GAUGE_UPDATE_INTERVAL', '2'))
 # print(f"[CFG] HEALTH_INTERVAL={_HEALTH_LOG_INTERVAL} GAUGE_UPDATE_INTERVAL={_GAUGE_UPDATE_INTERVAL}")
 
 def _health_snapshot(frame_idx: int):
     try:
+        if not HEALTH_TRACEMALLOC:
+            raise RuntimeError('tracemalloc disabled')
         snap = tracemalloc.take_snapshot()
         top_stats = snap.statistics('lineno')[:3]
         mem_str = '; '.join(f"{st.traceback[0].filename.split(os.sep)[-1]}:{st.traceback[0].lineno} {st.size/1024:.1f}KB" for st in top_stats)
@@ -2505,6 +2590,97 @@ LOOP_TRACE = os.getenv('LOOP_TRACE', '1') not in ('0','false','False')
 DISABLE_WRITE = os.getenv('DISABLE_WRITE', '0') in ('1','true','True')
 DISABLE_IMSHOW = os.getenv('DISABLE_IMSHOW', '0') in ('1','true','True')
 USE_NATIVE_DRAW = os.getenv('USE_NATIVE_DRAW', '1') in ('1','true','True')
+
+# ---- ラベル描画のスプライトキャッシュ ----
+# utils.put_text_jp はフレーム全体を PIL へ往復変換するため、6ラベル/フレームで
+# 6回のフルフレーム変換が走る。文字列ごとに小さな RGBA スプライトを一度だけ
+# 描画してキャッシュし、以降は numpy スライスで合成する。
+# DRAW_LABEL_CACHE=0 で従来の put_text_jp に戻せる。
+DRAW_LABEL_CACHE = os.getenv('DRAW_LABEL_CACHE', '1') not in ('0', 'false', 'False')
+_LABEL_SPRITES = {}
+_LABEL_SPRITES_MAX = 512
+_LABEL_FONTS = {}
+
+
+def _label_font(size: int):
+    f = _LABEL_FONTS.get(size)
+    if f is None:
+        from PIL import ImageFont as _IF
+        try:
+            f = _IF.truetype(os.path.join(folder_path, 'meiryo', 'meiryo.ttc'), size)
+        except OSError:
+            f = _IF.load_default()
+        _LABEL_FONTS[size] = f
+    return f
+
+
+def _glyph_sprite(ch: str, font_size: int, color):
+    """1文字を RGBA スプライト化してキャッシュする。
+
+    文字列全体でキャッシュすると数値が変わるたびに再描画になるため、
+    文字単位で持つ。ラベル+数字なら数十エントリで飽和し以降は全ヒットになる。
+
+    戻り値: (premul (h,w,3) f32, inv_a (h,w,1) f32, ox, oy, advance)
+      premul = color * alpha, inv_a = 1 - alpha を事前計算して合成を2演算に減らす。
+    """
+    key = (ch, int(font_size), tuple(color))
+    hit = _LABEL_SPRITES.get(key)
+    if hit is not None:
+        return hit
+    from PIL import Image as _IM, ImageDraw as _ID
+    font = _label_font(int(font_size))
+    try:
+        adv = float(font.getlength(ch))
+    except Exception:
+        adv = float(font_size)
+    try:
+        x0, y0, x1, y1 = font.getbbox(ch)
+    except Exception:
+        x0, y0, x1, y1 = 0, 0, int(adv), int(font_size * 1.2)
+    w = max(1, int(x1 - x0) + 1)
+    h = max(1, int(y1 - y0) + 1)
+    spr = _IM.new('RGBA', (w, h), (0, 0, 0, 0))
+    _ID.Draw(spr).text((-x0, -y0), ch, font=font,
+                       fill=(int(color[0]), int(color[1]), int(color[2]), 255))
+    rgba = np.asarray(spr, dtype=np.uint8)
+    a = (rgba[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
+    val = (rgba[:, :, :3].astype(np.float32) * a, 1.0 - a, int(x0), int(y0), adv)
+    if len(_LABEL_SPRITES) >= _LABEL_SPRITES_MAX:
+        _LABEL_SPRITES.clear()
+    _LABEL_SPRITES[key] = val
+    return val
+
+
+def _blit_label(frame, text: str, position, font_size: int, color, line_width: int = 20):
+    """キャッシュ済みグリフを frame へ順に合成する（frame を破壊的に更新）。"""
+    if line_width and len(text) > line_width:
+        import textwrap as _tw
+        text = _tw.fill(text, width=line_width)
+    H, W = frame.shape[:2]
+    base_x = int(position[0])
+    pen_y = int(position[1])
+    line_h = int(font_size * 1.25)
+    pen_x = 0.0
+    for ch in text:
+        if ch == '\n':
+            pen_x = 0.0
+            pen_y += line_h
+            continue
+        premul, inv_a, ox, oy, adv = _glyph_sprite(ch, font_size, color)
+        if ch != ' ':
+            sh, sw = premul.shape[:2]
+            x = base_x + int(pen_x) + ox
+            y = pen_y + oy
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(W, x + sw), min(H, y + sh)
+            if x1 > x0 and y1 > y0:
+                sx, sy = x0 - x, y0 - y
+                hh, ww = y1 - y0, x1 - x0
+                dst = frame[y0:y1, x0:x1]
+                np.copyto(dst, (dst * inv_a[sy:sy + hh, sx:sx + ww]
+                                + premul[sy:sy + hh, sx:sx + ww]).astype(np.uint8))
+        pen_x += adv
+    return frame
 try:
     VIDEO_TRACE_EVERY = int(os.getenv('VIDEO_TRACE_EVERY', '1'))
 except Exception:
@@ -3394,6 +3570,7 @@ while True:
         y_comp = {k: float(v[1]) if v is not None and np.all(np.isfinite(v)) else None for k, v in locals_map.items()}
         print(f"[DBG] frame {WHILE_COUNT}: local y {{elbow±/wrist±}} {y_comp}")
 
+    t_u_accum = time.perf_counter()
     # ---- Offline wrist energy capture (optional, bilateral) ----
     if os.getenv('OFFLINE_WRIST_CAPTURE','0') in ('1','true','True'):
         try:
@@ -3485,6 +3662,9 @@ while True:
         if E_DEBUG and (WHILE_COUNT % 60 == 0):
             print(f"[EPIPE] accumulate failed: {_e_acc}")
 
+    _perf.add('e_accum', time.perf_counter() - t_u_accum)
+
+    t_u_fb = time.perf_counter()
     # ================= フォールバック: サイクル未検出時の暫定エネルギー更新 =================
     # 目的: detector.update が発火しない環境でもゲージ針が全く動かない状況を回避し、
     # デバッグ観察を容易にする。一定フレーム経過後、瞬時トルクノルムを擬似エネルギーとして蓄積。
@@ -3522,6 +3702,9 @@ while True:
         if WHILE_COUNT % 120 == 0:
             print(f"[GaugeFallback] failed: {_fb_e}")
 
+    _perf.add('e_fallback', time.perf_counter() - t_u_fb)
+
+    t_u_wait = time.perf_counter()
     # ==== ローカル座標軸デバッグ描画（任意） ====
     # 低頻度でのキー受付: 'a' キーでトグル (OpenCV window フォーカス時)
     if ENABLE_AXES_DEBUG:
@@ -3536,6 +3719,9 @@ while True:
         ENABLE_AXES_DEBUG = not ENABLE_AXES_DEBUG
         print(f"[axes_debug] ENABLE_AXES_DEBUG -> {ENABLE_AXES_DEBUG}")
 
+    _perf.add('axes+waitkey', time.perf_counter() - t_u_wait)
+
+    t_u_hist = time.perf_counter()
     # ディクショナリにトルク値を格納
     for key in [
         "wrist_R",
@@ -3581,6 +3767,9 @@ while True:
         else:
             p_val = float(np.dot(tau_g, omg))
         current_power_history[key].append(p_val)
+    _perf.add('hist_store', time.perf_counter() - t_u_hist)
+
+    t_u_cyc = time.perf_counter()
     if WHILE_COUNT > 15:
         _z_cycle = transformed_p3ds[0][_cycle_axis_idx]
         if np.isfinite(_z_cycle) and detector.update(_z_cycle, WHILE_COUNT):
@@ -3647,6 +3836,9 @@ while True:
             current_torque_history[key].append(vec[2])
     else:
         pass
+    _perf.add('cycle_energy', time.perf_counter() - t_u_cyc)
+
+    t_u_gauge = time.perf_counter()
     # 連続エネルギー値/単眼デモ判定をゲージへ毎フレーム反映
     if gauge is not None:
         if DEMO_MONO_GAUGE_ON:
@@ -3729,6 +3921,8 @@ while True:
                 _gauge_log_state(tag="after_update_impulses")
             except Exception:
                 pass
+    _perf.add('gauge_apply', time.perf_counter() - t_u_gauge)
+
     # ノルムだけ取り出してプロット用に
     temp_norms = [np.linalg.norm(v) for v in temp_local]
     aim_torque.append(temp_local)
@@ -3758,7 +3952,23 @@ while True:
     display_keys = (gauge.part_keys if (gauge is not None) else part_keys)
     # 2) テキスト描画
     draw_put_total = 0.0
-    if USE_NATIVE_DRAW and (_native_overlay is not None) and getattr(_native_overlay, '_dll', None):
+    if DRAW_LABEL_CACHE:
+        # スプライトキャッシュ方式: フルフレームの色空間変換も PIL 往復も行わない
+        t_lbl_all = time.perf_counter()
+        for i, key in enumerate(display_keys):
+            lbl = jp_labels.get(key, key)
+            cur_E = float(current_impulses.get(key, 0.0))
+            new_frame = _blit_label(
+                new_frame,
+                f"{lbl} E:{cur_E:.1f}",
+                (new_width - 350, 40 + 30 * i),
+                24,
+                (255, 255, 255),
+                20,
+            )
+        draw_put_total = time.perf_counter() - t_lbl_all
+        _perf.add('draw_put_total', draw_put_total)
+    elif USE_NATIVE_DRAW and (_native_overlay is not None) and getattr(_native_overlay, '_dll', None):
         # ネイティブ: 一括描画（BGRAで作業）
         t_lbl_all = time.perf_counter()
         try:
@@ -3793,14 +4003,24 @@ while True:
             cur_E = float(current_impulses.get(key, 0.0))
             text = f"{lbl} E:{cur_E:.1f}"
             t_lbl = time.perf_counter()
-            new_frame = put_text_jp(
-                new_frame,
-                text,
-                (new_width - 350, y),
-                24,
-                (255, 255, 255),
-                20,
-            )
+            if DRAW_LABEL_CACHE:
+                new_frame = _blit_label(
+                    new_frame,
+                    text,
+                    (new_width - 350, y),
+                    24,
+                    (255, 255, 255),
+                    20,
+                )
+            else:
+                new_frame = put_text_jp(
+                    new_frame,
+                    text,
+                    (new_width - 350, y),
+                    24,
+                    (255, 255, 255),
+                    20,
+                )
             dt_lbl = time.perf_counter() - t_lbl
             draw_put_total += dt_lbl
             try:
