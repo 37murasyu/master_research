@@ -14,6 +14,9 @@ except Exception:
 import sys
 import datetime
 import collections
+import textwrap
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -516,9 +519,14 @@ class LandmarkEKF:
         self.vectorized = bool(EKF_VECTORIZED)
         if self.vectorized:
             _n = self.n_points * 3
+            self._I3 = np.eye(3, dtype=float)
             self._X = np.zeros((_n, 3), dtype=float)
-            self._P = np.tile(np.eye(3, dtype=float), (_n, 1, 1))
+            self._P = np.tile(self._I3, (_n, 1, 1))
             self._init = np.zeros(_n, dtype=bool)
+            # F/Q は dt にしか依存しないので (dt, F, Q) を1件キャッシュする
+            self._fq = None
+            # Joseph 形式の (I - KH)。列1,2 は常に単位行列のままなので使い回す
+            self._A = np.tile(self._I3, (_n, 1, 1))
             self.filters = None
         else:
             self.filters = [[ExtendedKalman1D(cfg) for _ in range(3)] for _ in range(self.n_points)]
@@ -569,22 +577,26 @@ class LandmarkEKF:
         if new.any():
             X[new] = 0.0
             X[new, 0] = z[new]
-            P[new] = np.eye(3, dtype=float)
+            P[new] = self._I3
             init[new] = True
 
         # 2) 既に初期化済みだったものだけ predict（今回初期化した分は除く）
         pred = init & ~new
         pi = np.flatnonzero(pred)
         if pi.size:
-            dt2 = dt * dt
-            dt3 = dt2 * dt
-            F = np.array([[1.0, dt, 0.5 * dt2],
-                          [0.0, 1.0, dt],
-                          [0.0, 0.0, 1.0]], dtype=float)
-            Q = cfg.q_acc * np.array(
-                [[dt3 * dt2 / 20.0, dt3 * dt / 8.0, dt3 / 6.0],
-                 [dt3 * dt / 8.0, dt3 / 3.0, dt2 / 2.0],
-                 [dt3 / 6.0, dt2 / 2.0, dt]], dtype=float)
+            fq = self._fq
+            if fq is None or fq[0] != dt:
+                dt2 = dt * dt
+                dt3 = dt2 * dt
+                F = np.array([[1.0, dt, 0.5 * dt2],
+                              [0.0, 1.0, dt],
+                              [0.0, 0.0, 1.0]], dtype=float)
+                Q = cfg.q_acc * np.array(
+                    [[dt3 * dt2 / 20.0, dt3 * dt / 8.0, dt3 / 6.0],
+                     [dt3 * dt / 8.0, dt3 / 3.0, dt2 / 2.0],
+                     [dt3 / 6.0, dt2 / 2.0, dt]], dtype=float)
+                fq = self._fq = (dt, F, Q)
+            _, F, Q = fq
             X[pi] = X[pi] @ F.T
             P[pi] = F @ P[pi] @ F.T + Q
 
@@ -602,8 +614,11 @@ class LandmarkEKF:
                     K = Ps[:, :, 0] / S[ok][:, None]          # (m,3) = P H^T / S
                     X[si] = X[si] + K * y[ok][:, None]
                     # Joseph 形式: (I-KH) P (I-KH)^T + K r K^T
-                    A = np.tile(np.eye(3, dtype=float), (si.size, 1, 1))
-                    A[:, :, 0] -= K
+                    # H = [1,0,0] なので I-KH は列0だけが単位行列と異なる。
+                    # 事前確保した _A の列1,2 は単位行列のまま使い回し、列0だけ書き換える
+                    A = self._A[:si.size]
+                    np.negative(K, out=A[:, :, 0])
+                    A[:, 0, 0] += 1.0
                     P[si] = A @ Ps @ np.transpose(A, (0, 2, 1)) \
                         + cfg.r * (K[:, :, None] * K[:, None, :])
 
@@ -1301,20 +1316,20 @@ pose1 = PoseEstimator(USE_POSE_LANDMARKER, POSE_TASK_MODEL, min_det=POSE_MIN_DET
 # ワーカは cam1 側だけを担当し、cam0 はメインスレッドで実行する（2並列に必要なのは1本）。
 # POSE_PARALLEL=0 で直列に戻せる（A/B比較用）。
 POSE_PARALLEL = os.getenv('POSE_PARALLEL', '1') not in ('0', 'false', 'False')
-_pose_pool = None
-if POSE_PARALLEL:
-    try:
-        from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
-        _pose_pool = _ThreadPoolExecutor(max_workers=1, thread_name_prefix='pose1')
-    except Exception as _pp_e:  # pragma: no cover
-        print(f"[PosePar] スレッドプール生成に失敗 -> 直列実行: {_pp_e}")
-        _pose_pool = None
+_pose_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pose1') if POSE_PARALLEL else None
+# ループ内から毎フレーム読まないよう、起動時に一度だけ確定させる
+POSE_DEBUG = os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True')
+POSE_TRACE_EVERY = max(1, int(os.getenv('POSE_TRACE_EVERY', '30')))
 
 
-def _pose_job(pose_estimator, frame_rgb, roi):
-    """姿勢推定1台分。所要時間も返す（_LoopPerf はスレッド安全でないため呼ばない）。"""
+def _pose_job(pose_estimator, frame_bgr, roi):
+    """姿勢推定1台分。
+
+    所要時間を戻り値に含めるのは、カメラ毎のCPU時間とループの実時間が別量であり、
+    共有の _LoopPerf カウンタでは表現できないため（併せて _LoopPerf はスレッド安全でない）。
+    """
     _t0 = time.perf_counter()
-    res, used = _pose_process_with_roi(pose_estimator, frame_rgb, roi)
+    res, used = _pose_process_with_roi(pose_estimator, frame_bgr, roi)
     return res, used, time.perf_counter() - _t0
 
 
@@ -1473,14 +1488,14 @@ _GAUGE_UPDATE_INTERVAL = int(os.getenv('GAUGE_UPDATE_INTERVAL', '2'))
 # print(f"[CFG] HEALTH_INTERVAL={_HEALTH_LOG_INTERVAL} GAUGE_UPDATE_INTERVAL={_GAUGE_UPDATE_INTERVAL}")
 
 def _health_snapshot(frame_idx: int):
-    try:
-        if not HEALTH_TRACEMALLOC:
-            raise RuntimeError('tracemalloc disabled')
-        snap = tracemalloc.take_snapshot()
-        top_stats = snap.statistics('lineno')[:3]
-        mem_str = '; '.join(f"{st.traceback[0].filename.split(os.sep)[-1]}:{st.traceback[0].lineno} {st.size/1024:.1f}KB" for st in top_stats)
-    except Exception:
-        mem_str = 'n/a'
+    mem_str = 'n/a'
+    if HEALTH_TRACEMALLOC:
+        try:
+            snap = tracemalloc.take_snapshot()
+            top_stats = snap.statistics('lineno')[:3]
+            mem_str = '; '.join(f"{st.traceback[0].filename.split(os.sep)[-1]}:{st.traceback[0].lineno} {st.size/1024:.1f}KB" for st in top_stats)
+        except Exception:
+            mem_str = 'n/a'
     th_cnt = len(threading.enumerate())
     gauge_angles = None
     try:
@@ -1966,10 +1981,11 @@ def get_valid_x_range(kpts, frame_width):
     return local_x_min, local_x_max
 
 
-def _resize_mp_input(frame_rgb):
+def _resize_mp_input(frame):
+    """MediaPipe 入力用の縮小。色空間には依存しない（BGR/RGB どちらでも可）。"""
     if MP_INPUT_SCALE < 1.0:
-        return cv.resize(frame_rgb, None, fx=MP_INPUT_SCALE, fy=MP_INPUT_SCALE, interpolation=cv.INTER_AREA)
-    return frame_rgb
+        return cv.resize(frame, None, fx=MP_INPUT_SCALE, fy=MP_INPUT_SCALE, interpolation=cv.INTER_AREA)
+    return frame
 
 
 def _pose_has_landmarks(results) -> bool:
@@ -2559,12 +2575,25 @@ class _LoopPerf:
         self.trace = bool(int(os.getenv('PERF_TRACE', '0')))
         self.trace_every = int(os.getenv('PERF_TRACE_EVERY', '5')) if os.getenv('PERF_TRACE_EVERY') else 5
         self.topk = int(os.getenv('PERF_TOPK', '7')) if os.getenv('PERF_TOPK') else 7
+        # 情報用（非加算）カウンタ。区間同士が重なるため TOTAL と Top-K からは外す
+        self.info_acc: dict[str, float] = {}
+        if not (self.enabled or self.trace):
+            # どちらも無効なら計上先が無いので、呼び出し側を変えずに丸ごと省く
+            self.add = self._add_noop
 
     def begin_loop(self):
         # フレーム内訳を初期化
         self.frame.clear()
 
-    def add(self, key: str, dt: float):
+    @staticmethod
+    def _add_noop(key: str, dt: float, additive: bool = True):
+        return
+
+    def add(self, key: str, dt: float, additive: bool = True):
+        if not additive:
+            # 他の区間と重なる実時間などの参考値。合計には混ぜない
+            self.info_acc[key] = self.info_acc.get(key, 0.0) + dt
+            return
         # 区間集計（有効時のみ）
         if self.enabled:
             self.acc[key] = self.acc.get(key, 0.0) + dt
@@ -2582,7 +2611,10 @@ class _LoopPerf:
                 print(f"  {k:18s}: {v * 1000.0 / self.interval:7.2f}")
             if total > 0:
                 print(f"  {'TOTAL':18s}: {total * 1000.0 / self.interval:7.2f}")
+            for k, v in sorted(self.info_acc.items(), key=lambda kv: kv[1], reverse=True):
+                print(f"  [参考] {k:12s}: {v * 1000.0 / self.interval:7.2f}")
             self.acc.clear()
+            self.info_acc.clear()
 
     def end_loop(self, loop_idx: int, frame_dt: float):
         if not self.trace:
@@ -2610,36 +2642,27 @@ USE_NATIVE_DRAW = os.getenv('USE_NATIVE_DRAW', '1') in ('1','true','True')
 # 描画してキャッシュし、以降は numpy スライスで合成する。
 # DRAW_LABEL_CACHE=0 で従来の put_text_jp に戻せる。
 DRAW_LABEL_CACHE = os.getenv('DRAW_LABEL_CACHE', '1') not in ('0', 'false', 'False')
-_LABEL_SPRITES = {}
-_LABEL_SPRITES_MAX = 512
-_LABEL_FONTS = {}
 
 
+@lru_cache(maxsize=8)
 def _label_font(size: int):
-    f = _LABEL_FONTS.get(size)
-    if f is None:
-        from PIL import ImageFont as _IF
-        try:
-            f = _IF.truetype(os.path.join(folder_path, 'meiryo', 'meiryo.ttc'), size)
-        except OSError:
-            f = _IF.load_default()
-        _LABEL_FONTS[size] = f
-    return f
+    from PIL import ImageFont as _IF
+    try:
+        return _IF.truetype(os.path.join(folder_path, 'meiryo', 'meiryo.ttc'), size)
+    except OSError:
+        return _IF.load_default()
 
 
+@lru_cache(maxsize=512)
 def _glyph_sprite(ch: str, font_size: int, color):
     """1文字を RGBA スプライト化してキャッシュする。
 
     文字列全体でキャッシュすると数値が変わるたびに再描画になるため、
     文字単位で持つ。ラベル+数字なら数十エントリで飽和し以降は全ヒットになる。
 
-    戻り値: (premul (h,w,3) f32, inv_a (h,w,1) f32, ox, oy, advance)
+    戻り値: (premul (h,w,3) f32, inv_a (h,w,3) f32, ox, oy, advance)
       premul = color * alpha, inv_a = 1 - alpha を事前計算して合成を2演算に減らす。
     """
-    key = (ch, int(font_size), tuple(color))
-    hit = _LABEL_SPRITES.get(key)
-    if hit is not None:
-        return hit
     from PIL import Image as _IM, ImageDraw as _ID
     font = _label_font(int(font_size))
     try:
@@ -2657,23 +2680,25 @@ def _glyph_sprite(ch: str, font_size: int, color):
                        fill=(int(color[0]), int(color[1]), int(color[2]), 255))
     rgba = np.asarray(spr, dtype=np.uint8)
     a = (rgba[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
-    val = (rgba[:, :, :3].astype(np.float32) * a, 1.0 - a, int(x0), int(y0), adv)
-    if len(_LABEL_SPRITES) >= _LABEL_SPRITES_MAX:
-        _LABEL_SPRITES.clear()
-    _LABEL_SPRITES[key] = val
-    return val
+    # inv_a は (h,w,1) のままだと合成時に末尾軸が stride 0 になり、numpy が
+    # ベクトル化ループを使えず 3 要素ずつのバッファリング処理に落ちる。
+    # キャッシュ側で (h,w,3) に展開しておくと合成が 4〜8 倍速くなる。
+    inv_a = np.ascontiguousarray(np.broadcast_to(1.0 - a, (a.shape[0], a.shape[1], 3)))
+    return (rgba[:, :, :3].astype(np.float32) * a, inv_a, int(x0), int(y0), adv)
 
 
 def _blit_label(frame, text: str, position, font_size: int, color, line_width: int = 20):
     """キャッシュ済みグリフを frame へ順に合成する（frame を破壊的に更新）。"""
     if line_width and len(text) > line_width:
-        import textwrap as _tw
-        text = _tw.fill(text, width=line_width)
+        text = textwrap.fill(text, width=line_width)
     H, W = frame.shape[:2]
     base_x = int(position[0])
     pen_y = int(position[1])
     line_h = int(font_size * 1.25)
     pen_x = 0.0
+    # _glyph_sprite は lru_cache なので引数はハッシュ可能でなければならない
+    font_size = int(font_size)
+    color = tuple(color)
     for ch in text:
         if ch == '\n':
             pen_x = 0.0
@@ -2694,6 +2719,15 @@ def _blit_label(frame, text: str, position, font_size: int, color, line_width: i
                                 + premul[sy:sy + hh, sx:sx + ww]).astype(np.uint8))
         pen_x += adv
     return frame
+
+
+if DRAW_LABEL_CACHE:
+    # 初回描画フレームで truetype ロード(約15ms)とグリフ描画がまとめて走ると
+    # 1フレーム落ちるため、起動時に使用する文字を焼いておく
+    for _ch in '右左手首肘肩E:.0123456789 ':
+        _glyph_sprite(_ch, 24, (255, 255, 255))
+    del _ch
+
 try:
     VIDEO_TRACE_EVERY = int(os.getenv('VIDEO_TRACE_EVERY', '1'))
 except Exception:
@@ -3059,13 +3093,11 @@ while True:
         _perf.next()
         break
 
-    t_seg = time.perf_counter()
     # フレームは BGR のまま保持する。MediaPipe 用の RGB 変換は
     # _mp_input_rgb() が ROI を縮小した後に行うため、ここでの
-    # フル解像度 BGR<->RGB 往復（1フレームあたり4回）は不要。
-    if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
-        print("[TRACE] preproc: keep BGR (RGB conversion deferred to ROI)")
-    _perf.add('preproc', time.perf_counter() - t_seg)
+    # フル解像度 BGR<->RGB 往復（1フレームあたり4回）は不要になった。
+    # 区間としては何も残っていないが、PERF 表の列を揃えるため 0 を計上する。
+    _perf.add('preproc', 0.0)
     if STOP_AFTER.lower() in ("preproc",):
         _perf.next()
         break
@@ -3093,22 +3125,18 @@ while True:
         results1, _roi1_used, _mp1_dt = _pose_job(pose1, frame1, roi1)
     _perf.add('mediapipe0', _mp0_dt)
     _perf.add('mediapipe1', _mp1_dt)
-    # 実時間（並列時は max(mp0,mp1) 相当、直列時は mp0+mp1 相当）
-    _perf.add('mediapipe_wall', time.perf_counter() - t_seg)
-    if os.getenv('POSE_DEBUG', '0') in ('1','true','True') and (WHILE_COUNT % max(1, int(os.getenv('POSE_TRACE_EVERY','30'))) == 0):
+    # 実時間（並列時は max(mp0,mp1) 相当、直列時は mp0+mp1 相当）。
+    # mediapipe0/1 と区間が重なるので TOTAL には加算しない
+    _perf.add('mediapipe_wall', time.perf_counter() - t_seg, additive=False)
+    if POSE_DEBUG and (WHILE_COUNT % POSE_TRACE_EVERY == 0):
         try:
-            if _roi0_used and roi0 is not None:
-                _rw0 = roi0[2] - roi0[0]
-                _rh0 = roi0[3] - roi0[1]
-                print(f"[Pose] cam0 ROI used scale={MP_INPUT_SCALE} roi={roi0} roi_shape=({_rh0},{_rw0},3)")
-            else:
-                print(f"[Pose] cam0 fullframe scale={MP_INPUT_SCALE} shape={tuple(frame0.shape)}")
-            if _roi1_used and roi1 is not None:
-                _rw1 = roi1[2] - roi1[0]
-                _rh1 = roi1[3] - roi1[1]
-                print(f"[Pose] cam1 ROI used scale={MP_INPUT_SCALE} roi={roi1} roi_shape=({_rh1},{_rw1},3)")
-            else:
-                print(f"[Pose] cam1 fullframe scale={MP_INPUT_SCALE} shape={tuple(frame1.shape)}")
+            for _cam, _roi, _used, _frame in ((0, roi0, _roi0_used, frame0),
+                                              (1, roi1, _roi1_used, frame1)):
+                if _used and _roi is not None:
+                    print(f"[Pose] cam{_cam} ROI used scale={MP_INPUT_SCALE} roi={_roi} "
+                          f"roi_shape=({_roi[3] - _roi[1]},{_roi[2] - _roi[0]},3)")
+                else:
+                    print(f"[Pose] cam{_cam} fullframe scale={MP_INPUT_SCALE} shape={tuple(_frame.shape)}")
         except Exception:
             pass
     if STOP_AFTER.lower() in ("mediapipe", "mediapipe1",):
@@ -3121,13 +3149,10 @@ while True:
         except Exception:
             lm0 = lm1 = '?'
         #print(f"[TRACE] mediapipe processed lm0={lm0} lm1={lm1}")
-    t_seg = time.perf_counter()
     # preproc で RGB 化しなくなったため、ここでの BGR 復帰も不要。
     # 以降の描画・extract_keypoints は従来どおり BGR を前提にできる。
-    if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
-        #print(f"[TRACE] postproc: already BGR (no conversion)")
-        pass
-    _perf.add('postproc', time.perf_counter() - t_seg)
+    # 区間としては何も残っていないが、PERF 表の列を揃えるため 0 を計上する。
+    _perf.add('postproc', 0.0)
     if STOP_AFTER.lower() in ("postproc",):
         _perf.next()
         break
@@ -3723,14 +3748,10 @@ while True:
         except Exception as e:
             if WHILE_COUNT % 100 == 0:
                 print(f"[axes_debug] 描画失敗: {e}")
-    # キートグル処理（HEADLESS ではウィンドウが無く waitKey は待ち時間だけのコストになる）
-    if not HEADLESS:
-        k = cv.waitKey(1) & 0xFF
-        if k == ord('a'):
-            ENABLE_AXES_DEBUG = not ENABLE_AXES_DEBUG
-            print(f"[axes_debug] ENABLE_AXES_DEBUG -> {ENABLE_AXES_DEBUG}")
-
-    _perf.add('axes+waitkey', time.perf_counter() - t_u_wait)
+    # キー入力の取得はループ末尾の1箇所に集約した（同一フレームで waitKey を
+    # 2回呼ぶと GUI ポンプの待ちを二重に払ううえ、両者がキューを奪い合って
+    # 'a' と 'q' が互いに取りこぼされるため）。'a' の処理もそちらにある。
+    _perf.add('axes_debug', time.perf_counter() - t_u_wait)
 
     t_u_hist = time.perf_counter()
     # ディクショナリにトルク値を格納
@@ -4014,24 +4035,16 @@ while True:
             cur_E = float(current_impulses.get(key, 0.0))
             text = f"{lbl} E:{cur_E:.1f}"
             t_lbl = time.perf_counter()
-            if DRAW_LABEL_CACHE:
-                new_frame = _blit_label(
-                    new_frame,
-                    text,
-                    (new_width - 350, y),
-                    24,
-                    (255, 255, 255),
-                    20,
-                )
-            else:
-                new_frame = put_text_jp(
-                    new_frame,
-                    text,
-                    (new_width - 350, y),
-                    24,
-                    (255, 255, 255),
-                    20,
-                )
+            # この else 節に来るのは DRAW_LABEL_CACHE が偽のときだけなので、
+            # ここでスプライト経路を分岐しても到達しない
+            new_frame = put_text_jp(
+                new_frame,
+                text,
+                (new_width - 350, y),
+                24,
+                (255, 255, 255),
+                20,
+            )
             dt_lbl = time.perf_counter() - t_lbl
             draw_put_total += dt_lbl
             try:
@@ -4173,6 +4186,10 @@ while True:
         # 早期終了の原因調査用ログ（まれに OS レベルで ESC=27 が発生するケースを検知）
         if key not in (255, ):  # 255 は no-key のことが多い
             print(f"[KEY] code={key}")
+        # 'a': ローカル座標軸デバッグ描画のトグル（次フレームの描画から反映）
+        if key == ord('a'):
+            ENABLE_AXES_DEBUG = not ENABLE_AXES_DEBUG
+            print(f"[axes_debug] ENABLE_AXES_DEBUG -> {ENABLE_AXES_DEBUG}")
         # 即時終了キー: 'q' or 'Q' または（設定で有効なら）ESC
         if key in (ord('q'), ord('Q')) or (key == 27 and IMMEDIATE_ESC_BREAK):
             reason = 'q/Q' if key in (ord('q'), ord('Q')) else 'ESC'
