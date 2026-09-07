@@ -1327,6 +1327,37 @@ POSE_DEBUG = os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True')
 POSE_TRACE_EVERY = max(1, int(os.getenv('POSE_TRACE_EVERY', '30')))
 
 
+# ---- 2カメラの grab を同時に待つためのワーカ ----
+# grab() は次のフレームが来るまでブロックする。2台を逐次に呼ぶと、cam0 が返った
+# 時点から改めて cam1 の次のフレーム境界まで待つことになり、位相が悪いと
+# 1ループにフレーム周期2回ぶんかかる。実測（macOS, 720p×2, 計算19.4ms相当）:
+#   逐次 63.3ms / 15.8fps  →  並列 33.6ms / 29.8fps（grab 37.8ms → 8.0ms）
+#
+# 三角測量の精度にも効く。逐次だと2台のフレームの撮影時刻が最大でフレーム周期
+# 1回ぶん（実測 32.7ms）離れるが、同時に待てばズレは2台の位相差そのものに
+# なり、必ず半周期以内に収まる。
+#
+# 待っている間 GIL は解放されるので、cam1 側だけワーカに出せば足りる。
+# VideoCapture は別インスタンスなので、それぞれのスレッドから触ってよい。
+# GRAB_PARALLEL=0 で直列に戻せる（A/B比較用）。
+GRAB_PARALLEL = os.getenv('GRAB_PARALLEL', '1') not in ('0', 'false', 'False')
+_grab_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='grab1') if GRAB_PARALLEL else None
+if _grab_pool is not None:
+    atexit.register(_grab_pool.shutdown, wait=False)
+
+
+def _grab_both(cap0, cap1):
+    """2台のフレームを1枚ずつ進める。戻り値は (ok0, ok1)。"""
+    if cap1 is None:
+        ok0 = cap0.grab()
+        return ok0, ok0
+    if _grab_pool is None:
+        return cap0.grab(), cap1.grab()
+    future = _grab_pool.submit(cap1.grab)
+    ok0 = cap0.grab()
+    return ok0, future.result()
+
+
 def _pose_job(pose_estimator, frame_bgr, roi):
     """姿勢推定1台分。
 
@@ -2945,8 +2976,7 @@ while True:
         print(f"[DBG] while-loop count={skip_counter}")
     # まずは grab でフレームを進める（軽量・スキップ時にデコードしない）
     t_seg = time.perf_counter()
-    okg0 = cap0.grab()
-    okg1 = (cap1.grab() if cap1 is not None else okg0)
+    okg0, okg1 = _grab_both(cap0, cap1)
     if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
         #print(f"[TRACE]] grab ok0={okg0} ok1={okg1}")
         pass
