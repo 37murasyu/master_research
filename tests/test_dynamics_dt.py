@@ -27,8 +27,9 @@
 修正後の 1.7% は ``KNOWN_ISSUES.md`` §2-3 が独立に述べている「慣性項の寄与は
 1.7〜4.6%」と一致する。**旧値は慣性項を実質ゼロに潰していた。**
 
-ただしリポジトリの実装は角速度に別の式を使っており、dt の効き方が一段強い。
-詳細は :class:`TestScalingLaws` の注記を参照。
+角速度の式そのものも 2026-09-08 に修正済み（R-2）。以前は ``cross(v_prev, v)/|r|²``
+という次元 1/s² の別物を返しており、dt の効き方が一段強かった。
+現在は標準形 ``(r × ṙ)/|r|²`` なので、下のスケーリングも素直な冪になる。
 """
 
 from __future__ import annotations
@@ -83,8 +84,8 @@ class TestResolveDynamicsDt:
 def _rotating_link(n: int, dt: float, omega: float = 2.0, length: float = 0.25):
     """始点固定・終点が z 軸まわりに一定角速度で回るリンクの点列。単位は m。
 
-    直線的に往復する運動では ``v_prev`` と ``v`` が平行になり、
-    ``cross(v_prev, v)`` が恒等的にゼロになってしまう（実装が外積を使うため）。
+    直線的に往復する運動では r と ṙ が平行になり ``cross(r, ṙ)`` が 0 になる。
+    これは物理的に正しい（向きが変わらないなら角速度は 0）が、
     スケーリングを見るには本物の回転が要る。
     """
     pts = []
@@ -100,23 +101,15 @@ class TestScalingLaws:
     """``dt`` を変えたときに各量がどう動くかを固定する。
 
     解析的には自明な関係だが、**どの量が dt に比例し、どの量が相殺するのか**が
-    今回の修正の勘所なので、退行しないようテストで留める。
+    dt 修正の勘所なので、退行しないようテストで留める。
 
-    .. warning::
-       ``link_vector_calculator_module.py:100`` の角速度は
-       ``cross(v_prev, v) / |r|²`` で計算されており、標準形の ``(r × ṙ) / |r|²``
-       ではない。既知の回転（ω=2.0 rad/s, L=0.25m, dt=1/30）を与えると
-       コードは **0.2664** を返す。これは ``ω³·dt = 8 × 0.0333 = 0.2667`` に一致する。
-       つまりこの量は角速度ではなく ``ω³·dt`` で、次元が 1/s²、しかも ω の 3 乗。
+    角速度は標準形 ``ω = (r × ṙ)/|r|²``（R-2 で修正済み）。``ṙ = Δr/dt`` が
+    1 回だけ入るので ``ω ∝ 1/dt``、``ω̇ = Δω/dt`` でもう 1 つ乗って ``ω̇ ∝ 1/dt²``。
 
-       ``KNOWN_ISSUES.md`` §2-4 はこれを ``(r × ṙ)/|r|²`` だと想定して
-       「式の展開自体は正しい（検算済み）」と書いており、**この食い違いは
-       未カタログ**。物理式の修正は本作業のスコープ外なので、ここでは
-       現状の挙動を固定するにとどめる。式を直したら下の 2 つが落ちるので、
-       そのときにこの注記ごと更新すること。
-
-       この式のため、``v ∝ 1/dt`` が 2 回入って **ω は 1/dt ではなく 1/dt²**
-       でスケールする。dt 誤りの影響が正しい式より一段強く出る。
+    修正前は ``cross(v_prev, v)/|r|²`` という別式で、``v ∝ 1/dt`` が 2 回入り
+    ``ω ∝ 1/dt²``・``ω̇ ∝ 1/dt³`` と一段強くスケールしていた。
+    既知の回転（ω=2.0 rad/s, L=0.25 m, dt=1/30）に対して **0.2664**、すなわち
+    ``ω³·dt`` を返しており、次元も 1/s² で角速度になっていなかった。
     """
 
     def _series(self, dt: float, n: int = 120):
@@ -136,11 +129,8 @@ class TestScalingLaws:
                 ang_accs.append(np.linalg.norm(np.asarray(ang_acc, dtype=float)))
         return np.array(omegas), np.array(ang_accs)
 
-    def test_angular_velocity_formula_is_the_cubic_one(self):
-        """コードの「角速度」が ``ω³·dt`` であることを固定する。
-
-        既知の一定回転を与えて確かめる。直したらここが落ちる。
-        """
+    def test_angular_velocity_matches_the_true_value(self):
+        """既知の一定回転を与えると、角速度の真値がそのまま返る。"""
         from link_vector_calculator_module import LinkVectorCalculator
 
         w_true, length, dt, n = 2.0, 0.25, 1 / 30.0, 60
@@ -159,34 +149,35 @@ class TestScalingLaws:
             if np.all(np.isfinite(result[2])):
                 got.append(abs(result[2][2]))
         measured = float(np.median(got[5:]))
-        assert measured == pytest.approx(w_true**3 * dt, rel=0.02), (
-            f"角速度が ω³·dt ({w_true**3 * dt:.4f}) から外れた（実測 {measured:.4f}）。"
-            f" 式を直したならこのテストと docstring を更新すること"
+        assert measured == pytest.approx(w_true, rel=0.02), (
+            f"角速度が真値 {w_true} rad/s から外れた（実測 {measured:.4f}）。"
+            f" 外積の第 1 引数がリンクベクトルになっているか確認すること"
         )
-        assert measured != pytest.approx(w_true, rel=0.1), (
-            "角速度が真値と一致した。式が直ったなら docstring の注記ごと更新すること"
+        assert measured != pytest.approx(w_true**3 * dt, rel=0.1), (
+            f"角速度が ω³·dt ({w_true**3 * dt:.4f}) に戻っている。"
+            f" cross(v_prev, v) を使う旧式が復活していないか確認すること"
         )
 
-    def test_angular_velocity_scales_with_the_square_of_dt(self):
-        # cross(v_prev, v) に v = Δr/dt が 2 回入るので 1/dt²。
-        # 正しい式 (r × ṙ)/|r|² なら 1/dt だった。
+    def test_angular_velocity_scales_inversely_with_dt(self):
+        # (r × ṙ)/|r|² に ṙ = Δr/dt が 1 回だけ入るので 1/dt。
+        # 旧式 cross(v_prev, v) では v が 2 回入り 1/dt² だった。
         w_fast, _ = self._series(1 / 30.0)
         w_slow, _ = self._series(0.3)
         assert len(w_fast) > 10 and len(w_slow) > 10, "角速度が十分に得られていない"
         ratio = float(np.median(w_slow[5:]) / np.median(w_fast[5:]))
-        assert ratio == pytest.approx(1 / 81, rel=0.05), (
-            f"dt を 9 倍にしたとき角速度が 1/81 になっていない（実測 {ratio:.5f} 倍）"
+        assert ratio == pytest.approx(1 / 9, rel=0.05), (
+            f"dt を 9 倍にしたとき角速度が 1/9 になっていない（実測 {ratio:.5f} 倍）"
         )
 
-    def test_angular_acceleration_adds_one_more_power_of_dt(self):
-        # ω̇ = Δω/dt なので、ω の 1/dt² とあわせて 1/dt³。
-        # 慣性トルク I·ω̇ もここに乗るため、dt 誤りは三乗で効く。
+    def test_angular_acceleration_scales_with_the_square_of_dt(self):
+        # ω̇ = Δω/dt なので、ω の 1/dt とあわせて 1/dt²。
+        # 慣性トルク I·ω̇ もここに乗るため、dt 誤りは二乗で効く。
         _, a_fast = self._series(1 / 30.0)
         _, a_slow = self._series(0.3)
         assert len(a_fast) > 10 and len(a_slow) > 10, "角加速度が十分に得られていない"
         ratio = float(np.median(a_slow[5:]) / np.median(a_fast[5:]))
-        assert ratio == pytest.approx(1 / 729, rel=0.05), (
-            f"dt を 9 倍にしたとき角加速度が 1/729 になっていない（実測 {ratio:.6f} 倍）"
+        assert ratio == pytest.approx(1 / 81, rel=0.05), (
+            f"dt を 9 倍にしたとき角加速度が 1/81 になっていない（実測 {ratio:.6f} 倍）"
         )
 
     def test_impulse_scales_directly_with_dt(self):

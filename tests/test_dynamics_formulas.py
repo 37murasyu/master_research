@@ -187,3 +187,145 @@ class TestOfflineSegmentKinematics:
         assert got == pytest.approx(want, rel=0.01), (
             f"オフライン経路の重心加速度が真値 {want:.5f} から外れた（実測 {got:.5f}）"
         )
+
+
+class TestLinkVectorCalculator:
+    """リアルタイム経路 ``LinkVectorCalculator`` の運動学。
+
+    2026-09-08 の R-2・R-3 で修正した箇所を固定する。
+
+    - R-2 角速度は標準形 ``(r × ṙ)/|r|²``。かつて外積の第 1 引数に前フレームの
+      速度を入れており、``dt·|ω⊥|²·ω⊥`` という次元 1/s² の別物を返していた。
+      信号を ``ω²·dt`` 倍に潰しつつ、位置ノイズを ``(σ/dt)²/|r|²`` で増幅していた。
+    - R-3 ``acceleration`` は重心の 2 階微分。かつてリンクベクトル ``r`` の
+      2 階微分を返しており、始点固定なら 2 倍、始点が動けば別のベクトルだった。
+    """
+
+    def _run(self, frames, dt=DT):
+        from link_vector_calculator_module import LinkVectorCalculator
+
+        calc = LinkVectorCalculator(0, 1)
+        out = {"omega": [], "acc": [], "omega_vec": []}
+        for i in range(len(frames)):
+            result = calc.calculate_link_vectors(list(frames[: i + 1]), 1, i, dt)
+            if result[0] is None:
+                continue
+            _, _, omega, _, _, acc, _ = result
+            if omega is not None and np.all(np.isfinite(omega)):
+                out["omega"].append(float(np.linalg.norm(omega)))
+                out["omega_vec"].append(np.asarray(omega, dtype=float))
+            if acc is not None and np.all(np.isfinite(acc)):
+                out["acc"].append(float(np.linalg.norm(acc)))
+        return out
+
+    def test_angular_velocity_matches_the_true_value(self):
+        """等速回転で角速度の真値がそのまま返る。"""
+        got = float(np.median(self._run(rotating_link())["omega"][10:]))
+        assert got == pytest.approx(OMEGA_TRUE, rel=0.02), (
+            f"角速度が真値 {OMEGA_TRUE} rad/s から外れた（実測 {got:.4f}）"
+        )
+
+    def test_angular_velocity_is_not_the_cubed_form(self):
+        """旧式 ``ω³·dt`` に戻っていないことを明示的に否定する。"""
+        got = float(np.median(self._run(rotating_link())["omega"][10:]))
+        assert got != pytest.approx(OMEGA_TRUE ** 3 * DT, rel=0.1), (
+            f"角速度が ω³·dt ({OMEGA_TRUE ** 3 * DT:.4f}) になっている。"
+            " cross(v_prev, v) を使う旧式が復活していないか確認すること"
+        )
+
+    def test_angular_velocity_points_along_the_rotation_axis(self):
+        """回転軸が z でなくても、向きと大きさが一致する。
+
+        リンクを回転軸に垂直に置く。``ω = (r × ṙ)/|r|²`` が厳密に ω を返すのは
+        この配置のとき。リンクに軸方向の成分があると
+        ``r × ṙ = ω|r⊥|² − r⊥(r∥·ω)`` の第 2 項が残り、向きがずれる
+        ── これは 2 点から軸まわりの回転を復元できないという原理的な限界
+        （KNOWN_ISSUES §2-4）であって実装の誤りではない。
+        """
+        axis = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+
+        def rodrigues(u, angle):
+            k = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
+            return np.eye(3) + np.sin(angle) * k + (1 - np.cos(angle)) * k @ k
+
+        r0 = np.array([LINK_LENGTH, 0.0, 0.0])
+        r0 = r0 - np.dot(r0, axis) * axis          # 軸に垂直な成分だけ残す
+        r0 = r0 / np.linalg.norm(r0) * LINK_LENGTH
+        frames = np.stack([
+            np.vstack([np.zeros(3), rodrigues(axis, OMEGA_TRUE * k * DT) @ r0])
+            for k in range(120)
+        ])
+        result = self._run(frames)
+        vecs = np.array(result["omega_vec"][10:])
+        unit = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+        assert float(np.median(unit @ axis)) == pytest.approx(1.0, abs=1e-3), (
+            "角速度の向きが回転軸と一致していない"
+        )
+        assert float(np.median(result["omega"][10:])) == pytest.approx(OMEGA_TRUE, rel=0.02), (
+            "z 軸以外の回転で角速度の大きさがずれた"
+        )
+
+    def test_pure_translation_gives_zero_angular_velocity(self):
+        """向きが変わらない平行移動では角速度が 0 になる。"""
+        frames = np.stack([
+            np.vstack([np.array([0.0, 0.0, 0.1 * np.sin(3 * k * DT)]),
+                       np.array([LINK_LENGTH, 0.0, 0.1 * np.sin(3 * k * DT)])])
+            for k in range(120)
+        ])
+        got = float(np.max(self._run(frames)["omega"][10:]))
+        assert got == pytest.approx(0.0, abs=1e-9), (
+            f"平行移動なのに角速度が立った（実測 {got:.3e}）"
+        )
+
+    def test_acceleration_is_that_of_the_centre_of_mass(self):
+        """返る加速度は重心のもので、リンクベクトルの 2 階微分ではない。"""
+        got = float(np.median(self._run(rotating_link())["acc"][10:]))
+        com_true = OMEGA_TRUE ** 2 * LINK_LENGTH / 2
+        assert got == pytest.approx(com_true, rel=0.02), (
+            f"重心加速度が真値 {com_true:.5f} m/s^2 から外れた（実測 {got:.5f}）"
+        )
+        assert got != pytest.approx(OMEGA_TRUE ** 2 * LINK_LENGTH, rel=0.1), (
+            "リンクベクトルの 2 階微分（重心加速度の 2 倍）が返っている"
+        )
+
+    def test_acceleration_is_correct_when_the_proximal_end_moves(self):
+        """始点が動く場合でも重心加速度になる（r̈ とは別物になるケース）。"""
+        amp, w_shoulder = 0.05, 3.0
+        frames = []
+        for k in range(200):
+            t = k * DT
+            p0 = np.array([0.0, 0.0, amp * np.sin(w_shoulder * t)])
+            p1 = p0 + np.array([LINK_LENGTH * np.cos(OMEGA_TRUE * t),
+                                LINK_LENGTH * np.sin(OMEGA_TRUE * t), 0.0])
+            frames.append(np.vstack([p0, p1]))
+        frames = np.stack(frames)
+        # 真値は中点の 2 階中心差分
+        mid = (frames[:, 0] + frames[:, 1]) / 2
+        truth = np.zeros_like(mid)
+        truth[1:-1] = (mid[2:] - 2 * mid[1:-1] + mid[:-2]) / DT ** 2
+        want = float(np.median(np.linalg.norm(truth[12:-12], axis=1)))
+        got = float(np.median(self._run(frames)["acc"][12:-12]))
+        assert got == pytest.approx(want, rel=0.05), (
+            f"始点が動く系で重心加速度がずれた（実測 {got:.5f} / 真値 {want:.5f}）"
+        )
+
+    def test_noise_is_not_amplified(self):
+        """位置ノイズを乗せても角速度が真値付近に留まる。
+
+        旧式では 2 mm のノイズで真値と同じ大きさの偽信号が立っていた。
+        """
+        rng = np.random.default_rng(0)
+        sigma = 0.002
+        frames = []
+        for k in range(200):
+            theta = OMEGA_TRUE * k * DT
+            frames.append(np.vstack([
+                rng.normal(0, sigma, 3),
+                np.array([LINK_LENGTH * np.cos(theta), LINK_LENGTH * np.sin(theta), 0.0])
+                + rng.normal(0, sigma, 3),
+            ]))
+        got = float(np.median(self._run(np.stack(frames))["omega"][10:]))
+        assert got == pytest.approx(OMEGA_TRUE, rel=0.15), (
+            f"2 mm のノイズで角速度が {got:.4f} rad/s になった（真値 {OMEGA_TRUE}）。"
+            " ノイズの外積を拾う旧式に戻っていないか確認すること"
+        )

@@ -22,7 +22,11 @@ class LinkVectorCalculator:
         relative_position_vector (np.ndarray | None): 現在のリンクの相対位置ベクトル。
         angular_velocity (np.ndarray | None): 現在の角速度ベクトル。
         centroid (np.ndarray | None): 始点と終点の中間点（重心）。
-        acceleration (np.ndarray | None): 現在の加速度ベクトル。
+        centroid_velocity (np.ndarray | None): 重心の速度。
+        previous_centroid (np.ndarray | None): 直前フレームの重心。
+        previous_centroid_velocity (np.ndarray | None): 直前フレームの重心速度。
+        acceleration (np.ndarray | None): **重心の**加速度ベクトル。
+            並進の慣性力 F = m(a - g) に渡す量。リンクベクトル r の 2 階微分ではない。
         angular_acceleration (np.ndarray | None): 現在の角加速度ベクトル。
     """
 
@@ -43,6 +47,12 @@ class LinkVectorCalculator:
         self.centroid = None
         self.acceleration = None
         self.angular_acceleration = None
+        # 重心の履歴。dot_dot_pg（並進の慣性力 F = m(a - g) に入る加速度）は
+        # 重心の 2 階微分でなければならない。かつてリンクベクトル r の 2 階微分を
+        # 渡しており、始点が固定なら 2 倍、始点が動けば別のベクトルになっていた。
+        self.previous_centroid = None
+        self.previous_centroid_velocity = None
+        self.centroid_velocity = None
         # print("LinkVectorCalculator object created")
 
     def calculate_link_vectors(self, keypoints_list, datFile_mode, i, dt):
@@ -71,6 +81,11 @@ class LinkVectorCalculator:
         self.centroid = (
             current_position[self.index_end] + current_position[self.index_start]
         ) / 2
+        if self.previous_centroid is None and datFile_mode == 1:
+            prev = keypoints_list[i - 1]
+            self.previous_centroid = (
+                prev[self.index_end] + prev[self.index_start]
+            ) / 2
         # print("centroid",self.centroid)
         # 速度ベクトルの計算
         self.velocity_vector = (
@@ -79,8 +94,14 @@ class LinkVectorCalculator:
             else None
         )
         # print("velocity_vector",self.velocity_vector)
-        # 速度が2つ溜まったら角速度ベクトルと加速度の計算
-        if self.previous_velocity_vector is not None and self.velocity_vector is not None:
+        # 角速度は標準形 omega = (r x r') / |r|^2。
+        # 剛体回転 r' = omega x r を代入すると r x r' = omega_perp |r|^2 になる
+        # （リンク軸まわりの回転は 2 点からは取れないので常に 0 になる。これは原理的な限界）。
+        # かつて第 1 引数に前フレームの速度を入れており、返していたのは
+        # dt |omega_perp|^2 omega_perp という次元 1/s^2 の別物だった。信号は
+        # omega^2 dt 倍に潰れ、逆に位置ノイズは (sigma/dt)^2/|r|^2 で増幅されていた。
+        # r' が 1 つあれば求まるので、速度が溜まった時点で計算できる。
+        if self.velocity_vector is not None:
             # 安全ガード: リンク長が極小/NaN の場合はゼロ割を避ける
             denom = np.linalg.norm(self.relative_position_vector)
             if not np.isfinite(denom) or denom < 1e-9:
@@ -92,7 +113,7 @@ class LinkVectorCalculator:
                         pass
                 self.angular_velocity = np.array([0.0, 0.0, 0.0])
             else:
-                cross_val = np.cross(self.previous_velocity_vector, self.velocity_vector)
+                cross_val = np.cross(self.relative_position_vector, self.velocity_vector)
                 if not np.all(np.isfinite(cross_val)):
                     if os.getenv('LVC_DEBUG', '0') not in ('0','false','False') or os.getenv('DEBUG_LOGS', '0') not in ('0','false','False'):
                         try:
@@ -102,12 +123,22 @@ class LinkVectorCalculator:
                     self.angular_velocity = np.array([0.0, 0.0, 0.0])
                 else:
                     self.angular_velocity = cross_val / (denom ** 2)
-            self.acceleration = (
-                self.velocity_vector - self.previous_velocity_vector
-            ) / self.dt
         else:
             self.angular_velocity = None
-            self.acceleration = None
+
+        # 重心の速度と加速度。並進の慣性力 F = m(a - g) に渡すのはこちらであって、
+        # リンクベクトル r の 2 階微分ではない。r'' = p_end'' - p_start'' なので
+        # 始点が固定なら重心加速度のちょうど 2 倍、始点が動けば別のベクトルになる。
+        self.centroid_velocity = (
+            (self.centroid - self.previous_centroid) / self.dt
+            if self.previous_centroid is not None
+            else None
+        )
+        self.acceleration = (
+            (self.centroid_velocity - self.previous_centroid_velocity) / self.dt
+            if (self.previous_centroid_velocity is not None and self.centroid_velocity is not None)
+            else None
+        )
         if self.previous_omega is not None:
             self.angular_acceleration = (
                 self.angular_velocity - self.previous_omega
@@ -118,6 +149,8 @@ class LinkVectorCalculator:
         self.previous_relative_position_vector = self.relative_position_vector
         self.previous_velocity_vector = self.velocity_vector
         self.previous_omega = self.angular_velocity
+        self.previous_centroid = self.centroid
+        self.previous_centroid_velocity = self.centroid_velocity
         # print("relative_position_vector",self.relative_position_vector)
         return (
             self.relative_position_vector,
