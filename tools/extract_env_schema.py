@@ -121,10 +121,23 @@ def _infer_type(call: ast.Call) -> str:
     if isinstance(parent, ast.Attribute) and parent.attr in ("strip", "lower", "upper"):
         grandparent = getattr(parent, "parent", None)
         if isinstance(grandparent, ast.Call):
-            setattr(grandparent, "parent", getattr(grandparent, "parent", None))
             return _infer_type(grandparent)
 
     return "str"
+
+
+def _merge_entry(existing: dict, entry: dict) -> None:
+    """同名の設定が再出現したときの併合。ファイル内・ファイル間の両方で使う。
+
+    既定値の食い違いを記録するのが要点。黙って先勝ちにすると、
+    ``Settings.as_env()`` が全設定を子プロセスへ明示的に渡す仕組み上、
+    選ばれなかった側のファイルに誤った既定が強制される。
+    """
+    existing["lines"].extend(entry["lines"])
+    if existing["type"] == "str" and entry["type"] != "str":
+        existing["type"] = entry["type"]
+    if existing["default"] != entry["default"]:
+        existing.setdefault("conflicting_defaults", []).append(entry["default"])
 
 
 def _group_of(name: str) -> str:
@@ -156,14 +169,9 @@ def extract(source_path: Path) -> dict[str, dict]:
         }
 
         if name in found:
-            # 同じ変数が複数箇所で読まれている。既定値が食い違う場合は記録しておく
-            # （どちらが効くかが実行経路依存になっている＝潜在的な不具合）。
-            prev = found[name]
-            prev["lines"].append(node.lineno)
-            if prev["default"] != entry["default"]:
-                prev.setdefault("conflicting_defaults", []).append(entry["default"])
-            if prev["type"] == "str" and entry["type"] != "str":
-                prev["type"] = entry["type"]
+            # 同じ変数が複数箇所で読まれている（どちらが効くかが実行経路依存
+            # になっている＝潜在的な不具合なので記録する）。
+            _merge_entry(found[name], entry)
         else:
             found[name] = entry
 
@@ -187,19 +195,10 @@ def main() -> int:
     schema: dict[str, dict] = {}
     for source in sources:
         for name, entry in extract(source).items():
-            if name not in schema:
+            if name in schema:
+                _merge_entry(schema[name], entry)
+            else:
                 schema[name] = entry
-                continue
-
-            existing = schema[name]
-            existing["lines"].extend(entry["lines"])
-            if existing["type"] == "str" and entry["type"] != "str":
-                existing["type"] = entry["type"]
-            # ファイルをまたぐ既定値の食い違いも記録する。ここを黙って
-            # 先勝ちにすると、Settings.as_env() が片方の値を全プロセスへ
-            # 強制することになり、衝突検出を書いた意味が失われる。
-            if existing["default"] != entry["default"]:
-                existing.setdefault("conflicting_defaults", []).append(entry["default"])
     schema = dict(sorted(schema.items()))
 
     payload = {

@@ -50,7 +50,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        2749
+        2743
       ]
     },
     "CAMERA_TRACE_EVERY": {
@@ -58,7 +58,7 @@
       "default": "30",
       "group": "その他",
       "lines": [
-        2751
+        2745
       ]
     },
     "DEBUG_LOGS": {
@@ -204,7 +204,7 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        3047
+        3041
       ]
     },
     "EKF_BPF_HIGH": {
@@ -721,8 +721,8 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        3619,
-        4359
+        3613,
+        4353
       ]
     },
     "OPENCV_THREADS": {
@@ -794,7 +794,7 @@
         771,
         1326,
         2294,
-        3546
+        3540
       ]
     },
     "POSE_MIN_DET": {
@@ -1147,7 +1147,7 @@
       "group": "入力ソース",
       "lines": [
         2215,
-        3507
+        3501
       ]
     },
     "USE_NATIVE_POSE": {
@@ -1179,7 +1179,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        2741
+        2735
       ]
     }
   }

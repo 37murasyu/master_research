@@ -42,12 +42,7 @@ if command -v uv >/dev/null 2>&1; then
     uv venv --python "${REQUIRED_PY}" .venv
   fi
   PY=".venv/bin/python"
-
-  if [ -d "wheelhouse" ]; then
-    uv pip install --python "$PY" --no-index --find-links=wheelhouse -r requirements_min.txt
-  else
-    uv pip install --python "$PY" -r requirements_min.txt
-  fi
+  PIP=(uv pip install --python "$PY")
 else
   # uv が無い場合は python3.12 を直接探す。
   PY_BIN="$(command -v "python${REQUIRED_PY}" || true)"
@@ -68,16 +63,20 @@ else
     echo "==> 既存の .venv を再利用（作り直すには --clean）"
   else
     echo "==> ${PY_BIN} で仮想環境を作成"
+    "$PY_BIN" -m venv .venv
   fi
-  "$PY_BIN" -m venv .venv
   PY=".venv/bin/python"
   "$PY" -m pip install --upgrade pip
+  PIP=("$PY" -m pip install)
+fi
 
-  if [ -d "wheelhouse" ]; then
-    "$PY" -m pip install --no-index --find-links=wheelhouse -r requirements_min.txt
-  else
-    "$PY" -m pip install -r requirements_min.txt
-  fi
+# 依存の入れ方は uv かどうかで違うが、入れるものは同じ。
+# wheelhouse/ があればネット無しで入れる（実験室の PC 向け）。
+if [ -d "wheelhouse" ]; then
+  echo "==> wheelhouse/ からオフラインで依存を入れます"
+  "${PIP[@]}" --no-index --find-links=wheelhouse -r requirements_min.txt
+else
+  "${PIP[@]}" -r requirements_min.txt
 fi
 
 echo "==> 完了: $("$PY" --version)"

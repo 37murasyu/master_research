@@ -23,13 +23,11 @@ MODE="auto"   # auto | wifi | pair
 for arg in "$@"; do
   case "$arg" in
     --debug)   VARIANT="debug" ;;
-    --release) VARIANT="release" ;;
     --build)   FORCE_BUILD=1 ;;
     --wifi)    MODE="wifi" ;;
     --pair)    MODE="pair" ;;
-    --usb)     MODE="auto" ;;
     *) echo "不明な引数: ${arg}
-使えるのは --debug / --release / --build / --wifi / --pair / --usb" >&2; exit 1 ;;
+使えるのは --debug / --build / --wifi / --pair" >&2; exit 1 ;;
   esac
 done
 
