@@ -1,0 +1,12 @@
+# 開発・テスト・ビルド用。実行だけなら requirements_min.txt で足りる。
+-r requirements_min.txt
+
+### テスト
+pytest
+pytest-cov
+
+### 配布ビルド
+# PyInstaller でスタンドアロンの .exe / .app を作る。
+# クロスコンパイルは不可なので、Windows 版は Windows 上で、
+# macOS 版は macOS 上でビルドする（CI のマトリクスで実施）。
+pyinstaller

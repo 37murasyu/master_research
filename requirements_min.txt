@@ -10,6 +10,20 @@ pygame
 pillow
 pyyaml
 
+### GUI (Gauge_display.py が pyqtgraph.Qt 経由で使う)
+# pyqtgraph は Qt バックエンドを自動選択する。PySide6 は LGPL なので配布時に
+# ソース開示義務が生じない。PyQt5 は GPL v3 のため、配布物には入れないこと。
+# バックエンドを確定させたい場合は PYQTGRAPH_QT_LIB=PySide6 を設定する。
+pyqtgraph
+PySide6
+
+### Python 3.12 対応
+# 3.12 で distutils が標準ライブラリから削除された。japanize-matplotlib が
+# distutils.version.LooseVersion を import するため、setuptools のシムが要る。
+# NOTE: 恒久対応としては japanize-matplotlib をやめ、同梱フォントを
+#       matplotlib に直接登録する方式へ移行する（アプリ側で実施）。
+setuptools
+
 ### Networking / I/O
 requests
 boto3
