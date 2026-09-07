@@ -1,0 +1,17 @@
+# Android / Gradle のビルド成果物とローカル設定
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.cxx/
+captures/
+
+# 署名鍵は絶対にコミットしない
+*.jks
+*.keystore
+keystore.properties
+
+# 姿勢推定モデルはリポジトリルートの 1 つが正。ここへは Gradle が複製する。
+# 2 箇所で管理すると更新時に片方だけ古くなるため、生成物として扱う。
+app/src/main/assets/pose_landmarker_lite.task

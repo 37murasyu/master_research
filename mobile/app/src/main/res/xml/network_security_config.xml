@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 9 以降は平文通信が既定で禁止されている。
+  このアプリは同一 LAN 内の PC に ws:// で繋ぐ（研究室内で完結する用途）ため、
+  平文を許可する必要がある。許可しないと WebSocket の接続が静かに失敗する。
+
+  インターネット越しに使う想定はない。外部公開するなら wss:// にして
+  このファイルごと外すこと。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

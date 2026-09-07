@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">車椅子計測センサ</string>
+
+    <string name="scan_qr">PCのQRコードを読み取る</string>
+    <string name="disconnect">切断</string>
+    <string name="camera_permission_required">カメラの利用を許可してください。姿勢推定に必要です。</string>
+
+    <string name="status_idle">未接続</string>
+    <string name="status_connecting">接続中…</string>
+    <string name="status_syncing">時刻同期中…</string>
+    <string name="status_streaming">送信中</string>
+    <string name="status_error">エラー</string>
+</resources>

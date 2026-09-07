@@ -79,6 +79,12 @@ __pycache__/
 !tools/**
 !assets/**
 
+# Android 側のソースと、PC 側との電文の突き合わせに使う契約ファイル。
+# golden_messages.json は Kotlin のテストが生成し、Python のテストが読む。
+# ビルド成果物は mobile/.gitignore で別途除外している。
+!mobile/contract/**
+!mobile/app/src/**
+
 # サンプル動画とゲージ背景画像（media/ を media/* にしたので今度は効く）
 !media/cam000_test.mp4
 !media/cam111_test.mp4
