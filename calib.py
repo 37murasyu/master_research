@@ -10,8 +10,12 @@ import json
 # pylint: disable=no-member
 import cv2 as cv
 import numpy as np
-import wmi
 import yaml
+
+# OS 差（カメラのバックエンド優先順・デバイス名列挙）はここに集約している。
+# 以前は wmi をトップレベルで import していたため、macOS ではこのモジュールを
+# import した時点で ModuleNotFoundError になっていた。
+from app.core.platform_compat import camera_backends, enumerate_camera_device_names
 
 # import sys
 from scipy import linalg
@@ -175,9 +179,10 @@ def save_frames_single_camera(camera_name):
     view_resize = calibration_settings["view_resize"]
     cooldown_time = calibration_settings["cooldown"]
 
-    # open video stream (prefer DSHOW to avoid MSMF stream failures)
+    # open video stream（OS ごとの優先順。Windows は MSMF の失敗を避けるため DSHOW を先に、
+    # macOS は AVFoundation を先に試す）
     cap = None
-    for be in [cv.CAP_DSHOW, cv.CAP_MSMF, cv.CAP_ANY]:
+    for be in camera_backends():
         cap = cv.VideoCapture(camera_device_id, be)
         if cap is not None and cap.isOpened():
             print(f"[INFO] Opened {camera_name} index={camera_device_id} backend={be}")
@@ -387,7 +392,7 @@ def save_frames_two_cams(camera0_name, camera1_name):
     number_to_save = calibration_settings["stereo_calibration_frames"]
 
     def _open_cam(index, label):
-        preferred_backends = [cv.CAP_DSHOW, cv.CAP_MSMF, cv.CAP_ANY]
+        preferred_backends = camera_backends()
         last_cap = None
         for be in preferred_backends:
             cap = cv.VideoCapture(index, be)
@@ -1206,19 +1211,32 @@ def process_camera_intrinsics(label, current_device_name, image_prefix):
 
 
 def enumerate_camera_device_names_windows():
-    w = wmi.WMI()
-    cameras = []
-    for item in w.Win32_PnPEntity():
-        if item.Name and "camera" in item.Name.lower():
-            cameras.append(item.Name)
-    return cameras
+    """後方互換のための別名。実体は platform_compat 側にある。
+
+    Windows 以外でも空リストを返すだけで例外にはならない。
+    """
+    return enumerate_camera_device_names()
 
 
 def probe_cameras(max_index=10):
     print(f"[INFO] Probing camera indices 0..{max_index-1}")
     available = []
+    backends = camera_backends()
     for i in range(max_index):
-        cap = cv.VideoCapture(i, cv.CAP_DSHOW)
+        # OS ごとの優先順で試す。以前は CAP_DSHOW 固定だったため、
+        # macOS では接続済みのカメラが 1 台も見つからなかった。
+        cap = None
+        for be in backends:
+            cap = cv.VideoCapture(i, be)
+            if cap is not None and cap.isOpened():
+                break
+            if cap is not None:
+                cap.release()
+                cap = None
+        if cap is None:
+            print(f"  Index {i}: (open failed)")
+            continue
+
         ok, frame = cap.read()
         if ok and frame is not None:
             print(f"  Index {i}: OK (resolution={frame.shape[1]}x{frame.shape[0]})")

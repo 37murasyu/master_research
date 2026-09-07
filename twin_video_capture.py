@@ -3,7 +3,6 @@ import logging
 import os
 import sys
 import time
-import winsound
 
 # pylint: disable=no-member
 import cv2 as cv

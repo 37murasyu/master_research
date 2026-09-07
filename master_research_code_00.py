@@ -2,7 +2,8 @@
 import logging
 import os
 import time
-import winsound
+
+from app.core.platform_compat import beep
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -192,7 +193,7 @@ maxs = [0, 0, 0, 0]
 SKIP_FRAMES = 0
 WHILE_COUNT = 0
 print("Starting loop")
-winsound.Beep(500, 1000)  # 周波数と持続時間を指定して音を鳴らす（例えば、500Hzで1秒間）
+beep(500, 1000)  # ループ開始の合図。OS 差は platform_compat が吸収する
 
 # %%
 while True:
