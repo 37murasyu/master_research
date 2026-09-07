@@ -55,7 +55,25 @@ class _Stats:
     dropped_gap: int = 0
     dropped_late: int = 0
     rejected: int = 0
+    # 直近 1 サンプルの位相差。値は素直だがジッタでよく揺れる。
     last_role_skew_ms: float = 0.0
+    # 指数移動平均。UI に出すのも、同期品質を判定するのもこちらを使う。
+    # 瞬時値はジッタの分散をそのまま拾うため、単発の値で良否を決めてはいけない。
+    mean_role_skew_ms: float = 0.0
+    max_role_skew_ms: float = 0.0
+    _skew_samples: int = 0
+
+    # 平滑化の強さ。0.1 だとおよそ直近 20 サンプルぶんを見る。
+    SKEW_ALPHA = 0.1
+
+    def observe_skew(self, skew_ms: float) -> None:
+        self.last_role_skew_ms = skew_ms
+        self.max_role_skew_ms = max(self.max_role_skew_ms, skew_ms)
+        if self._skew_samples == 0:
+            self.mean_role_skew_ms = skew_ms
+        else:
+            self.mean_role_skew_ms += self.SKEW_ALPHA * (skew_ms - self.mean_role_skew_ms)
+        self._skew_samples += 1
 
     def as_dict(self) -> dict[str, float | int]:
         return {
@@ -64,6 +82,8 @@ class _Stats:
             "dropped_late": self.dropped_late,
             "rejected": self.rejected,
             "last_role_skew_ms": self.last_role_skew_ms,
+            "mean_role_skew_ms": self.mean_role_skew_ms,
+            "max_role_skew_ms": self.max_role_skew_ms,
         }
 
 
@@ -255,7 +275,7 @@ class SyncBuffer:
             if not candidates:
                 return
             nearest.append(min(candidates, key=lambda x: abs(x - t)))
-        self._stats.last_role_skew_ms = (max(nearest) - min(nearest)) / 1_000_000
+        self._stats.observe_skew((max(nearest) - min(nearest)) / 1_000_000)
 
     def _evict(self) -> None:
         """時間窓より古いフレームを捨てる。長時間の計測でメモリを食わないため。"""

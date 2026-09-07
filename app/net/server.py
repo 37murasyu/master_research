@@ -269,7 +269,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 f"  接続 {stats['clients']}台 {stats['roles']}  "
                 f"受信 {stats['frames_received']}  ペア {stats['emitted']}  "
                 f"欠測破棄 {stats['dropped_gap']}  "
-                f"位相差 {stats['last_role_skew_ms']:.1f}ms  "
+                f"位相差 {stats['mean_role_skew_ms']:.1f}ms(最大{stats['max_role_skew_ms']:.1f})  "
                 f"不正 {stats['protocol_errors']}"
             )
     except (KeyboardInterrupt, asyncio.CancelledError):

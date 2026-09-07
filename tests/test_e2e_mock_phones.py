@@ -85,5 +85,11 @@ def test_survives_jitter_and_packet_loss():
 
     stats = server.buffer.stats
     assert stats["rejected"] == 0, "未知のロールが混入している"
-    # 位相差が 1 フレーム（33ms）以内に収まっていること
-    assert stats["last_role_skew_ms"] < 33.0
+
+    # 位相差は平滑値で見る。瞬時値 1 サンプルはジッタの分散をそのまま拾うため、
+    # 単発の値で良否を決めてはいけない（±15ms を両系統に入れると差分の標準偏差は
+    # 約 21ms になり、1 フレーム 33ms を超える回が普通に出る）。
+    assert stats["mean_role_skew_ms"] < 33.0, (
+        f"平均位相差が 1 フレームを超えている: {stats['mean_role_skew_ms']:.1f}ms "
+        f"(最大 {stats['max_role_skew_ms']:.1f}ms)"
+    )
