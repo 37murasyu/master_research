@@ -1,7 +1,16 @@
-# 🔸 output_data 以下の .csv ファイルをすべて無視（サブフォルダ含む）
-output_data/**/*.csv
+# ===========================================================================
+# 重要: git は「親ディレクトリごと除外したファイル」を ! で戻せない。
+#
+#   誤り:  media/          +  !media/wheelchair_user.png   → 戻らない
+#   正しい: media/*         +  !media/wheelchair_user.png   → 戻る
+#
+# 以前は前者の書き方だったため、.gitattributes で LFS 宣言していても
+# media/wheelchair_user.png は一度もコミットされておらず、
+# clone しただけでは起動できない状態になっていた。
+# ディレクトリを丸ごと無視したいが中身を個別に戻したい場合は必ず `/*` を付ける。
+# ===========================================================================
 
-# 🔸 全体の画像ファイルを無視
+# --- 研究データ・生成物（既定は無視）---------------------------------------
 *.png
 *.jpg
 *.jpeg
@@ -10,7 +19,6 @@ output_data/**/*.csv
 *.tiff
 *.webp
 
-# 🔸 全体の動画ファイルを無視
 *.mp4
 *.mov
 *.avi
@@ -21,25 +29,59 @@ output_data/**/*.csv
 *.csv
 *.npy
 *.json
-# large data and build outputs
-*.mp4
-*.npy
-*.csv
+*.log
+*.prof
+
+# --- ディレクトリ（中身を戻せるよう /* で書く）-----------------------------
 output_data/
 frames/
 frames_pair/
 videos/
-media/
+media/*
 tmp_debug/
+fft_plots/
+
+# --- ビルド成果物・キャッシュ ----------------------------------------------
 build/
+dist/
+
+# ネイティブ拡張（CMake / MSVC）の出力。原本は native_*/*.cpp と CMakeLists.txt の側。
+# native_overlay だけ出力先が build/ ではなく overlay/ なので個別に指定する。
+native_overlay/overlay/
+*.obj
+*.tlog
+*.ipdb
+*.iobj
+*.pdb
+*.recipe
+*.lastbuildstate
 .pio/
 .aws-sam/
 .venv/
 wheelhouse/
-!media/cam111_test.mp4
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+
+# ===========================================================================
+# ここから下は「実行に必須なので除外から戻す」もの。
+# 上の拡張子ルールより後に書く必要がある（後勝ち）。
+# ===========================================================================
+
+# アプリの同梱資産一式（フォント・画像・ライセンス）。
+# assets/ 自体はディレクトリとして除外していないので ** で戻せる。
+!assets/**
+
+# サンプル動画とゲージ背景画像（media/ を media/* にしたので今度は効く）
 !media/cam000_test.mp4
+!media/cam111_test.mp4
 !media/wheelchair_user.png
 
-# 生成物・ログ（履歴に入れない）
-fft_plots/
-*.log
+# 実行時に必ず必要な設定・基準値
+!gauge_layout.json
+!supervision_stats.csv
+!rm_method.csv
+!m_max_part*.json
+!camera_parameters/**
