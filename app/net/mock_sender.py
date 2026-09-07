@@ -48,7 +48,13 @@ def synthetic_pose(t_sec: float, role: str) -> list[tuple[float, float, float, f
     """
     cycle_hz = 1.2
     phase = 2 * math.pi * cycle_hz * t_sec
-    parallax = 0.04 if role == "cam1" else 0.0
+
+    # 2 台の視差。押し出し周期に合わせて変化させる。
+    # 固定値にすると三角測量の結果が「奥行き一定」になり、
+    # 奥行き方向のサイクル検出が原理的に働かなくなる。
+    # 実際の計測では体が前後に動くので、視差も周期的に変わる。
+    base_parallax = 0.045
+    parallax = (base_parallax + 0.015 * math.sin(phase)) if role == "cam1" else 0.0
 
     points: list[tuple[float, float, float, float]] = []
     for index in range(p.LANDMARK_COUNT):

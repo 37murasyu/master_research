@@ -9,19 +9,29 @@
 再利用する**。既存の USB 経路は一切変更しないので回帰リスクがゼロ。
 
 再利用しているもの:
-    utils.DLT / compute_local_torque / PushCycleDetector
+    utils.compute_local_torque / PushCycleDetector
     utils_dynamic.calculate_inertia_tensor / calculate_M_and_F /
                   calculate_individual_torques
     link_vector_calculator_module.LinkVectorCalculator
     body_part_storage_module.BodyPartDataStorage
 
-代償はオーケストレーションが 2 本になること。**規約は既存に忠実に合わせて**
-あり（キーポイントの並び順、リンク定義、慣性テンソルの部位行、r_g の重み）、
-同一入力で両経路の出力が一致することをテストで確かめる。
+既存 USB 経路と揃えてある点:
+    - キーポイントの並び順（config.pose_keypoints の宣言順）
+    - リンク定義（part_calculations / links / parent_links）
+    - 慣性テンソルの部位行と長さの取り方、r_g の重み、Imode / condition
+    - サイクル検出の軸（既定 y）、閾値、mode='rise_to_rise'
+    - ``compute_local_torque`` への parent_vec（肘面を基準に取る）
 
-注記: キーポイントの並び順は既存実装（``_extract_keypoints_fast_single``）に
-合わせて ``config.pose_keypoints`` の**宣言順**にしてある。この順序が下流の
-インデックス演算と整合しているかは research 側の論点で、ここでは判断しない。
+**揃っていない点（重要）**:
+    サイクルごとの量は τ·ω を積分した**仕事 [J]** で、既存の
+    ``master_research_code.py:3833-3843`` が肘・手首に対して使う特別な経路
+    （``compute_cycle_energy_filtered`` と局所 y 成分の片側積算）は再現していない。
+    したがって肘・手首の値は USB 経路と**直接比較できない**。肩・体幹に相当する
+    「その他」分岐（P = τ·ω の積分）とは同じ定義。
+
+注記: キーポイントの並び順が下流のインデックス演算と整合しているかには疑義がある
+（code-review 指摘 #1 と同じ論点）。ここでは既存と同じ規約に揃えることを優先し、
+規約自体は変更していない。
 """
 
 from __future__ import annotations
@@ -37,7 +47,7 @@ from app.net.sync_buffer import PairedSample
 __all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig"]
 
 
-# 既存 master_research_code.py と同じリンク定義
+# 既存 master_research_code.py の part_calculations と同じ
 PART_LINKS: dict[str, tuple[int, int]] = {
     "upper_arm_R": (3, 1),
     "forearm_R": (5, 3),
@@ -49,7 +59,7 @@ PART_LINKS: dict[str, tuple[int, int]] = {
     "upper_Leg_L": (6, 8),
 }
 
-# 局所トルクに変換するときの基準リンク（既存の links 辞書と同じ）
+# 局所トルクの基準リンク（既存の links 辞書と同じ）
 TORQUE_LINKS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "wrist_R": lambda p: p[4] - p[2],
     "elbow_R": lambda p: p[2] - p[0],
@@ -59,20 +69,66 @@ TORQUE_LINKS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "shoulder_L": lambda p: (p[1] - p[0]),
 }
 
+# 親リンク。局所座標の y 軸を親×z（肘面の法線）で取るために使う。
+# 既存 master_research_code.py:3587-3594 と同じ対応。
+PARENT_OF: dict[str, str | None] = {
+    "wrist_R": "elbow_R",
+    "elbow_R": "shoulder_R",
+    "shoulder_R": None,
+    "wrist_L": "elbow_L",
+    "elbow_L": "shoulder_L",
+    "shoulder_L": None,
+}
+
+# 仕事率 P = τ·ω を求めるときに、各関節へ対応させる部位の角速度。
+# 既存 master_research_code.py:3790-3797 と同じ。
+OMEGA_SOURCE: dict[str, str] = {
+    "wrist_R": "forearm_R",
+    "elbow_R": "upper_arm_R",
+    "shoulder_R": "both_shoulder",
+    "wrist_L": "forearm_L",
+    "elbow_L": "up_arm_l",
+    "shoulder_L": "both_shoulder",
+}
+
 PART_KEYS = ("wrist_R", "elbow_R", "shoulder_R", "wrist_L", "elbow_L", "shoulder_L")
+
+_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
 @dataclass
 class MeasurementConfig:
-    """計測のパラメータ。既定値は config.py に揃えてある。"""
+    """計測のパラメータ。既定値は既存 USB 経路に揃えてある。"""
 
     body_mass_kg: float = 60.0
+
     # 慣性テンソルを確定させるまでに必要なフレーム数（既存と同じ）
     inertia_ready_frames: int = 3
     dynamics_ready_frames: int = 7
-    # サイクル検出の基準値を作るのに使うフレーム範囲（既存と同じ 5..14）
+
+    # サイクル検出の基準値を作るフレーム範囲（既存と同じ 5..14）
     baseline_first_frame: int = 5
     baseline_last_frame: int = 14
+    # 基準値を確定させるのに最低限必要なサンプル数。欠測があっても
+    # これだけ集まれば検出器を作る（1 フレームの欠測で無効化されないように）。
+    baseline_min_samples: int = 3
+
+    # サイクル検出に使う軸。既存の RT_CYCLE_AXIS（既定 'y'）に合わせる。
+    cycle_axis: str = "y"
+    cycle_threshold: float = 0.015
+    cycle_velocity_epsilon: float = 0.01
+    cycle_min_interval: int = 10
+    cycle_mode: str = "rise_to_rise"
+    cycle_negative_down: bool = True
+
+    # 保持するフレーム数の上限。長時間の計測でメモリを食い潰さないため。
+    # 物理計算が実際に見るのは直近 2 フレームだけ（LinkVectorCalculator は
+    # i と i-1、calculate_M_and_F は [-1] しか使わない）。
+    history_limit: int = 600
+
+    @property
+    def cycle_axis_index(self) -> int:
+        return _AXIS_INDEX.get(self.cycle_axis.strip().lower(), 1)
 
 
 @dataclass
@@ -83,11 +139,15 @@ class FrameResult:
     points_3d: np.ndarray
     local_torques: dict[str, np.ndarray] = field(default_factory=dict)
     cycle_detected: bool = False
-    impulses: dict[str, float] = field(default_factory=dict)
+    # サイクルごとの仕事 [J]。詳細はモジュール docstring の「揃っていない点」を参照。
+    cycle_work_j: dict[str, float] = field(default_factory=dict)
 
 
 class NetworkMeasurement:
-    """ペアになったランドマークを順に流し込み、トルクと力積を得る。"""
+    """ペアになったランドマークを順に流し込み、トルクと仕事を得る。"""
+
+    # 物理計算が参照する過去フレーム数（LinkVectorCalculator が i-1 を見る）
+    _REQUIRED_FRAMES = 2
 
     def __init__(
         self,
@@ -109,18 +169,19 @@ class NetworkMeasurement:
             part: LinkVectorCalculator(start, end) for part, (start, end) in PART_LINKS.items()
         }
 
-        self.points_history: list[np.ndarray] = []
+        # 直近 2 フレームだけ持つ。物理計算はそれ以上遡らない。
+        self._recent_points: list[np.ndarray] = []
         self.frame_index = 0
         self._prev_t_ns: int | None = None
 
-        # 慣性テンソル。既存と同じく 3 フレーム目で確定させる。
         self._inertia: dict[str, np.ndarray] = {}
 
         # サイクル検出
-        self._baseline_z = 0.0
+        self._baseline_sum = 0.0
+        self._baseline_samples = 0
         self._detector = None
-        self.impulse_records: dict[str, list[float]] = {k: [] for k in PART_KEYS}
-        self._torque_history: dict[str, list[float]] = {k: [] for k in PART_KEYS}
+        self.cycle_work: dict[str, list[float]] = {k: [] for k in PART_KEYS}
+        self._power_history: dict[str, list[float]] = {k: [] for k in PART_KEYS}
 
         self.results: list[FrameResult] = []
 
@@ -133,7 +194,9 @@ class NetworkMeasurement:
             return None
 
         points = self._triangulate(keypoints0, keypoints1)
-        self.points_history.append(points)
+        self._recent_points.append(points)
+        if len(self._recent_points) > self._REQUIRED_FRAMES:
+            del self._recent_points[0]
 
         dt = self._timestep(pair.t_ns)
         self._update_links(dt)
@@ -141,17 +204,18 @@ class NetworkMeasurement:
 
         result = FrameResult(t_ns=pair.t_ns, points_3d=points)
 
-        if len(self.points_history) == self.config.inertia_ready_frames:
+        if self.frame_index + 1 == self.config.inertia_ready_frames:
             self._build_inertia(points)
 
-        if len(self.points_history) >= self.config.dynamics_ready_frames and self._inertia:
+        if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
             torques = self._compute_local_torques(points)
             if torques is not None:
                 result.local_torques = torques
-                self._accumulate_cycle(points, torques, dt, result)
+                self._accumulate_cycle(points, dt, result)
 
         self.frame_index += 1
-        self.results.append(result)
+        self._append_result(result)
+        self._trim_storage()
         return result
 
     # -- 各段 --------------------------------------------------------------
@@ -160,10 +224,7 @@ class NetworkMeasurement:
         if frame is None:
             return None
         # 既存 `_extract_keypoints_fast_single` と同じく pose_keypoints の宣言順。
-        return [
-            list(frame.pixel_xy(index))
-            for index in self.pose_keypoints
-        ]
+        return [list(frame.pixel_xy(index)) for index in self.pose_keypoints]
 
     def _triangulate(self, keypoints0, keypoints1) -> np.ndarray:
         """三角測量して既存と同じ座標系に変換する。
@@ -192,9 +253,9 @@ class NetworkMeasurement:
     def _timestep(self, t_ns: int) -> float:
         """前フレームとの実時間差。
 
-        既存のリアルタイム経路は「PC の処理ループ速度」から dt を逆算していたが、
-        こちらは**撮影時刻の差**を使える。無線のジッタがあっても、時刻で
-        再標本化した後のグリッド間隔になるので等間隔が保たれる。
+        既存のリアルタイム経路は「PC の処理ループ速度」から dt を逆算していたが
+        （master_research_code.py:4149-4154）、こちらは**撮影時刻の差**を使える。
+        無線のジッタがあっても、時刻で再標本化した後のグリッド間隔になる。
         """
         if self._prev_t_ns is None:
             self._prev_t_ns = t_ns
@@ -204,27 +265,52 @@ class NetworkMeasurement:
         return dt if dt > 0 else 1.0 / 30.0
 
     def _update_links(self, dt: float) -> None:
-        index = len(self.points_history) - 1
+        index = len(self._recent_points) - 1
         for part, calculator in self.calculators.items():
-            result = calculator.calculate_link_vectors(self.points_history, True, index, dt)
+            result = calculator.calculate_link_vectors(self._recent_points, True, index, dt)
             if result[0] is None:
                 continue
             r_vec, vel, omega, centroid, p1, acc, ang_acc = result
             self.storage.add_data(part, r_vec, vel, omega, centroid, p1, ang_acc, acc)
 
+    def _cycle_value(self, points: np.ndarray) -> float:
+        """サイクル検出に使うスカラー。既存は右手首相当の点の指定軸。"""
+        return float(points[0][self.config.cycle_axis_index])
+
     def _update_baseline(self, points: np.ndarray) -> None:
-        """サイクル検出の基準値（安定座位での z）を作る。既存と同じ 5..14 フレーム。"""
+        """サイクル検出の基準値（安定座位での値）を作る。
+
+        欠測に強くしてある。既存はフレーム番号ちょうどで検出器を作るので、
+        その 1 フレームが欠測だと以後一度も検出されない。ここでは
+        実際に集まったサンプル数で平均し、範囲を過ぎた時点で確定させる。
+        """
         from utils import PushCycleDetector
 
-        value = float(points[0][2])
-        if not math.isfinite(value):
-            return  # NaN を混ぜると基準値が汚染され、以後一度も検出されなくなる
+        config = self.config
+        value = self._cycle_value(points)
 
-        span = self.config.baseline_last_frame - self.config.baseline_first_frame + 1
-        if self.config.baseline_first_frame <= self.frame_index <= self.config.baseline_last_frame:
-            self._baseline_z += value / span
-        elif self.frame_index == self.config.baseline_last_frame + 1 and self._detector is None:
-            self._detector = PushCycleDetector(self._baseline_z)
+        in_window = config.baseline_first_frame <= self.frame_index <= config.baseline_last_frame
+        if in_window and math.isfinite(value):
+            self._baseline_sum += value
+            self._baseline_samples += 1
+
+        if self._detector is not None:
+            return
+        if self.frame_index < config.baseline_last_frame:
+            return
+        if self._baseline_samples < config.baseline_min_samples:
+            # まだ足りない。窓を過ぎても集まるまで待つ（全滅時は検出しない）。
+            return
+
+        baseline = self._baseline_sum / self._baseline_samples
+        self._detector = PushCycleDetector(
+            baseline,
+            threshold=config.cycle_threshold,
+            velocity_epsilon=config.cycle_velocity_epsilon,
+            min_interval=config.cycle_min_interval,
+            mode=config.cycle_mode,
+            negative_down=config.cycle_negative_down,
+        )
 
     def _build_inertia(self, points: np.ndarray) -> None:
         """慣性テンソルを確定させる。部位行と引数は既存と同じ。"""
@@ -235,9 +321,7 @@ class NetworkMeasurement:
         def length(a: int, b: int) -> float:
             return float(np.linalg.norm(points[a] - points[b]))
 
-        half_body = 0.25 * float(
-            np.linalg.norm(points[0] + points[1] - points[7] - points[6])
-        )
+        half_body = 0.25 * float(np.linalg.norm(points[0] + points[1] - points[7] - points[6]))
 
         self._inertia = {
             "upper_arm": calculate_inertia_tensor(3, mass, length(0, 2)),
@@ -264,10 +348,10 @@ class NetworkMeasurement:
         gravity = np.array([0.0, 0.0, -9.81])
         inertia = self._inertia
 
-        def chain(arm: str, leg: str, condition: int):
+        def chain(arm: str, forearm: str, leg: str, condition: int):
             specs = [
                 (inertia["upper_arm"], m_upper_arm, data[arm], {}),
-                (inertia["forearm"], m_forearm, data[f"forearm_{'R' if condition else 'L'}"], {}),
+                (inertia["forearm"], m_forearm, data[forearm], {}),
                 (
                     inertia["upper_body"],
                     mass,
@@ -296,17 +380,17 @@ class NetworkMeasurement:
             return moments, forces, parts
 
         try:
-            Ms_r, Fs_r, parts_r = chain("upper_arm_R", "upper_Leg_R", condition=1)
-            Ms_l, Fs_l, parts_l = chain("up_arm_l", "upper_Leg_L", condition=0)
+            Ms_r, Fs_r, parts_r = chain("upper_arm_R", "forearm_R", "upper_Leg_R", condition=1)
+            Ms_l, Fs_l, parts_l = chain("up_arm_l", "forearm_L", "upper_Leg_L", condition=0)
         except (IndexError, KeyError, ValueError):
             return None
 
-        def centroids(arm: str, leg: str) -> list[np.ndarray]:
+        def centroids(arm: str, forearm: str, leg: str) -> list[np.ndarray]:
             shoulder = data["both_shoulder"][-1]["centroid"]
             hip = data["both_hip"][-1]["centroid"]
             return [
                 data[arm][-1]["centroid"],
-                data[f"forearm_{'R' if arm.endswith('_R') else 'L'}"][-1]["centroid"],
+                data[forearm][-1]["centroid"],
                 (shoulder * 3 + hip) / 4,
                 (shoulder + hip * 3) / 4,
                 data[leg][-1]["centroid"],
@@ -317,11 +401,11 @@ class NetworkMeasurement:
         f_E = np.zeros(3)
 
         torques_r = calculate_individual_torques(
-            Ms_r, Fs_r, np.array(centroids("upper_arm_R", "upper_Leg_R")),
+            Ms_r, Fs_r, np.array(centroids("upper_arm_R", "forearm_R", "upper_Leg_R")),
             tau_E, f_E, r_x, parts_r, self.storage,
         )
         torques_l = calculate_individual_torques(
-            Ms_l, Fs_l, np.array(centroids("up_arm_l", "upper_Leg_L")),
+            Ms_l, Fs_l, np.array(centroids("up_arm_l", "forearm_L", "upper_Leg_L")),
             tau_E, f_E, r_x, parts_l, self.storage,
         )
 
@@ -334,53 +418,92 @@ class NetworkMeasurement:
             "shoulder_L": torques_l[2][0],
         }
 
+        links = {key: builder(points) for key, builder in TORQUE_LINKS.items()}
+
         local = {}
         for key, global_torque in global_torques.items():
-            link = TORQUE_LINKS[key](points)
-            local[key] = compute_local_torque(global_torque, link)
+            parent_key = PARENT_OF[key]
+            local[key] = compute_local_torque(
+                global_torque,
+                links[key],
+                parent_vec=links[parent_key] if parent_key else None,
+            )
             self.storage.add_torque(key, local[key])
+
+        self._accumulate_power(global_torques, data)
         return local
 
-    def _accumulate_cycle(
-        self,
-        points: np.ndarray,
-        torques: dict[str, np.ndarray],
-        dt: float,
-        result: FrameResult,
+    def _accumulate_power(
+        self, global_torques: dict[str, np.ndarray], data: dict[str, list]
     ) -> None:
-        """サイクルを検出し、その区間の力積を積む。既存の計算と同じ。"""
+        """仕事率 P = τ·ω を溜める。既存 master_research_code.py:3789-3805 と同じ式。"""
+        for key, part in OMEGA_SOURCE.items():
+            torque = global_torques.get(key)
+            entries = data.get(part)
+            omega = entries[-1]["omega"] if entries else None
+            if (
+                torque is None
+                or omega is None
+                or not np.all(np.isfinite(torque))
+                or not np.all(np.isfinite(omega))
+            ):
+                self._power_history[key].append(0.0)
+            else:
+                self._power_history[key].append(float(np.dot(torque, omega)))
+
+    def _accumulate_cycle(self, points: np.ndarray, dt: float, result: FrameResult) -> None:
+        """サイクルを検出し、その区間の仕事を積む。"""
         if self._detector is None:
             return
 
-        z = float(points[0][2])
-        if not math.isfinite(z):
+        value = self._cycle_value(points)
+        if not math.isfinite(value):
             return
 
-        if self._detector.update(z, self.frame_index):
+        if self._detector.update(value, self.frame_index):
             result.cycle_detected = True
             for key in PART_KEYS:
-                series = np.asarray(self._torque_history[key], dtype=np.float64)
-                if series.size:
-                    positive = float(series[series > 0].sum() * dt)
-                    negative = float(series[series < 0].sum() * dt)
-                    impulse = max(abs(positive), abs(negative))
-                    self.impulse_records[key].append(impulse)
-                    result.impulses[key] = impulse
-                self._torque_history[key].clear()
+                series = self._power_history[key]
+                if series:
+                    work = float(np.sum(series) * dt)
+                    self.cycle_work[key].append(work)
+                    result.cycle_work_j[key] = work
+                series.clear()
 
-        for key in PART_KEYS:
-            vector = torques.get(key)
-            if vector is not None and math.isfinite(float(vector[2])):
-                self._torque_history[key].append(float(vector[2]))
+    # -- メモリ管理 --------------------------------------------------------
+    def _append_result(self, result: FrameResult) -> None:
+        """結果を溜める。上限を超えたら古いものから捨てる。
+
+        長時間の計測で溜め込むと、1 時間で 10 万件を超えてメモリを食い潰す。
+        上流の SyncBuffer が時間窓で捨てているのと同じ理由。
+        全件必要なら、呼び出し側が逐次書き出すこと。
+        """
+        self.results.append(result)
+        limit = self.config.history_limit
+        if limit > 0 and len(self.results) > limit:
+            del self.results[: len(self.results) - limit]
+
+    def _trim_storage(self) -> None:
+        """BodyPartDataStorage を直近数フレームに切り詰める。
+
+        既存の BodyPartDataStorage は部位ごとに毎フレーム辞書を積むだけで
+        捨てる仕組みが無い。参照されるのは ``[-1]`` だけなので、
+        少し残しておけば足りる。
+        """
+        keep = max(self._REQUIRED_FRAMES, 2)
+        for part, entries in self.storage.storage.items():
+            if len(entries) > keep:
+                self.storage.storage[part] = entries[-keep:]
+        for key, values in self.storage.torques.items():
+            if len(values) > keep:
+                self.storage.torques[key] = values[-keep:]
 
     # -- 参照 --------------------------------------------------------------
     @property
-    def latest_impulses(self) -> dict[str, float]:
-        return {
-            key: (values[-1] if values else 0.0)
-            for key, values in self.impulse_records.items()
-        }
+    def latest_cycle_work(self) -> dict[str, float]:
+        """直近のサイクルの仕事 [J]。"""
+        return {key: (values[-1] if values else 0.0) for key, values in self.cycle_work.items()}
 
     @property
     def cycle_count(self) -> int:
-        return len(self.impulse_records[PART_KEYS[0]])
+        return len(self.cycle_work[PART_KEYS[0]])

@@ -110,7 +110,8 @@ def test_full_chain_from_phones_to_torques():
     pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
     intrinsics = np.array([[900.0, 0.0, width / 2], [0.0, 900.0, height / 2], [0.0, 0.0, 1.0]])
     p_left = intrinsics @ np.hstack([np.eye(3), np.zeros((3, 1))])
-    p_right = intrinsics @ np.hstack([np.eye(3), np.array([[-0.5], [0.0], [0.0]])])
+    # 並進は cm 単位。既存パイプラインが三角測量結果を 0.01 倍して m にするため。
+    p_right = intrinsics @ np.hstack([np.eye(3), np.array([[-50.0], [0.0], [0.0]])])
 
     measurement = NetworkMeasurement(
         p_left, p_right, pose_keypoints, MeasurementConfig(body_mass_kg=60.0)

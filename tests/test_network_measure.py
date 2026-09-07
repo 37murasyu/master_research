@@ -20,13 +20,21 @@ WIDTH, HEIGHT = 1280, 720
 POSE_KEYPOINTS = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
 
 
-def _stereo_projections(baseline_m: float = 0.5, focal_px: float = 900.0):
-    """左右に baseline だけ離した、平行なステレオ対の投影行列。"""
+def _stereo_projections(baseline_cm: float = 50.0, focal_px: float = 900.0):
+    """左右に baseline だけ離した、平行なステレオ対の投影行列。
+
+    **並進は cm 単位**にしてある。既存パイプラインは三角測量の結果を 0.01 倍して
+    m に直しており（``_triangulate_transform_batch``）、部位長も m で扱っている
+    （KNOWN_ISSUES によれば前腕 0.19〜0.26 m）。したがって
+    ``camera_parameters/*.dat`` の並進は cm 単位である。
+    ここを m にすると、サイクル検出の閾値 0.015 が「1.5 m の移動」に相当する
+    非現実的な設定になり、実データでは起こらない条件になってしまう。
+    """
     K = np.array(
         [[focal_px, 0.0, WIDTH / 2], [0.0, focal_px, HEIGHT / 2], [0.0, 0.0, 1.0]]
     )
     P0 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-    P1 = K @ np.hstack([np.eye(3), np.array([[-baseline_m], [0.0], [0.0]])])
+    P1 = K @ np.hstack([np.eye(3), np.array([[-baseline_cm], [0.0], [0.0]])])
     return P0, P1
 
 
@@ -55,13 +63,19 @@ def _pair_from_pixels(t_ns: int, pixels0: np.ndarray, pixels1: np.ndarray) -> Pa
 
 
 def _body_points(t: float) -> np.ndarray:
-    """12 関節ぶんの 3D 点。上肢だけ動かす。カメラ座標系（z が前方）。"""
+    """12 関節ぶんの 3D 点。上肢だけ動かす。カメラ座標系（z が前方）、**単位 cm**。
+
+    被写体まで 250cm、上肢の振幅 10cm、押し出し周期 1.2Hz。
+    奥行きも 15cm ほど前後させる（車椅子駆動では体幹が前後する）。
+    """
+    phase = 2 * np.pi * 1.2 * t
     points = []
     for index in range(12):
-        base_x = -0.3 + 0.06 * index
-        base_y = -0.2 + 0.03 * index
-        swing = 0.10 * np.sin(2 * np.pi * 1.2 * t) if index < 6 else 0.0
-        points.append([base_x + swing, base_y, 2.5])
+        base_x = -30.0 + 6.0 * index
+        base_y = -20.0 + 3.0 * index
+        swing = 10.0 * np.sin(phase) if index < 6 else 0.0
+        depth = 250.0 + 15.0 * np.sin(phase)
+        points.append([base_x + swing, base_y, depth])
     return np.array(points, dtype=np.float64)
 
 
@@ -105,8 +119,8 @@ class TestTriangulation:
             0, _project(measurement.P0, truth), _project(measurement.P1, truth)
         )
         points = measurement.process(pair).points_3d
-        # 2.5m 先の被写体なので、変換後の該当成分は 0.025 のオーダー
-        assert np.nanmax(np.abs(points)) < 1.0
+        # 250cm 先の被写体。0.01 倍されるので m 単位で 2.5 前後になる
+        assert 1.0 < np.nanmax(np.abs(points)) < 10.0
 
 
 class TestPipeline:
@@ -145,6 +159,26 @@ class TestPipeline:
         for result in measurement.results:
             for name, vector in result.local_torques.items():
                 assert np.all(np.isfinite(vector)), f"{name} に非有限値: {vector}"
+
+    def test_cycles_are_detected_for_realistic_motion(self):
+        """現実的な大きさの往復運動でサイクルが検出されること。
+
+        閾値（0.015）は既存パイプラインの単位系に合わせて調整されている。
+        投影行列の並進を m 単位にすると、この閾値が「1.5 m の移動」に相当し、
+        実データでは決して起こらない条件になる。cm 単位で組むこと。
+        """
+        measurement = self._run(frames=150)
+        assert measurement.cycle_count > 0, (
+            "1.2Hz・奥行き15cm の往復でサイクルが検出されない。"
+            "投影行列の単位系（cm）を確認すること。"
+        )
+
+    def test_cycle_work_is_recorded_per_joint(self):
+        measurement = self._run(frames=150)
+        assert measurement.cycle_count > 0
+        for key, values in measurement.cycle_work.items():
+            assert len(values) == measurement.cycle_count, f"{key} の記録数が揃っていない"
+            assert all(np.isfinite(v) for v in values), f"{key} に非有限値"
 
     def test_timestep_comes_from_capture_timestamps(self):
         """dt は撮影時刻の差から取る。既存のリアルタイム経路は処理ループ速度から
@@ -186,11 +220,83 @@ class TestRobustness:
             else:
                 measurement.process(_pair_from_pixels(index * 33_000_000, p0, p1))
 
-        assert np.isfinite(measurement._baseline_z), "基準値が NaN に汚染された"
+        assert np.isfinite(measurement._baseline_sum), "基準値が NaN に汚染された"
+
+    def test_missing_frame_at_detector_creation_does_not_disable_detection(self):
+        """検出器が作られる瞬間のフレームが欠測でも、検出が死なないこと。
+
+        既存実装は「フレーム番号ちょうど」で検出器を作るため、そのフレームが
+        欠測だと以後一度もサイクルを検出できない。ここでは実際に集まった
+        サンプル数で確定させるので、1 フレームの欠測では死なない。
+        """
+        measurement = _measurement()
+        truth = _body_points(0.0)
+        p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
+
+        broken_frame = measurement.config.baseline_last_frame  # 検出器が作られる直前
+        for index in range(20):
+            if index == broken_frame:
+                nan_pixels = np.full_like(p0, np.nan)
+                measurement.process(_pair_from_pixels(index * 33_000_000, nan_pixels, nan_pixels))
+            else:
+                measurement.process(_pair_from_pixels(index * 33_000_000, p0, p1))
+
+        assert measurement._detector is not None, (
+            "1 フレームの欠測でサイクル検出器が作られなくなった"
+        )
+
+    def test_baseline_divides_by_the_samples_actually_collected(self):
+        """欠測があっても平均が偏らないこと。
+
+        固定の窓幅で割ると、欠測のぶんだけ基準値が 0 に寄る。
+        PushCycleDetector は基準値との差を 0.015 m の閾値で見るので、
+        ずれると検出のタイミングが狂う。
+        """
+        measurement = _measurement()
+        truth = _body_points(0.0)
+        p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
+
+        skipped = {6, 8, 10}
+        for index in range(16):
+            if index in skipped:
+                nan_pixels = np.full_like(p0, np.nan)
+                measurement.process(_pair_from_pixels(index * 33_000_000, nan_pixels, nan_pixels))
+            else:
+                measurement.process(_pair_from_pixels(index * 33_000_000, p0, p1))
+
+        window = (
+            measurement.config.baseline_last_frame
+            - measurement.config.baseline_first_frame
+            + 1
+        )
+        assert measurement._baseline_samples == window - len(skipped), (
+            "欠測フレームが基準値のサンプル数に数えられている"
+        )
+
+    def test_cycle_axis_follows_the_configuration(self):
+        """既存の RT_CYCLE_AXIS と同じく、既定は y 軸であること。"""
+        assert MeasurementConfig().cycle_axis == "y"
+        assert MeasurementConfig().cycle_axis_index == 1
+        assert MeasurementConfig(cycle_axis="z").cycle_axis_index == 2
+
+    def test_history_is_bounded(self):
+        """長時間の計測でメモリを食い潰さないこと。"""
+        measurement = _measurement()
+        measurement.config.history_limit = 20
+        truth = _body_points(0.0)
+        p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
+
+        for index in range(200):
+            measurement.process(_pair_from_pixels(index * 33_000_000, p0, p1))
+
+        assert len(measurement.results) <= 20
+        assert len(measurement._recent_points) <= 2
+        for entries in measurement.storage.storage.values():
+            assert len(entries) <= 2, "部位データが際限なく溜まっている"
 
     def test_reports_cycle_count_and_latest_impulses(self):
         measurement = _measurement()
         assert measurement.cycle_count == 0
-        assert set(measurement.latest_impulses) == {
+        assert set(measurement.latest_cycle_work) == {
             "wrist_R", "elbow_R", "shoulder_R", "wrist_L", "elbow_L", "shoulder_L",
         }
