@@ -114,7 +114,22 @@ def _compute_angles(pose_df: pd.DataFrame, side: Dict[str, int]) -> Tuple[np.nda
     elbow_angle = _angle_about_y(v1, v2)
     forearm = v2
     wrist_angle = _angle_from_xz_plane(forearm)
-    return elbow_angle, wrist_angle
+    # 両者とも arctan2 なので値域は ±π。折り返しをそのまま微分すると
+    # 1 回につき 2π/dt = 188 rad/s のスパイクが立つ。仕事量は max(τω, 0) と
+    # 正側だけを拾う（整流する）ので、符号がランダムなスパイクでも必ず加算される。
+    # 実データには 1 試技あたり中央 29 回の折り返しがあった。
+    return np.unwrap(elbow_angle), np.unwrap(wrist_angle)
+
+
+def _compute_omega(pose_df: pd.DataFrame, side: Dict[str, int], dt: float) -> Tuple[np.ndarray, np.ndarray]:
+    """肘と手首の角速度 [rad/s] を返す。
+
+    ``_gradient`` は ``np.gradient(series, dt)`` で第 2 引数がサンプル間隔なので、
+    戻り値は既に rad/s。**ここで fps を掛け戻してはいけない**（KNOWN_ISSUES §1-1）。
+    かつて掛けており ω が一律 30 倍になっていた。
+    """
+    elbow_angle, wrist_angle = _compute_angles(pose_df, side)
+    return _gradient(elbow_angle, dt), _gradient(wrist_angle, dt)
 
 
 def _aggregate_cycles(frame_idx: np.ndarray, power: np.ndarray, cycle_index: np.ndarray, dt: float) -> pd.DataFrame:
@@ -227,9 +242,7 @@ def main() -> int:
                         col = f"joint_{idx}_{ax}"
                         if col in pose_scaled.columns:
                             pose_scaled[col] = pose_scaled[col].to_numpy(float) * pos_scale
-            elbow_angle, wrist_angle = _compute_angles(pose_scaled, side)
-            elbow_omega = _gradient(elbow_angle, dt) * (args.fps if args.fps > 0 else DEFAULT_FPS)
-            wrist_omega = _gradient(wrist_angle, dt) * (args.fps if args.fps > 0 else DEFAULT_FPS)
+            elbow_omega, wrist_omega = _compute_omega(pose_scaled, side, dt)
 
             # align to torque frames
             n = min(len(torque_df), len(pose_df))

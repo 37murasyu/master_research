@@ -325,7 +325,10 @@ def build_side_inverse_inputs(
         length = max(length, 1e-4)
         mass = body_mass * seg.mass_fraction
         masses[idx] = mass
-        inertia_tensors[idx] = calculate_inertia_tensor(seg.inertia_row, mass, length)
+        # 回帰式 I = a*w + b*l + c（utils_dynamic.py:50）の w は全身体重であって
+        # 部位質量ではない。部位質量を渡すと a*w の項が小さすぎ、定数項 c が
+        # 効いて対角成分が負になる（前腕は全軸で負になっていた）。
+        inertia_tensors[idx] = calculate_inertia_tensor(seg.inertia_row, body_mass, length)
     ddpg = com_acc
     return inertia_tensors, masses, omegas, domegas, ddpg, com_pos, joint_pos, link_vec
 def _broadcast_vector(value: Optional[np.ndarray], length: int, name: str) -> Optional[np.ndarray]:
