@@ -70,16 +70,29 @@ def _body_points(t: float) -> np.ndarray:
 
     被写体まで 250cm、上肢の振幅 10cm、押し出し周期 1.2Hz。
     奥行きも 15cm ほど前後させる（車椅子駆動では体幹が前後する）。
+
+    索引はランドマーク ID の昇順（[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首
+    [5]右手首 [6]左腰 [7]右腰 [8]左膝 [9]右膝 [10]左足首 [11]右足首）。
+    等間隔に並べるとリンク長が解剖学的にあり得ない値になり、慣性回帰式が
+    適用範囲外に落ちてフォールバック警告が出る。実寸に近い配置にしてある。
     """
     phase = 2 * np.pi * 1.2 * t
-    points = []
-    for index in range(12):
-        base_x = -30.0 + 6.0 * index
-        base_y = -20.0 + 3.0 * index
-        swing = 10.0 * np.sin(phase) if index < 6 else 0.0
-        depth = 250.0 + 15.0 * np.sin(phase)
-        points.append([base_x + swing, base_y, depth])
-    return np.array(points, dtype=np.float64)
+    swing = 10.0 * np.sin(phase)     # 上肢の押し出し
+    depth = 250.0 + 15.0 * np.sin(phase)
+    points = np.zeros((12, 3), dtype=np.float64)
+    points[0] = [-18.0 + swing, -30.0, depth]   # 左肩
+    points[1] = [18.0 + swing, -30.0, depth]    # 右肩
+    points[2] = [-22.0 + swing, -6.0, depth]    # 左肘（上腕 約 24cm）
+    points[3] = [22.0 + swing, -6.0, depth]     # 右肘
+    points[4] = [-25.0 + swing, 15.0, depth]    # 左手首（前腕 約 21cm）
+    points[5] = [25.0 + swing, 15.0, depth]     # 右手首
+    points[6] = [-12.0, 20.0, depth]            # 左腰
+    points[7] = [12.0, 20.0, depth]             # 右腰
+    points[8] = [-12.0, 60.0, depth]            # 左膝（大腿 40cm）
+    points[9] = [12.0, 60.0, depth]             # 右膝
+    points[10] = [-12.0, 100.0, depth]          # 左足首（下腿 40cm）
+    points[11] = [12.0, 100.0, depth]           # 右足首
+    return points
 
 
 def _measurement() -> NetworkMeasurement:

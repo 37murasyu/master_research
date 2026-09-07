@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from config import THEORETICAL_WORK_COEFF
 
 G = 9.81
 FOREARM_MASS_FRAC = 0.0160
@@ -125,7 +126,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cyc = cyc[:n]
 
     m_x = args.body_mass * float(args.mass_frac)
-    theor = (m_x * r_g + args.dumbbell_mass * r_x) * 16.73
+    # 係数は config に集約（再検算 R-5）
+    theor = (m_x * r_g + args.dumbbell_mass * r_x) * THEORETICAL_WORK_COEFF
 
     skip = set(int(x) for x in args.skip_cycles)
 

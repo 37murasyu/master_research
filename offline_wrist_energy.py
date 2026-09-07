@@ -31,18 +31,21 @@ from typing import Dict, Tuple
 
 import numpy as np
 
-# Reuse constants / helper formulas (duplicated minimal subset to avoid heavy import of main)
-CONST_K = math.sqrt(3)/2 + 1.0
-G = 9.80665
+# 定数は config が正本。かつてここに CONST_K = √3/2+1、G = 9.80665、
+# 等価質量係数 0.615 / 0.589 を「重い import を避けるため」と写していたが、
+# master_research_code.py 側は √3/2+1 と 0.026+0.276+0.19+0.123 の和で持っており、
+# さらに compute_cycle_energy_elbow_wrist.py ほかは 16.73 =(√2/2+1)×9.8 だった。
+# 三者が食い違ったまま二重管理されていた（再検算 R-5）。
+from config import EFFECTIVE_MASS_BY_JOINT, G_SCALAR, WORK_INTEGRAL_K  # noqa: E402
 
-# ---- Minimal m1 per part (copied logic) ----
-# (coefficients from existing code: wrist: upper_arm(0.026)+upper_limb(0.276+0.19)+thigh(0.123)=0.615,
-#  elbow: upper_limb(0.276+0.19)+thigh(0.123)=0.589 )
+CONST_K = WORK_INTEGRAL_K
+G = G_SCALAR
+
 _DEF_COEFFS = {
-    'wrist_R': 0.615,
-    'wrist_L': 0.615,
-    'elbow_R': 0.589,
-    'elbow_L': 0.589,
+    'wrist_R': EFFECTIVE_MASS_BY_JOINT['wrist'],
+    'wrist_L': EFFECTIVE_MASS_BY_JOINT['wrist'],
+    'elbow_R': EFFECTIVE_MASS_BY_JOINT['elbow'],
+    'elbow_L': EFFECTIVE_MASS_BY_JOINT['elbow'],
 }
 
 

@@ -5,6 +5,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from config import THEORETICAL_WORK_COEFF
 
 FOREARM_MASS_FRAC = 0.0160  # body mass fraction for forearm
 FOREARM_COM_FRAC = 0.430    # COM distance fraction from elbow toward wrist
@@ -57,7 +58,8 @@ def aggregate_cycles(frames: np.ndarray, power: np.ndarray, cycle_index: np.ndar
 
 
 def compute_theoretical_work(m_body: float, m_max: float, r_g: float, r_x: float, mass_frac: float = FOREARM_MASS_FRAC) -> float:
-    return (m_body * mass_frac * r_g + m_max * r_x) * 16.73
+    # 係数は config に集約（再検算 R-5）
+    return (m_body * mass_frac * r_g + m_max * r_x) * THEORETICAL_WORK_COEFF
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -149,7 +151,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         'm_max_weight': m_max,
         'mass_frac': float(args.mass_frac),
         'com_frac': float(args.com_frac),
-        'formula': '(m_x*r_g + m_maxweight*r_x)*16.73 with m_x = body_mass*mass_frac',
+        'formula': (f'(m_x*r_g + m_maxweight*r_x)*{THEORETICAL_WORK_COEFF:.4f}'
+                    ' with m_x = body_mass*mass_frac'),
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out_csv)), exist_ok=True)

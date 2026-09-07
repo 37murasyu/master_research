@@ -56,6 +56,8 @@ from config import (
     m4,
     part_calculations,
     INERTIA_LENGTH_FRAMES,
+    WORK_INTEGRAL_K,
+    EFFECTIVE_MASS_BY_JOINT,
 
     pose_keypoints,
     rm_path,
@@ -971,7 +973,10 @@ def _iso8601_utc_ms() -> str:
 ENABLE_AXES_DEBUG = False  # 特殊入力で True になる
 
 # ================= 追加: 部位別エネルギー閾値計算ユーティリティ =================
-CONST_K = (math.sqrt(3) / 2.0) + 1.0  # (√3 / 2 + 1)
+# 1 サイクルの角度範囲にわたる cos の積分。値と角度範囲は config に集約した。
+# かつてここは √3/2 + 1 = 1.8660、compute_cycle_energy_elbow_wrist.py ほかは
+# 16.73 =(√2/2 + 1)×9.8 = 1.7071×g と、9.3% 食い違ったまま二重管理されていた（再検算 R-5）。
+CONST_K = WORK_INTEGRAL_K
 
 def _compute_m1_per_part_from_bodymass(body_mass_kg: float) -> Dict[str, float]:
     """ユーザー要望の有効質量合算に基づく部位別 m1 を返す。
@@ -979,19 +984,21 @@ def _compute_m1_per_part_from_bodymass(body_mass_kg: float) -> Dict[str, float]:
     wrist: 上腕 0.026 + 上肢(0.276+0.19) + 太もも 0.123
     elbow: 上肢(0.276+0.19) + 太もも 0.123
     肩は仕様未定のため 0（必要なら拡張）。
+
+    係数は config.EFFECTIVE_MASS_BY_JOINT に集約。offline_wrist_energy.py が
+    和を潰した値（0.615 / 0.589）を別に直書きしており、片方だけ直すと
+    食い違う状態だった（再検算 R-5）。
     """
-    coeff_upper_arm = 0.026
-    coeff_upper_limb = 0.276 + 0.19
-    coeff_thigh = 0.123
-    m_wrist = body_mass_kg * (coeff_upper_arm + coeff_upper_limb + coeff_thigh)
-    m_elbow = body_mass_kg * (coeff_upper_limb + coeff_thigh)
+    m_wrist = body_mass_kg * EFFECTIVE_MASS_BY_JOINT['wrist']
+    m_elbow = body_mass_kg * EFFECTIVE_MASS_BY_JOINT['elbow']
+    m_shoulder = body_mass_kg * EFFECTIVE_MASS_BY_JOINT['shoulder']
     return {
         'wrist_R': m_wrist,
         'wrist_L': m_wrist,
         'elbow_R': m_elbow,
         'elbow_L': m_elbow,
-        'shoulder_R': 0.0,
-        'shoulder_L': 0.0,
+        'shoulder_R': m_shoulder,
+        'shoulder_L': m_shoulder,
     }
 
 def compute_energy_thresholds(m_max_part: Dict[str, float], m1_val: float | Dict[str, float], g_scalar: float, r_x_map: Dict[str, float]) -> Dict[str, Tuple[float, float]]:

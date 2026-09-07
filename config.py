@@ -216,3 +216,53 @@ part_calculations = {
 # 1 フレームの瞬時値だと三角測量の誤差がそのまま全実行に固定される。
 # 慣性回帰式 I = a*w + b*l + c は l に極端に敏感なので中央値で均す（再検算 R-6）。
 INERTIA_LENGTH_FRAMES = int(os.environ.get("INERTIA_LENGTH_FRAMES", "30"))
+
+
+# ===================== 理論仕事量の係数 =====================
+#
+# 1 サイクルの角度範囲にわたる cos θ の積分。∫_a^b cos θ dθ = sin(b) - sin(a)。
+# 値ではなく角度範囲で持つのは、論文の定義が変わったときに 1 箇所で追随できるようにするため。
+#
+#   -90°〜45° → sin(45°) - sin(-90°) = √2/2 + 1 = 1.7071
+#   -90°〜60° → sin(60°) - sin(-90°) = √3/2 + 1 = 1.8660
+#
+# 2026-09-08 以前は 2 系統が併存していた（再検算 R-5）:
+#   - master_research_code.py と offline_wrist_energy.py が √3/2 + 1 = 1.8660
+#   - compute_cycle_energy_elbow_wrist.py ほか 3 箇所が 16.73 = (√2/2 + 1) × 9.8
+# 9.3% 食い違ったまま二重管理されていた。
+#
+# **-90°〜45° に統一した。** 根拠は 力学計算_検証結果.md の C 節が 16.73 を
+# 「導出も値も正しい」と検算しており、論文のスコアもこの系統で算出されているため。
+# 論文本文の定義が -90°〜60° だと判明した場合は下の 1 行だけを直すこと。
+WORK_ANGLE_RANGE_DEG = (-90.0, 45.0)
+WORK_INTEGRAL_K = float(
+    np.sin(np.radians(WORK_ANGLE_RANGE_DEG[1])) - np.sin(np.radians(WORK_ANGLE_RANGE_DEG[0]))
+)
+
+# 重力加速度の大きさ。g（ベクトル）と食い違わせないためここから引く。
+# かつては config.g=9.81 / offline_wrist_energy.G=9.80665 / 16.73 に内包された 9.8 の
+# 3 つが併存していた。
+G_SCALAR = float(np.linalg.norm(g))
+
+# 理論仕事量 W = (m_x·r_g + m_max·r_x) × THEORETICAL_WORK_COEFF。
+# 従来 16.73 と直書きされていた値に相当する（16.73 は g=9.8 を内包していたので
+# G_SCALAR=9.81 に揃えた分だけ 0.1% 増える）。
+THEORETICAL_WORK_COEFF = WORK_INTEGRAL_K * G_SCALAR
+
+# 部位別の等価質量係数（体重に対する比）。
+# wrist: 上腕 0.026 + 上肢 (0.276 + 0.19) + 太もも 0.123
+# elbow: 上肢 (0.276 + 0.19) + 太もも 0.123
+# master_research_code.py が和を組み立て、offline_wrist_energy.py が潰した値を
+# 直書きしており、片方だけ直すと食い違う状態だった。
+EFFECTIVE_MASS_COEFFS = {
+    "upper_arm": 0.026,
+    "upper_limb": 0.276 + 0.19,
+    "thigh": 0.123,
+}
+EFFECTIVE_MASS_BY_JOINT = {
+    "wrist": (EFFECTIVE_MASS_COEFFS["upper_arm"]
+              + EFFECTIVE_MASS_COEFFS["upper_limb"]
+              + EFFECTIVE_MASS_COEFFS["thigh"]),
+    "elbow": EFFECTIVE_MASS_COEFFS["upper_limb"] + EFFECTIVE_MASS_COEFFS["thigh"],
+    "shoulder": 0.0,   # 仕様未定
+}

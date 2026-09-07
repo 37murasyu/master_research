@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,6 +11,22 @@ from config import w, folder_path
 
 # Small numeric epsilon for numerical stability
 EPS = 1e-12
+
+# 慣性回帰式の行番号 → 体重に対する部位質量比。
+# 回帰式が適用範囲外で負を返したときに、一様棒近似 m*L^2/12 へ落とすために使う。
+# 胴体の 0.276 / 0.19 は utils_dynamic.calculate_M_and_F と
+# master_research_code.py の肩の質量配分で既に使われている値に合わせた。
+_SEGMENT_MASS_FRACTION = {
+    0: 0.19,     # 下胴体
+    1: 0.276,    # 上胴体
+    2: 0.081,    # 頭部
+    3: 0.0227,   # 上腕（config.m1 と同じ）
+    4: 0.0160,   # 前腕（config.m2 と同じ）
+    5: 0.0060,   # 手（config.m3 と同じ）
+    6: 0.1100,   # 大腿（config.m4 と同じ）
+    7: 0.0465,   # 下腿
+    8: 0.0145,   # 足
+}
 
 
 def calculate_inertia_tensor(k, mass, l):
@@ -50,12 +67,40 @@ def calculate_inertia_tensor(k, mass, l):
     coeffs = np.array([row.iloc[i] for i in range(1, 10)], dtype=np.float64)
     coeffs *= 1e-4  # CSV values are in units of 1e-4 kg*m^2
     ax, bx, cx, ay, by, cy, az, bz, cz = coeffs
-    I_tensor = np.diag([
+    diag = np.array([
         ax * mass + bx * l + cx,
         ay * mass + by * l + cy,
         az * mass + bz * l + cz,
-    ])
-    return I_tensor
+    ], dtype=np.float64)
+
+    # 回帰式の適用範囲外だと対角成分が負になる。定数項 c が b*l とほぼ相殺する
+    # 領域があるため、リンクが短いと符号が反転する。体重 60 kg のとき正になる
+    # 最小リンク長は 上腕 0.205 / 前腕 0.168 / 大腿 0.249 / 下腿 0.283 m で、
+    # 実測の下腿 0.232 m は範囲外に落ちる（再検算 R-7）。
+    # 負の慣性テンソルは物理的にあり得ないので、黙って返さず一様棒近似に落とす。
+    if np.any(diag <= 0.0):
+        fraction = _SEGMENT_MASS_FRACTION.get(int(k))
+        if fraction is not None and l > 0:
+            segment_mass = float(mass) * fraction
+            fallback = segment_mass * l * l / 12.0
+            warnings.warn(
+                f"慣性回帰式が行 {k}（w={mass:.1f}, l={l:.3f} m）で負の対角 {diag} を"
+                f" 返した。適用範囲外なので一様棒近似 m*L^2/12 = {fallback:.6f}"
+                f"（部位質量 {segment_mass:.3f} kg）にフォールバックする。",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            diag = np.full(3, fallback, dtype=np.float64)
+        else:
+            warnings.warn(
+                f"慣性回帰式が行 {k}（w={mass:.1f}, l={l:.3f} m）で負の対角 {diag} を"
+                f" 返したが、フォールバックに使う質量比が未定義。0 にクリップする。",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            diag = np.clip(diag, 0.0, None)
+
+    return np.diag(diag)
 
 
 def skew_symmetric_matrix(v):

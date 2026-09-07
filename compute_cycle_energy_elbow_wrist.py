@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+from config import THEORETICAL_WORK_COEFF
 
 FOREARM_MASS_FRAC = 0.0160
 HAND_MASS_FRAC = 0.0060
@@ -153,7 +154,9 @@ def _aggregate_cycles(frame_idx: np.ndarray, power: np.ndarray, cycle_index: np.
 
 
 def _theoretical_work(m_x: float, m_db: float, r_g: float, r_x: float) -> float:
-    return (m_x * r_g + m_db * r_x) * 16.73
+    # 係数は config に集約（1 サイクルの角度範囲にわたる cos の積分 × g）。
+    # かつて 16.73 と直書きされており、ゲージ閾値側の √3/2+1 と 9.3% 食い違っていた。
+    return (m_x * r_g + m_db * r_x) * THEORETICAL_WORK_COEFF
 
 
 def _load_mmax(mmax_df: pd.DataFrame, subject_id: int, col: str) -> float:

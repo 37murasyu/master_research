@@ -420,3 +420,108 @@ class TestInertiaLengthFromMedian:
         assert not np.allclose(good, bad, rtol=0.1), (
             "外れ値のリンク長でも慣性テンソルが変わらない。テストの前提が崩れている"
         )
+
+
+class TestTheoreticalWorkCoefficient:
+    """R-5 理論仕事量の係数。2 系統で 9.3% 食い違っていたのを一本化した。"""
+
+    def test_integral_matches_the_declared_angle_range(self):
+        """係数は宣言した角度範囲の cos の積分そのもの。"""
+        from config import WORK_ANGLE_RANGE_DEG, WORK_INTEGRAL_K
+
+        low, high = np.radians(WORK_ANGLE_RANGE_DEG)
+        assert WORK_INTEGRAL_K == pytest.approx(np.sin(high) - np.sin(low), rel=1e-12), (
+            "係数が角度範囲から導かれていない"
+        )
+
+    def test_the_chosen_range_gives_the_verified_value(self):
+        """-90°〜45° を採ったので √2/2 + 1 になる。"""
+        from config import WORK_INTEGRAL_K
+
+        assert WORK_INTEGRAL_K == pytest.approx(np.sqrt(2) / 2 + 1, rel=1e-12), (
+            "係数が √2/2 + 1 から外れた。角度範囲を変えたなら"
+            " 力学計算_検証結果.md の C 節と突き合わせること"
+        )
+        assert WORK_INTEGRAL_K != pytest.approx(np.sqrt(3) / 2 + 1, rel=1e-3), (
+            "係数が √3/2 + 1 に戻っている（旧ゲージ閾値側の値）"
+        )
+
+    def test_coefficient_is_close_to_the_legacy_hardcoded_value(self):
+        """従来の直書き 16.73 とほぼ一致する（g の桁を揃えた分だけ差が出る）。"""
+        from config import THEORETICAL_WORK_COEFF
+
+        assert THEORETICAL_WORK_COEFF == pytest.approx(16.73, rel=0.005), (
+            f"係数が 16.73 から 0.5% 以上ずれた（実測 {THEORETICAL_WORK_COEFF:.4f}）"
+        )
+
+    def test_offline_and_realtime_agree(self):
+        """ゲージ閾値側（CONST_K）と仕事量側（16.73 相当）が同じ積分係数を指す。"""
+        import offline_wrist_energy
+        from config import G_SCALAR, THEORETICAL_WORK_COEFF, WORK_INTEGRAL_K
+
+        assert offline_wrist_energy.CONST_K == pytest.approx(WORK_INTEGRAL_K), (
+            "offline_wrist_energy の CONST_K が config と食い違っている"
+        )
+        assert offline_wrist_energy.G == pytest.approx(G_SCALAR), (
+            "重力加速度が config と食い違っている"
+        )
+        assert THEORETICAL_WORK_COEFF == pytest.approx(WORK_INTEGRAL_K * G_SCALAR), (
+            "仕事量の係数が 積分係数 × g になっていない"
+        )
+
+    def test_effective_mass_coefficients_are_shared(self):
+        """等価質量係数も 1 箇所で持つ。"""
+        import offline_wrist_energy
+        from config import EFFECTIVE_MASS_BY_JOINT
+
+        assert offline_wrist_energy._DEF_COEFFS["wrist_R"] == pytest.approx(
+            EFFECTIVE_MASS_BY_JOINT["wrist"]), "手首の等価質量係数が食い違っている"
+        assert offline_wrist_energy._DEF_COEFFS["elbow_R"] == pytest.approx(
+            EFFECTIVE_MASS_BY_JOINT["elbow"]), "肘の等価質量係数が食い違っている"
+
+
+class TestInertiaRegressionGuard:
+    """R-7 回帰式が適用範囲外で負を返したときのガード。"""
+
+    def test_valid_range_is_untouched(self):
+        """範囲内では警告も変更も起きない。"""
+        import warnings
+
+        from utils_dynamic import calculate_inertia_tensor
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            diag = np.diag(calculate_inertia_tensor(4, 60.0, 0.205))   # 前腕
+        assert not caught, f"正常な入力で警告が出た: {[str(c.message) for c in caught]}"
+        assert np.all(diag > 0), f"正常な入力で負の対角が出た: {diag}"
+
+    def test_out_of_range_falls_back_to_a_uniform_rod(self):
+        """範囲外では警告して一様棒近似に落ちる。"""
+        import warnings
+
+        from utils_dynamic import calculate_inertia_tensor
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            diag = np.diag(calculate_inertia_tensor(7, 60.0, 0.232))   # 下腿、範囲外
+        assert caught, "範囲外なのに警告が出なかった"
+        assert np.all(diag > 0), f"フォールバック後も負が残っている: {diag}"
+        want = 60.0 * 0.0465 * 0.232 ** 2 / 12.0
+        assert diag[0] == pytest.approx(want, rel=1e-9), (
+            f"一様棒 m*L^2/12 = {want:.6f} になっていない（実測 {diag[0]:.6f}）"
+        )
+
+    def test_never_returns_a_negative_diagonal(self):
+        """どの部位・どの長さでも負を返さない。"""
+        import warnings
+
+        from utils_dynamic import calculate_inertia_tensor
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for row in range(9):
+                for length in (0.05, 0.15, 0.25, 0.40, 0.60):
+                    diag = np.diag(calculate_inertia_tensor(row, 60.0, length))
+                    assert np.all(diag >= 0), (
+                        f"行 {row}, L={length} で負の対角: {diag}"
+                    )
