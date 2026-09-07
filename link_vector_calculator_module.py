@@ -21,7 +21,8 @@ class LinkVectorCalculator:
         velocity_vector (np.ndarray | None): 現在の速度ベクトル。
         relative_position_vector (np.ndarray | None): 現在のリンクの相対位置ベクトル。
         angular_velocity (np.ndarray | None): 現在の角速度ベクトル。
-        centroid (np.ndarray | None): 始点と終点の中間点（重心）。
+        com_fraction (float): 重心比。近位端(end)から遠位端(start)へ測った比。既定 0.5。
+        centroid (np.ndarray | None): 重心。``p_end + com_fraction * (p_start - p_end)``。
         centroid_velocity (np.ndarray | None): 重心の速度。
         previous_centroid (np.ndarray | None): 直前フレームの重心。
         previous_centroid_velocity (np.ndarray | None): 直前フレームの重心速度。
@@ -30,9 +31,14 @@ class LinkVectorCalculator:
         angular_acceleration (np.ndarray | None): 現在の角加速度ベクトル。
     """
 
-    def __init__(self, index_start, index_end):
+    def __init__(self, index_start, index_end, com_fraction=0.5):
         self.index_start = index_start
         self.index_end = index_end
+        # 重心比。近位端（end 側）から遠位端（start 側）へ測った比。
+        # 0.5 なら両端の中点で、2026-09-08 以前の挙動と一致する。
+        # 実測の比は上腕 0.436・前腕 0.430 で、中点だと重力モーメント腕が
+        # それぞれ +14.7%・+16.3% 過大になる（再検算 R-4）。
+        self.com_fraction = float(com_fraction)
         self.dt = None
         self.previous_relative_position_vector = None
         self.previous_velocity_vector = None
@@ -77,15 +83,15 @@ class LinkVectorCalculator:
             self.previous_relative_position_vector = (
                 prev[self.index_end] - prev[self.index_start]
             )
-        # 重心座標を計算
-        self.centroid = (
-            current_position[self.index_end] + current_position[self.index_start]
-        ) / 2
+        # 重心座標を計算。近位端（end）から com_fraction だけ遠位端（start）寄り。
+        self.centroid = current_position[self.index_end] + self.com_fraction * (
+            current_position[self.index_start] - current_position[self.index_end]
+        )
         if self.previous_centroid is None and datFile_mode == 1:
             prev = keypoints_list[i - 1]
-            self.previous_centroid = (
-                prev[self.index_end] + prev[self.index_start]
-            ) / 2
+            self.previous_centroid = prev[self.index_end] + self.com_fraction * (
+                prev[self.index_start] - prev[self.index_end]
+            )
         # print("centroid",self.centroid)
         # 速度ベクトルの計算
         self.velocity_vector = (

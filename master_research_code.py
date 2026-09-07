@@ -54,6 +54,8 @@ from config import (
     m1,
     m2,
     m4,
+    part_calculations,
+    INERTIA_LENGTH_FRAMES,
 
     pose_keypoints,
     rm_path,
@@ -1651,19 +1653,11 @@ I1 = I2 = I3 = I4 = I5 = I6 = I7 = None
 
 storage = BodyPartDataStorage()
 # 部位ごとの計算設定を辞書に格納
-part_calculations = {
-    "upper_arm_R": {"start": 3, "end": 1},
-    "forearm_R": {"start": 5, "end": 3},
-    "both_shoulder": {"start": 0, "end": 1},
-    "both_hip": {"start": 6, "end": 7},
-    "up_arm_l": {"start": 2, "end": 0},
-    "forearm_L": {"start": 4, "end": 2},
-    "upper_Leg_R": {"start": 7, "end": 9},
-    "upper_Leg_L": {"start": 6, "end": 8},
-}
+# リンク定義（part_calculations）は config.py に集約した。重心比とセットで
+# 持たせるため、および app/runners/network_measure.py と定義を 1 つにするため。
 # LinkVectorCalculatorのインスタンスを辞書に保持
 calculators = {
-    part: LinkVectorCalculator(s["start"], s["end"])
+    part: LinkVectorCalculator(s["start"], s["end"], s.get("com_fraction", 0.5))
     for part, s in part_calculations.items()
 }
 print("Calculators created")
@@ -3414,30 +3408,40 @@ while True:
         lens = {k: (len(v) if isinstance(v, list) else (0 if v is None else 'n/a')) for k, v in part_data.items()}
         print(f"[DBG] frame {WHILE_COUNT}: part_data lengths {lens}")
 
-    if len(kpts_3d) < 4:
-        if len(kpts_3d) == 3:
-            I1 = calculate_inertia_tensor(
-                3, w, np.linalg.norm(transformed_p3ds[0] - transformed_p3ds[2])
-            )  # 上腕
-            I2 = calculate_inertia_tensor(
-                4, w, np.linalg.norm(transformed_p3ds[2] - transformed_p3ds[4])
-            )  # 前腕
-            len_half_body = 0.25 * np.linalg.norm(
-                transformed_p3ds[0]
-                + transformed_p3ds[1]
-                - transformed_p3ds[7]
-                - transformed_p3ds[6]
-            )
-            I3 = calculate_inertia_tensor(1, w, len_half_body)  # 上胴体
-            I4 = calculate_inertia_tensor(0, w, len_half_body)  # 下胴体
-            I5 = calculate_inertia_tensor(
-                6, w, np.linalg.norm(transformed_p3ds[9] - transformed_p3ds[7])
-            )  # 太もも
-            I6 = calculate_inertia_tensor(
-                7, w, np.linalg.norm(transformed_p3ds[11] - transformed_p3ds[9])
-            )  # 前足
-            I7 = calculate_inertia_tensor(2, w, 0.25)  # 頭
-        continue
+    # 慣性テンソルは体格で決まるので一度だけ確定させる。リンク長は先頭
+    # INERTIA_LENGTH_FRAMES フレームの**中央値**を使う。かつては 3 フレーム目の
+    # 瞬時値で決めており、その瞬間の三角測量誤差が全実行に固定されていた
+    # （kpts_3d は毎フレーム append される無制限リストなので、len==3 は一度しか
+    # 通らない）。回帰式 I = a*w + b*l + c は l に極端に敏感で、前腕では
+    # L が 0.19→0.30 m で I_xx が 6 倍変わる（再検算 R-6）。
+    #
+    # 索引は pose_keypoints をランドマーク ID の昇順に並べたときの位置。
+    if I1 is None:
+        if len(kpts_3d) < INERTIA_LENGTH_FRAMES:
+            continue
+        _lead = np.stack(kpts_3d[:INERTIA_LENGTH_FRAMES])
+
+        def _median_span(a, b):
+            return float(np.nanmedian(np.linalg.norm(_lead[:, a] - _lead[:, b], axis=1)))
+
+        _len_upper_arm = _median_span(0, 2)   # 左肩 → 左肘
+        _len_forearm = _median_span(2, 4)     # 左肘 → 左手首
+        _len_thigh = _median_span(7, 9)       # 右腰 → 右膝
+        _len_shank = _median_span(9, 11)      # 右膝 → 右足首
+        len_half_body = 0.25 * float(np.nanmedian(np.linalg.norm(
+            _lead[:, 0] + _lead[:, 1] - _lead[:, 7] - _lead[:, 6], axis=1)))
+
+        I1 = calculate_inertia_tensor(3, w, _len_upper_arm)  # 上腕
+        I2 = calculate_inertia_tensor(4, w, _len_forearm)    # 前腕
+        I3 = calculate_inertia_tensor(1, w, len_half_body)   # 上胴体
+        I4 = calculate_inertia_tensor(0, w, len_half_body)   # 下胴体
+        I5 = calculate_inertia_tensor(6, w, _len_thigh)      # 太もも
+        I6 = calculate_inertia_tensor(7, w, _len_shank)      # 下腿
+        I7 = calculate_inertia_tensor(2, w, 0.25)            # 頭
+        print(f"[INERTIA] リンク長を {INERTIA_LENGTH_FRAMES} フレームの中央値で確定: "
+              f"上腕={_len_upper_arm:.3f} 前腕={_len_forearm:.3f} "
+              f"胴体半長={len_half_body:.3f} 大腿={_len_thigh:.3f} "
+              f"下腿={_len_shank:.3f} [m]")
 
     # 計算とデータの格納をループで行う
     if len(kpts_3d) < 7:

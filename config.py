@@ -173,3 +173,46 @@ min_history_len = 3  # ガード用
 detector = None  # 既に初期化済みと仮定
 gauge = None
 current_impulses = {}
+
+
+# ===================== 体節の重心比とリンク定義 =====================
+#
+# 重心比は「近位端からの距離 / リンク長」。Winter, *Biomechanics and Motor Control
+# of Human Movement* の体節パラメータ表に基づく。リポジトリ内に同じ値が
+# compute_torque_from_pose.py・compute_cycle_energy_elbow_wrist.py・
+# inverse_dynamics_two_link.py・compute_elbow_cycle_work.py と散在していたのを
+# ここに集約した（再検算 H-9）。
+COM_FRACTIONS = {
+    "upper_arm": 0.436,
+    "forearm": 0.430,
+    "hand": 0.506,
+    "thigh": 0.433,   # 出典要確認。上 3 つと違い、リポジトリ内に既存値が無かった
+}
+
+# リンク定義。索引は pose_keypoints をランドマーク ID の昇順に並べたときの位置
+# （[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首 [6]左腰 [7]右腰
+#   [8]左膝 [9]右膝 [10]左足首 [11]右足首）。
+#
+# start/end は **遠位 → 近位** の向きで書かれている（例: upper_arm_R は肘→肩）。
+# したがって重心は end 側（近位端）から測る:
+#     centroid = p_end + com_fraction * (p_start - p_end)
+# com_fraction = 0.5 なら両端の中点になり、2026-09-08 以前の挙動と一致する。
+#
+# both_shoulder / both_hip は体節ではなく「両肩の中点」「両腰の中点」であり、
+# r_g の組み立て側（master_research_code.py の r_g_R）が肩:腰 = 3:1 の重み付けで
+# 上胴体・下胴体の重心を作る。したがってここは 0.5 のままにする。
+part_calculations = {
+    "upper_arm_R": {"start": 3, "end": 1, "com_fraction": COM_FRACTIONS["upper_arm"]},
+    "forearm_R": {"start": 5, "end": 3, "com_fraction": COM_FRACTIONS["forearm"]},
+    "both_shoulder": {"start": 0, "end": 1, "com_fraction": 0.5},
+    "both_hip": {"start": 6, "end": 7, "com_fraction": 0.5},
+    "up_arm_l": {"start": 2, "end": 0, "com_fraction": COM_FRACTIONS["upper_arm"]},
+    "forearm_L": {"start": 4, "end": 2, "com_fraction": COM_FRACTIONS["forearm"]},
+    "upper_Leg_R": {"start": 7, "end": 9, "com_fraction": COM_FRACTIONS["thigh"]},
+    "upper_Leg_L": {"start": 6, "end": 8, "com_fraction": COM_FRACTIONS["thigh"]},
+}
+
+# 慣性テンソルのリンク長を決めるのに使うフレーム数。
+# 1 フレームの瞬時値だと三角測量の誤差がそのまま全実行に固定される。
+# 慣性回帰式 I = a*w + b*l + c は l に極端に敏感なので中央値で均す（再検算 R-6）。
+INERTIA_LENGTH_FRAMES = int(os.environ.get("INERTIA_LENGTH_FRAMES", "30"))

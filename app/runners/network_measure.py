@@ -48,7 +48,9 @@ import numpy as np
 from body_part_storage_module import BodyPartDataStorage
 # 部位キーと重力は config.py が持っている。utils 経由で既に読み込まれているので
 # 追加コストなしで再利用できる。
+from config import INERTIA_LENGTH_FRAMES
 from config import g as GRAVITY
+from config import part_calculations
 from config import part_keys as _PART_KEYS
 from link_vector_calculator_module import LinkVectorCalculator
 from utils import PushCycleDetector, compute_local_torque
@@ -64,16 +66,10 @@ from app.net.sync_buffer import PairedSample
 __all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig"]
 
 
-# 既存 master_research_code.py の part_calculations と同じ
+# リンク定義は config.part_calculations が正本（USB 経路と共通）。
+# ここでは (start, end) のタプル形式に落として使う。
 PART_LINKS: dict[str, tuple[int, int]] = {
-    "upper_arm_R": (3, 1),
-    "forearm_R": (5, 3),
-    "both_shoulder": (0, 1),
-    "both_hip": (6, 7),
-    "up_arm_l": (2, 0),
-    "forearm_L": (4, 2),
-    "upper_Leg_R": (7, 9),
-    "upper_Leg_L": (6, 8),
+    name: (spec["start"], spec["end"]) for name, spec in part_calculations.items()
 }
 
 # 局所トルクの基準リンク（既存の links 辞書と同じ）。
@@ -122,8 +118,10 @@ class MeasurementConfig:
     body_mass_kg: float = 60.0
 
     # 慣性テンソルを確定させるまでに必要なフレーム数（既存と同じ）
-    inertia_ready_frames: int = 3
-    dynamics_ready_frames: int = 7
+    # 慣性テンソルのリンク長を確定するまでに溜めるフレーム数。
+    # 1 フレームの瞬時値だとその瞬間の三角測量誤差が全実行に固定される（再検算 R-6）。
+    inertia_ready_frames: int = INERTIA_LENGTH_FRAMES
+    dynamics_ready_frames: int = max(7, INERTIA_LENGTH_FRAMES)
 
     # サイクル検出の基準値を作るフレーム範囲（既存と同じ 5..14）
     baseline_first_frame: int = 5
@@ -182,7 +180,9 @@ class NetworkMeasurement:
 
         self.storage = BodyPartDataStorage()
         self.calculators = {
-            part: LinkVectorCalculator(start, end) for part, (start, end) in PART_LINKS.items()
+            part: LinkVectorCalculator(
+                spec["start"], spec["end"], spec.get("com_fraction", 0.5))
+            for part, spec in part_calculations.items()
         }
 
         # 直近 2 フレームだけ持つ。物理計算はそれ以上遡らない。
@@ -191,6 +191,7 @@ class NetworkMeasurement:
         self._prev_t_ns: int | None = None
 
         self._inertia: dict[str, np.ndarray] = {}
+        self._inertia_samples: list[np.ndarray] = []
 
         # サイクル検出
         self._baseline_sum = 0.0
@@ -220,8 +221,11 @@ class NetworkMeasurement:
 
         result = FrameResult(t_ns=pair.t_ns, points_3d=points)
 
-        if self.frame_index + 1 == self.config.inertia_ready_frames:
-            self._build_inertia(points)
+        if not self._inertia:
+            self._inertia_samples.append(points)
+            if len(self._inertia_samples) >= self.config.inertia_ready_frames:
+                self._build_inertia(np.stack(self._inertia_samples))
+                self._inertia_samples = []
 
         if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
             torques = self._compute_local_torques(points)
@@ -315,14 +319,21 @@ class NetworkMeasurement:
             negative_down=config.cycle_negative_down,
         )
 
-    def _build_inertia(self, points: np.ndarray) -> None:
-        """慣性テンソルを確定させる。部位行と引数は既存と同じ。"""
+    def _build_inertia(self, samples: np.ndarray) -> None:
+        """慣性テンソルを確定させる。部位行と引数は既存と同じ。
+
+        ``samples`` は (フレーム, 関節, 3) の点列。リンク長は**中央値**で決める。
+        1 フレームの瞬時値だと三角測量の誤差がそのまま固定され、回帰式
+        ``I = a*w + b*l + c`` は l に極端に敏感なので大きくずれる（再検算 R-6）。
+        索引は pose_keypoints をランドマーク ID の昇順に並べたときの位置。
+        """
         mass = self.config.body_mass_kg
 
         def length(a: int, b: int) -> float:
-            return float(np.linalg.norm(points[a] - points[b]))
+            return float(np.nanmedian(np.linalg.norm(samples[:, a] - samples[:, b], axis=1)))
 
-        half_body = 0.25 * float(np.linalg.norm(points[0] + points[1] - points[7] - points[6]))
+        half_body = 0.25 * float(np.nanmedian(np.linalg.norm(
+            samples[:, 0] + samples[:, 1] - samples[:, 7] - samples[:, 6], axis=1)))
 
         self._inertia = {
             "upper_arm": calculate_inertia_tensor(3, mass, length(0, 2)),

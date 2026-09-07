@@ -152,9 +152,10 @@ EXPECTED_SPAN = {
 }
 
 
-def _usb_links() -> dict[str, tuple[int, int]]:
-    raw = _load_from_script("part_calculations", "assign")
-    return {k: (v["start"], v["end"]) for k, v in raw.items()}
+def _config_links() -> dict[str, tuple[int, int]]:
+    from config import part_calculations
+
+    return {k: (v["start"], v["end"]) for k, v in part_calculations.items()}
 
 
 def _phone_links() -> dict[str, tuple[int, int]]:
@@ -166,8 +167,8 @@ def _phone_links() -> dict[str, tuple[int, int]]:
 class TestPartLinksAreAnatomical:
     """リンク定義が解剖学的に妥当な 2 点を結ぶ。"""
 
-    @pytest.mark.parametrize("loader", [_usb_links, _phone_links],
-                             ids=["master_research_code", "network_measure"])
+    @pytest.mark.parametrize("loader", [_config_links, _phone_links],
+                             ids=["config", "network_measure"])
     def test_every_link_has_a_plausible_length(self, loader):
         points = _synthetic_skeleton()
         for name, (start, end) in loader().items():
@@ -179,11 +180,49 @@ class TestPartLinksAreAnatomical:
                 " 体を斜めに横切るリンクになっていないか確認すること"
             )
 
-    def test_the_two_definitions_agree(self):
-        """USB 経路とスマホ経路のリンク定義が一致する。"""
-        assert _usb_links() == _phone_links(), (
-            "part_calculations と PART_LINKS が食い違っている"
+    def test_the_phone_path_derives_from_config(self):
+        """スマホ経路のリンク定義が config から派生している。"""
+        assert _config_links() == _phone_links(), (
+            "config.part_calculations と PART_LINKS が食い違っている"
         )
+
+    def test_the_main_script_has_no_rival_definition(self):
+        """``master_research_code.py`` が独自の part_calculations を持たない。
+
+        かつては同じ辞書が master_research_code.py・master_research_code_00.py・
+        network_measure.py に 3 つあり、片方だけ直すと食い違う状態だった。
+        正本は config.py 一つに集約してある（再検算 H-9）。
+        """
+        tree = ast.parse(io.open(MAIN_SCRIPT, encoding="utf-8").read())
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                assert not any(getattr(t, "id", None) == "part_calculations" for t in node.targets), (
+                    "master_research_code.py に part_calculations の定義が復活している。"
+                    " 正本は config.py"
+                )
+
+    def test_every_link_carries_a_centre_of_mass_fraction(self):
+        """全リンクが重心比を持ち、値が妥当な範囲にある。"""
+        from config import part_calculations
+
+        for name, spec in part_calculations.items():
+            assert "com_fraction" in spec, f"{name} に com_fraction が無い"
+            frac = spec["com_fraction"]
+            assert 0.0 < frac < 1.0, f"{name} の com_fraction が範囲外: {frac}"
+
+    def test_limb_segments_use_anatomical_fractions(self):
+        """四肢は中点（0.5）ではなく文献値を使う。"""
+        from config import COM_FRACTIONS, part_calculations
+
+        for name in ("upper_arm_R", "up_arm_l"):
+            assert part_calculations[name]["com_fraction"] == COM_FRACTIONS["upper_arm"]
+        for name in ("forearm_R", "forearm_L"):
+            assert part_calculations[name]["com_fraction"] == COM_FRACTIONS["forearm"]
+        # 両肩・両腰は体節ではなく中点なので 0.5 のまま
+        for name in ("both_shoulder", "both_hip"):
+            assert part_calculations[name]["com_fraction"] == 0.5, (
+                f"{name} は両端の中点であるべき（r_g の組み立て側が 3:1 で重み付けする）"
+            )
 
 
 class TestTorqueLinksHandedness:

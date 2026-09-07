@@ -329,3 +329,94 @@ class TestLinkVectorCalculator:
             f"2 mm のノイズで角速度が {got:.4f} rad/s になった（真値 {OMEGA_TRUE}）。"
             " ノイズの外積を拾う旧式に戻っていないか確認すること"
         )
+
+
+class TestCentreOfMassFraction:
+    """R-4 重心比。中点固定ではなく体節ごとの文献値を使う。"""
+
+    def _centroid(self, com_fraction: float) -> np.ndarray:
+        from link_vector_calculator_module import LinkVectorCalculator
+
+        # start=遠位(原点)、end=近位(x=1)。part_calculations と同じ向き。
+        frames = [np.vstack([np.zeros(3), np.array([1.0, 0.0, 0.0])]) for _ in range(3)]
+        calc = LinkVectorCalculator(0, 1, com_fraction)
+        return calc.calculate_link_vectors(frames, 1, 1, DT)[3]
+
+    def test_half_reproduces_the_midpoint(self):
+        """0.5 なら従来どおり両端の中点になる（既存挙動との差分を切り分けるため）。"""
+        assert self._centroid(0.5)[0] == pytest.approx(0.5), (
+            "com_fraction=0.5 が中点にならない"
+        )
+
+    def test_fraction_is_measured_from_the_proximal_end(self):
+        """重心比は近位端（end 側）から測る。"""
+        frac = 0.436
+        # 近位端は x=1 なので、そこから遠位（x=0）へ frac だけ寄る
+        assert self._centroid(frac)[0] == pytest.approx(1.0 - frac), (
+            f"重心が近位端から {frac} の位置に来ていない"
+        )
+
+    def test_gravity_moment_arm_shrinks_versus_the_midpoint(self):
+        """文献値を使うと重力モーメント腕が中点より短くなる。
+
+        近位端（関節）から重心までの距離がモーメント腕。中点なら 0.5、
+        前腕の文献値なら 0.430 なので、中点は 16.3% 過大だった。
+        """
+        from config import COM_FRACTIONS
+
+        # 近位端は x=1。そこから重心までの距離を測る。
+        arm_mid = 1.0 - self._centroid(0.5)[0]
+        arm_true = 1.0 - self._centroid(COM_FRACTIONS["forearm"])[0]
+        assert arm_true < arm_mid, "文献値のモーメント腕が中点より長い"
+        assert arm_mid / arm_true == pytest.approx(0.5 / COM_FRACTIONS["forearm"], rel=1e-9), (
+            f"過大率が想定と違う（実測 {100 * (arm_mid / arm_true - 1):+.1f}%）"
+        )
+
+
+class TestInertiaLengthFromMedian:
+    """R-6 慣性テンソルのリンク長は複数フレームの中央値で決める。"""
+
+    def test_phone_path_uses_the_median_not_a_single_frame(self):
+        """1 フレームだけ外れ値を混ぜても、確定するリンク長がほぼ動かない。"""
+        from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
+
+        config = MeasurementConfig(body_mass_kg=60.0)
+        projection = np.hstack([np.eye(3), np.zeros((3, 1))])
+        measurement = NetworkMeasurement(projection, projection, list(range(12)), config)
+
+        n = config.inertia_ready_frames
+        clean = np.zeros((12, 3), dtype=float)
+        clean[0] = [-0.15, 0.0, 1.40]
+        clean[1] = [0.15, 0.0, 1.40]
+        clean[2] = [-0.18, 0.0, 1.16]
+        clean[4] = [-0.20, 0.0, 0.95]
+        clean[6] = [-0.10, 0.0, 1.00]
+        clean[7] = [0.10, 0.0, 1.00]
+        clean[9] = [0.10, 0.0, 0.60]
+        clean[11] = [0.10, 0.0, 0.20]
+
+        samples = np.stack([clean.copy() for _ in range(n)])
+        measurement._build_inertia(samples)
+        baseline = np.diag(measurement._inertia["forearm"]).copy()
+
+        # 1 フレームだけ肘を大きく飛ばす（三角測量の外れ値を模す）
+        spoiled = samples.copy()
+        spoiled[n // 2, 2] = [-1.50, 0.0, 1.16]
+        measurement._inertia = {}
+        measurement._build_inertia(spoiled)
+        with_outlier = np.diag(measurement._inertia["forearm"])
+
+        assert np.allclose(baseline, with_outlier, rtol=1e-9), (
+            f"外れ値 1 フレームで慣性テンソルが動いた: {baseline} → {with_outlier}。"
+            " 中央値ではなく平均や瞬時値を使っていないか確認すること"
+        )
+
+    def test_a_single_frame_would_have_been_wrong(self):
+        """対照: その外れ値フレームだけで決めると値が大きく変わる。"""
+        from utils_dynamic import calculate_inertia_tensor
+
+        good = np.diag(calculate_inertia_tensor(4, 60.0, 0.21))
+        bad = np.diag(calculate_inertia_tensor(4, 60.0, 1.32))
+        assert not np.allclose(good, bad, rtol=0.1), (
+            "外れ値のリンク長でも慣性テンソルが変わらない。テストの前提が崩れている"
+        )
