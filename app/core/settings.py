@@ -1,0 +1,271 @@
+"""146 箇所に散った ``os.getenv`` を、型付きの設定として外から束ねる。
+
+``master_research_code.py`` は設定をすべて環境変数で受け取る作りになっている
+（``os.getenv`` が 150 箇所、ユニーク 135 個）。この層はそれを
+
+1. 型付きスキーマとして表現し
+2. ユーザ領域の JSON に永続化し
+3. **環境変数の辞書として子プロセスに渡す**
+
+という形で扱う。3 の経路を取るので、**既存コードは 1 行も変更しなくてよい**。
+
+スキーマの雛形は ``tools/extract_env_schema.py`` がソースから機械生成し、
+``settings_schema.json`` に置いてある。UI に出す項目・説明文・アプリ側の
+既定値の上書きは、このファイルの ``CURATED`` で行う。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+__all__ = ["Setting", "Settings", "SCHEMA", "APP_NAME"]
+
+APP_NAME = "WheelchairTorque"
+
+_SCHEMA_FILE = Path(__file__).with_name("settings_schema.json")
+
+# 既存コードが bool を読むときの慣用句。``os.getenv(X, '1') in ('1','true','True')``
+_TRUE_LITERALS = ("1", "true", "True")
+
+
+@dataclass(frozen=True)
+class Setting:
+    """設定 1 項目の定義。"""
+
+    name: str
+    type: str  # "bool" | "int" | "float" | "str"
+    code_default: str | None
+    group: str
+    description: str = ""
+    ui_visible: bool = False
+    # アプリとしての既定値。コード側の既定が不適切な場合にここで上書きする。
+    app_default: str | None = None
+
+    @property
+    def effective_default(self) -> str | None:
+        """実際に使う既定値。アプリ側の指定があればそちらが勝つ。"""
+        return self.app_default if self.app_default is not None else self.code_default
+
+
+# ---------------------------------------------------------------------------
+# 手で面倒を見る項目
+#
+# 大半の設定は機械生成のままで足りる。ここに書くのは
+#   (a) コード側の既定値が壊れていてアプリ側で変える必要があるもの
+#   (b) 利用者が UI から触る必要があるもの
+# のいずれか。
+# ---------------------------------------------------------------------------
+CURATED: dict[str, dict[str, Any]] = {
+    # --- (a) 既定値が壊れている 4 つ -------------------------------------
+    # 素の `python master_research_code.py` はこれらが有効なため、
+    # 警告も出さずに無意味な出力を作る。アプリでは既定で無効にする。
+    "DEMO_MONO_GAUGE_ON": {
+        "app_default": "0",
+        "ui_visible": True,
+        "description": (
+            "デモ用の単眼ゲージ表示。有効だと逆動力学の計算が丸ごと止まり、"
+            "トルクCSVが全ゼロで出力される（警告は出ない）。通常は無効。"
+        ),
+    },
+    "DEMO_MONO_CAM0_ONLY": {
+        "app_default": "0",
+        "ui_visible": True,
+        "description": (
+            "カメラ0の映像を1にも複製するデモ用モード。有効だと同一画像を"
+            "異なる投影行列で三角測量することになり、3D再構成が無意味になる。通常は無効。"
+        ),
+    },
+    "RT_POSE_FIXED_HZ_ON": {
+        "app_default": "0",
+        "ui_visible": True,
+        "description": (
+            "姿勢推定を固定レート（既定4Hz）に間引く。有効だと実処理が約3.75Hzに"
+            "落ちる一方、エネルギー計算は30Hz前提のままなのでカットオフ周波数が8倍ずれる。"
+        ),
+    },
+    "E_LPF_NATIVE_ON": {
+        "app_default": "0",
+        "ui_visible": True,
+        "description": (
+            "ローパスフィルタをネイティブ実装（1次指数フィルタ）に差し替える。"
+            "有効だと Butterworth filtfilt ではなくなり、既発表の数値と比較できなくなる。"
+        ),
+    },
+    # --- (b) 利用者が触る項目 --------------------------------------------
+    "HEADLESS": {
+        "ui_visible": True,
+        "group": "表示",
+        "description": "ウィンドウを一切開かずに実行する。計測を裏で走らせたいときに使う。",
+    },
+    "USE_SAMPLE_VIDEOS": {
+        "ui_visible": True,
+        "group": "入力ソース",
+        "description": "カメラの代わりに収録済み動画を入力にする。動作確認や再解析に使う。",
+    },
+    "AUTO_FALLBACK_TO_FILES": {
+        "ui_visible": True,
+        "group": "入力ソース",
+        "description": "カメラを開けなかったとき、自動で動画ファイルに切り替える。",
+    },
+    "CAM0": {
+        "ui_visible": True,
+        "group": "カメラ",
+        "description": "カメラ0の指定。数字ならデバイス番号、それ以外は名前やパスとして扱う。",
+    },
+    "CAM1": {
+        "ui_visible": True,
+        "group": "カメラ",
+        "description": "カメラ1の指定。数字ならデバイス番号、それ以外は名前やパスとして扱う。",
+    },
+    "IO_DEBUG": {
+        "ui_visible": True,
+        "group": "診断",
+        "description": "入出力まわりの詳細ログを出す。カメラが開かないときの切り分けに使う。",
+    },
+}
+
+
+def _load_schema() -> dict[str, Setting]:
+    payload = json.loads(_SCHEMA_FILE.read_text(encoding="utf-8"))
+    schema: dict[str, Setting] = {}
+
+    for name, raw in payload["settings"].items():
+        schema[name] = Setting(
+            name=name,
+            type=raw["type"],
+            code_default=raw.get("default"),
+            group=raw.get("group", "その他"),
+        )
+
+    for name, overrides in CURATED.items():
+        base = schema.get(name)
+        if base is None:
+            # 生成元に無い設定も UI に出せるようにしておく（config.py 側の変数など）
+            base = Setting(
+                name=name,
+                type=overrides.get("type", "str"),
+                code_default=overrides.get("code_default"),
+                group=overrides.get("group", "その他"),
+            )
+        schema[name] = replace(
+            base,
+            **{k: v for k, v in overrides.items() if k not in ("type", "code_default")},
+        )
+
+    return schema
+
+
+SCHEMA: dict[str, Setting] = _load_schema()
+
+
+def _to_str(setting: Setting, value: Any) -> str:
+    """Python の値を、既存コードが読める文字列に変換する。"""
+    if setting.type == "bool":
+        if not isinstance(value, bool):
+            raise TypeError(f"{setting.name} は bool。受け取った値: {value!r}")
+        return "1" if value else "0"
+    if setting.type == "int":
+        return str(int(value))
+    if setting.type == "float":
+        return repr(float(value))
+    return str(value)
+
+
+def _from_str(setting: Setting, raw: str) -> Any:
+    if setting.type == "bool":
+        return raw in _TRUE_LITERALS
+    if setting.type == "int":
+        return int(raw)
+    if setting.type == "float":
+        return float(raw)
+    return raw
+
+
+class Settings:
+    """設定値の集合。既定値との差分だけを保持する。"""
+
+    def __init__(self, values: dict[str, str] | None = None):
+        # 既定と異なる項目のみを持つ。既定が変わったとき自動で追随できるようにするため。
+        self._overrides: dict[str, str] = {}
+        for name, raw in (values or {}).items():
+            if name in SCHEMA:  # 消えた設定は黙って捨てる（古い保存ファイル対策）
+                self._overrides[name] = raw
+
+    # -- 参照・更新 --------------------------------------------------------
+    def _setting(self, name: str) -> Setting:
+        try:
+            return SCHEMA[name]
+        except KeyError:
+            raise KeyError(
+                f"未知の設定です: {name}\n"
+                f"  スキーマは {_SCHEMA_FILE.name} にあります。"
+                f"（tools/extract_env_schema.py で再生成できます）"
+            ) from None
+
+    def get(self, name: str) -> Any:
+        setting = self._setting(name)
+        raw = self._overrides.get(name, setting.effective_default)
+        if raw is None:
+            return None
+        return _from_str(setting, raw)
+
+    def set(self, name: str, value: Any) -> None:
+        setting = self._setting(name)
+        raw = _to_str(setting, value)
+        if raw == setting.effective_default:
+            self._overrides.pop(name, None)  # 既定に戻ったら差分から外す
+        else:
+            self._overrides[name] = raw
+
+    @property
+    def overrides(self) -> dict[str, str]:
+        """既定と異なる項目だけ。"""
+        return dict(self._overrides)
+
+    # -- 子プロセスへの受け渡し -------------------------------------------
+    def as_env(self) -> dict[str, str]:
+        """環境変数の辞書。**全設定を明示的に含める**。
+
+        差分だけ渡すと、渡さなかった項目は子プロセス側の既定値が効いてしまう。
+        その既定値こそが壊れているものを含むので、全件を明示して
+        呼び出し元のシェル環境からも隔離する。
+        """
+        env: dict[str, str] = {}
+        for name, setting in SCHEMA.items():
+            raw = self._overrides.get(name, setting.effective_default)
+            if raw is not None:
+                env[name] = raw
+        return env
+
+    # -- 永続化 ------------------------------------------------------------
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "_note": "既定値と異なる項目のみ保存している。既定はアプリ側で管理。",
+            "values": self._overrides,
+        }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Settings":
+        path = Path(path)
+        if not path.is_file():
+            return cls()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # 壊れた設定ファイルで起動できなくなるより、既定で立ち上がる方がよい。
+            return cls()
+        return cls(payload.get("values", {}))
+
+    @classmethod
+    def default_path(cls) -> Path:
+        from app.core.platform_compat import user_config_dir
+
+        return user_config_dir(APP_NAME) / "settings.json"
