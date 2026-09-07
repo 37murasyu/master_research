@@ -40,16 +40,9 @@ class WorkerRunner(QtCore.QObject):
     # 計測終了時に CSV を書き出すので、その時間は待つ必要がある。
     GRACE_MS = 10_000
 
-    def __init__(
-        self,
-        role: str = "realtime",
-        parent: QtCore.QObject | None = None,
-        module: str | None = None,
-    ):
+    def __init__(self, role: str = "realtime", parent: QtCore.QObject | None = None):
         super().__init__(parent)
         self.role = role
-        # --role script のときに実行するモジュール名
-        self.module = module
         self._process = QtCore.QProcess(self)
         self._process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
         self._process.readyReadStandardOutput.connect(self._drain_output)
@@ -61,12 +54,24 @@ class WorkerRunner(QtCore.QObject):
     def is_running(self) -> bool:
         return self._process.state() != QtCore.QProcess.NotRunning
 
-    def start(self, settings: Settings, passthrough: list[str] | None = None) -> bool:
+    def start(
+        self,
+        settings: Settings,
+        passthrough: list[str] | None = None,
+        module: str | None = None,
+    ) -> bool:
+        """ワーカーを起動する。
+
+        ``module`` は ``--role script`` のときに実行するモジュール名。
+        インスタンスの状態にせず引数で受けるのは、1 回の実行に属する情報だから。
+        状態に置くと呼び出し側が start の直前に代入する形になり、
+        代入忘れや「前回の値が残る」が起こりうる。
+        """
         if self.is_running:
             self.output.emit("[警告] 既に動いています。\n")
             return False
 
-        command = entry.worker_command(self.role, passthrough, module=self.module)
+        command = entry.worker_command(self.role, passthrough, module=module)
         environment = entry.worker_environment(settings, role=self.role)
 
         process_env = QtCore.QProcessEnvironment()

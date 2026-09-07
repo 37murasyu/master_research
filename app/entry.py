@@ -28,13 +28,10 @@ from app.core.settings import Settings
 __all__ = [
     "ParsedArgs",
     "parse_args",
+    "resolve_module",
     "worker_command",
-    "realtime_command",
-    "calibrate_command",
     "worker_environment",
     "run_worker",
-    "run_realtime_worker",
-    "run_calibrate_worker",
     "ROLES",
     "WORKER_MODULES",
     "SCRIPT_ROLE",
@@ -55,8 +52,6 @@ WORKER_MODULES = {
 # 解析スクリプトは matplotlib で描画するものが多く、これも GUI 操作なので
 # スレッドではなく子プロセスで動かす。対象が多いため個別の役割にはしない。
 SCRIPT_ROLE = "script"
-
-REALTIME_MODULE = WORKER_MODULES["realtime"]
 
 ROLES = ("gui", *WORKER_MODULES, SCRIPT_ROLE)
 
@@ -91,6 +86,24 @@ def parse_args(argv: list[str] | None = None) -> ParsedArgs:
     return ParsedArgs(role=known.role, module=known.module, passthrough=list(rest))
 
 
+def resolve_module(role: str, module: str | None = None) -> str:
+    """役割から、``__main__`` として実行するモジュール名を決める。
+
+    役割の妥当性検査もここで行う。以前は ``worker_command`` と ``run_worker`` が
+    同じ二分岐を別々に書いており、片方だけ直すと食い違う形だった。
+    """
+    if role == SCRIPT_ROLE:
+        if not module:
+            raise ValueError(f"--role {SCRIPT_ROLE} にはモジュール名の指定が必要です")
+        return module
+
+    resolved = WORKER_MODULES.get(role)
+    if resolved is None:
+        valid = ", ".join((*WORKER_MODULES, SCRIPT_ROLE))
+        raise ValueError(f"ワーカーの役割が不正: {role}（有効: {valid}）")
+    return resolved
+
+
 def worker_command(
     role: str, passthrough: list[str] | None = None, module: str | None = None
 ) -> list[str]:
@@ -99,30 +112,16 @@ def worker_command(
     **既存スクリプトのパスを直接参照しない**。凍結後はファイルとして
     存在しないため。自分自身を役割つきで呼び直す。
     """
+    resolve_module(role, module)  # 妥当性の検査
+
+    role_args = ["--role", role]
     if role == SCRIPT_ROLE:
-        if not module:
-            raise ValueError("--role script にはモジュール名の指定が必要です")
-        role_args = ["--role", role, "--module", module]
-    elif role in WORKER_MODULES:
-        role_args = ["--role", role]
-    else:
-        valid = ", ".join((*WORKER_MODULES, SCRIPT_ROLE))
-        raise ValueError(f"ワーカーの役割が不正: {role}（有効: {valid}）")
+        role_args += ["--module", module or ""]
 
     extra = list(passthrough or [])
     if resources.is_frozen():
         return [sys.executable, *role_args, *extra]
     return [sys.executable, "-m", "app", *role_args, *extra]
-
-
-def realtime_command(passthrough: list[str] | None = None) -> list[str]:
-    """計測ワーカーの起動コマンド。"""
-    return worker_command("realtime", passthrough)
-
-
-def calibrate_command(passthrough: list[str] | None = None) -> list[str]:
-    """キャリブレーションワーカーの起動コマンド。"""
-    return worker_command("calibrate", passthrough)
 
 
 def worker_environment(settings: Settings, role: str = "realtime") -> dict[str, str]:
@@ -151,13 +150,7 @@ def run_worker(
     2,900 行が import 時に走る）、ファイルパス指定も凍結後は使えない。
     モジュール名で解決する必要がある。
     """
-    if role == SCRIPT_ROLE:
-        if not module:
-            raise ValueError("--role script にはモジュール名の指定が必要です")
-    else:
-        module = WORKER_MODULES.get(role)
-        if module is None:
-            raise ValueError(f"ワーカーの役割が不正: {role}")
+    module = resolve_module(role, module)
 
     argv_backup = sys.argv[:]
     sys.argv = [module, *(passthrough or [])]
@@ -167,10 +160,3 @@ def run_worker(
     finally:
         sys.argv = argv_backup
 
-
-def run_realtime_worker(passthrough: list[str] | None = None) -> int:
-    return run_worker("realtime", passthrough)
-
-
-def run_calibrate_worker(passthrough: list[str] | None = None) -> int:
-    return run_worker("calibrate", passthrough)

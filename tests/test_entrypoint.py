@@ -43,7 +43,7 @@ class TestArgumentDispatch:
 class TestWorkerCommand:
     def test_dev_mode_uses_module_invocation(self, monkeypatch):
         monkeypatch.setattr(entry.resources, "is_frozen", lambda: False)
-        command = entry.realtime_command(["--subject", "9"])
+        command = entry.worker_command("realtime", ["--subject", "9"])
         assert command[0] == sys.executable
         assert command[1:4] == ["-m", "app", "--role"]
         assert command[4] == "realtime"
@@ -52,14 +52,14 @@ class TestWorkerCommand:
     def test_frozen_mode_reinvokes_the_executable(self, monkeypatch):
         """凍結時は -m app が使えない。実行ファイル自身を呼び直す。"""
         monkeypatch.setattr(entry.resources, "is_frozen", lambda: True)
-        command = entry.realtime_command([])
+        command = entry.worker_command("realtime", [])
         assert command == [sys.executable, "--role", "realtime"]
 
     def test_command_never_references_the_script_path(self, monkeypatch):
         """master_research_code.py を直接呼ばないこと。凍結後は存在しない。"""
         for frozen in (True, False):
             monkeypatch.setattr(entry.resources, "is_frozen", lambda: frozen)
-            assert not any("master_research_code" in part for part in entry.realtime_command([]))
+            assert not any("master_research_code" in part for part in entry.worker_command("realtime", []))
 
 
 class TestWorkerEnvironment:
