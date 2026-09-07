@@ -218,6 +218,26 @@ class LandmarkServer:
         }
 
 
+def _print_qr(url: str) -> None:
+    """接続先をターミナルに QR で描く。
+
+    端末側は QR で接続先と役割を受け取る。手で URL を打たせると、
+    2 台とも同じ役割にしてしまう事故が起きやすい。
+
+    segno が無くても起動は妨げない（URL を手入力すれば繋がる）。
+    """
+    try:
+        import segno
+    except ImportError:
+        print("  （segno が無いため QR を省略します: pip install segno）")
+        return
+
+    try:
+        segno.make(url, error="m").terminal(compact=True)
+    except Exception as exc:  # pragma: no cover - 端末依存
+        print(f"  （QR を描けませんでした: {exc}）")
+
+
 # ---------------------------------------------------------------------------
 # 単体起動（動作確認・Phase 3 の GUI から切り離してのデバッグ用）
 # ---------------------------------------------------------------------------
@@ -239,9 +259,15 @@ async def _main_async(args: argparse.Namespace) -> int:
         return 1
 
     advertise = local_ip() if args.host in ("0.0.0.0", "") else args.host
-    print(f"受信サーバを起動しました  session={server.session}")
+    print(f"受信サーバを起動しました  session={server.session}\n")
     for role in p.ROLES:
-        print(f"  {role}: {server.connect_url(role, host=advertise)}")
+        url = server.connect_url(role, host=advertise)
+        print(f"■ {role}")
+        print(f"  {url}")
+        if not args.no_qr:
+            _print_qr(url)
+        print()
+    print("端末のアプリで QR を読み取ってください。cam0 と cam1 で別々の QR です。")
     print("Ctrl-C で終了します。\n")
 
     # SIGINT / SIGTERM をイベントに変換する。
@@ -287,6 +313,7 @@ def main() -> int:
     parser.add_argument("--hz", type=float, default=30.0, help="再標本化するグリッド周波数")
     parser.add_argument("--window", type=float, default=2.0, help="バッファの時間窓（秒）")
     parser.add_argument("--max-gap-ms", type=float, default=100.0, help="補間を許す最大欠測幅")
+    parser.add_argument("--no-qr", action="store_true", help="QR コードを表示しない")
     args = parser.parse_args()
 
     try:

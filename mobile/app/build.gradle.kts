@@ -1,7 +1,23 @@
+import java.util.Properties
+
 plugins {
     // Kotlin は AGP 9 に組み込まれているので、別プラグインは適用しない。
     id("com.android.application")
 }
+
+// リリース署名の設定。keystore.properties と鍵本体は git 管理外に置く。
+//
+// 鍵を固定するのは、後から更新版を配れるようにするため。Android は署名が
+// 一致しない APK の上書きインストールを拒否するので、デバッグ鍵（PC ごとに
+// 異なる）で配ると次の版が入らなくなる。
+//
+// 鍵が無い環境（CI など）でもビルドは通るようにし、その場合は署名なしにする。
+val keystoreProperties = Properties().apply {
+    val file = rootProject.file("keystore.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+val hasReleaseKey = keystoreProperties.getProperty("storeFile") != null &&
+    rootProject.file(keystoreProperties.getProperty("storeFile", "")).exists()
 
 android {
     namespace = "com.murayama.wheelchairsensor"
@@ -24,10 +40,38 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+
+                // v2 だけでもインストールはできるが、v3 は鍵のローテーションに
+                // 対応する。鍵が漏れた場合に差し替える道を残しておく。
+                enableV1Signing = false  // minSdk 24 なので不要。署名検証が速くなる
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
+            // ネイティブライブラリ（mediapipe）が大半なので、Kotlin 側を縮めても
+            // ほとんど効かない。難読化で不具合を持ち込むリスクの方が大きい。
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+
+            if (hasReleaseKey) {
+                signingConfig = signingConfigs.getByName("release")
+            } else {
+                logger.warn(
+                    "リリース鍵がありません（mobile/keystore.properties）。" +
+                        "署名なしAPKになり、端末にインストールできません。"
+                )
+            }
         }
     }
 

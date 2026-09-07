@@ -31,6 +31,9 @@ PySide6
 #       matplotlib に直接登録する方式へ移行する（アプリ側で実施）。
 setuptools
 
+### スマホ接続用の QR 表示（PC が接続先を端末に渡す手段）
+segno
+
 ### Networking / I/O
 requests
 boto3
