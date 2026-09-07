@@ -38,12 +38,20 @@ class PoseAnalyzer(
 
     private var landmarker: PoseLandmarker? = null
 
+    /** 送り出したフレームの情報。結果が返ってきたときに突き合わせる。 */
+    private data class PendingFrame(val captureNanos: Long, val width: Int, val height: Int)
+
     /**
-     * MediaPipe に渡した時刻（ミリ秒）から、元の撮影時刻（ナノ秒）へ戻すための対応表。
+     * MediaPipe に渡した時刻（ミリ秒）から元のフレーム情報へ戻すための対応表。
      * LIVE_STREAM モードは結果が非同期で返るため、どのフレームの結果かを
      * タイムスタンプで突き合わせる必要がある。
+     *
+     * **サイズも一緒に持つ**のが要点。1 個の変数で「直近のサイズ」を持つと、
+     * フレーム N の結果にフレーム N+k のサイズを付けてしまう。PC 側は
+     * 正規化座標に w/h を掛けてピクセルに直すので、取り違えると
+     * 3D 再構成が静かに狂う。
      */
-    private val pendingCaptureNanos = HashMap<Long, Long>()
+    private val pendingFrames = HashMap<Long, PendingFrame>()
 
     init {
         try {
@@ -80,12 +88,13 @@ class PoseAnalyzer(
             val bitmap = image.toUprightBitmap()
             val timestampMs = captureNanos / 1_000_000
 
-            synchronized(pendingCaptureNanos) {
-                pendingCaptureNanos[timestampMs] = captureNanos
+            synchronized(pendingFrames) {
+                pendingFrames[timestampMs] =
+                    PendingFrame(captureNanos, bitmap.width, bitmap.height)
                 // 結果が返らなかったフレームの記録が溜まらないようにする
-                if (pendingCaptureNanos.size > PENDING_LIMIT) {
-                    val oldest = pendingCaptureNanos.keys.minOrNull()
-                    if (oldest != null) pendingCaptureNanos.remove(oldest)
+                if (pendingFrames.size > PENDING_LIMIT) {
+                    val oldest = pendingFrames.keys.minOrNull()
+                    if (oldest != null) pendingFrames.remove(oldest)
                 }
             }
 
@@ -103,9 +112,11 @@ class PoseAnalyzer(
         if (poses.isEmpty()) return  // 人が写っていないフレームは送らない
 
         val timestampMs = result.timestampMs()
-        val captureNanos = synchronized(pendingCaptureNanos) {
-            pendingCaptureNanos.remove(timestampMs)
-        } ?: (timestampMs * 1_000_000)
+        // 対応するフレームが見つからない結果は捨てる。サイズを推測して
+        // 送ると、PC 側で誤ったピクセル座標になる。
+        val pending = synchronized(pendingFrames) {
+            pendingFrames.remove(timestampMs)
+        } ?: return
 
         val points = poses[0].map { landmark ->
             floatArrayOf(
@@ -116,19 +127,15 @@ class PoseAnalyzer(
             )
         }
 
-        val size = lastFrameSize ?: return
         onResult(
             Detection(
-                captureDeviceNanos = captureNanos,
-                width = size.first,
-                height = size.second,
+                captureDeviceNanos = pending.captureNanos,
+                width = pending.width,
+                height = pending.height,
                 landmarks = points,
             )
         )
     }
-
-    @Volatile
-    private var lastFrameSize: Pair<Int, Int>? = null
 
     /**
      * ImageProxy を、画面表示と同じ向きの Bitmap にする。
@@ -139,14 +146,9 @@ class PoseAnalyzer(
     private fun ImageProxy.toUprightBitmap(): Bitmap {
         val source = toBitmap()
         val degrees = imageInfo.rotationDegrees
-        val bitmap = if (degrees == 0) {
-            source
-        } else {
-            val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
-            Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
-        }
-        lastFrameSize = bitmap.width to bitmap.height
-        return bitmap
+        if (degrees == 0) return source
+        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
     fun close() {

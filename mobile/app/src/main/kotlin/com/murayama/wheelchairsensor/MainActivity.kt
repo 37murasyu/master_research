@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -65,6 +66,12 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // 計測中に画面が消えると CameraX がフレームを止め、その端末の
+        // ランドマークが途絶える。PC 側は片方を待ち続けてペアを出さなくなり、
+        // ログにも何も出ない。マニフェストの android:keepScreenOn は
+        // View の属性でありアクティビティには効かないので、ここで立てる。
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         analysisExecutor = Executors.newSingleThreadExecutor()
         cameraSetup = CameraSetup(this, binding.preview, analysisExecutor)
