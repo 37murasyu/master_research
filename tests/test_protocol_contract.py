@@ -1,0 +1,129 @@
+"""Android が実際に送る電文を、PC 側が解釈できることを検証する。
+
+片側だけのテストでは「両者が同じものを想定している」ことは保証できない。
+Kotlin 側のテスト（ContractSampleTest）が組み立てた**生の JSON**を
+ファイルに落とし、ここで decode する。どちらかが電文の形を変えれば、
+実機を繋ぐ前にここで気づける。
+
+サンプルの更新:
+    cd mobile && ./gradlew :app:testDebugUnitTest
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from app.net import protocol as p
+
+GOLDEN = Path(__file__).resolve().parent.parent / "mobile" / "contract" / "golden_messages.json"
+
+pytestmark = pytest.mark.skipif(
+    not GOLDEN.is_file(),
+    reason=f"契約サンプルがありません（cd mobile && ./gradlew :app:testDebugUnitTest で生成）: {GOLDEN}",
+)
+
+
+def _messages() -> list[str]:
+    return json.loads(GOLDEN.read_text(encoding="utf-8"))
+
+
+def test_every_kotlin_message_decodes():
+    """Android 側が送るすべての電文が PC 側で読めること。"""
+    messages = _messages()
+    assert messages, "契約サンプルが空"
+    for raw in messages:
+        p.decode(raw)  # ProtocolError が飛べば失敗
+
+
+def test_hello_carries_role_and_session():
+    hello = next(m for m in _messages() if json.loads(m).get("type") == "hello")
+    decoded = p.decode(hello)
+    assert isinstance(decoded, p.Hello)
+    assert decoded.role in p.ROLES
+    assert decoded.session
+
+
+def test_sync_request_timestamp_is_an_integer():
+    """浮動小数になっていると 2^53 を超えた時点でナノ秒の精度が落ちる。"""
+    raw = next(m for m in _messages() if json.loads(m).get("type") == "sync_req")
+    decoded = p.decode(raw)
+    assert isinstance(decoded, p.SyncRequest)
+    assert isinstance(json.loads(raw)["t1"], int)
+
+
+def test_landmark_frames_have_the_expected_shape():
+    frames = [m for m in _messages() if json.loads(m).get("type") == "landmarks"]
+    assert frames, "landmarks の電文が含まれていない"
+
+    for raw in frames:
+        frame = p.decode(raw)
+        assert isinstance(frame, p.LandmarkFrame)
+        assert len(frame.landmarks) == p.LANDMARK_COUNT
+        assert frame.width > 0 and frame.height > 0
+        assert all(len(point) == 4 for point in frame.landmarks)
+
+
+def test_capture_timestamp_survives_the_round_trip():
+    """ナノ秒の値がそのまま復元できること。
+
+    JSON を経由して float になると 1_725_699_123_456_789_000 は表現できず、
+    数百ナノ秒ずれる。同期バッファはこの値でペアを組むので、ここは崩せない。
+    """
+    raw = next(m for m in _messages() if json.loads(m).get("type") == "landmarks")
+    original = json.loads(raw)["t_capture_ns"]
+    assert isinstance(original, int)
+    assert p.decode(raw).t_capture_ns == original
+
+
+def test_normalized_coordinates_convert_to_pixels():
+    """x, y が [0,1] の正規化座標で、w/h を掛けてピクセルになる規約であること。
+
+    既存の utils.extract_keypoints と同じ扱いにしてある。
+    """
+    raw = next(m for m in _messages() if json.loads(m).get("type") == "landmarks")
+    frame = p.decode(raw)
+
+    for index in range(p.LANDMARK_COUNT):
+        x, y, _z, _v = frame.landmarks[index]
+        assert 0.0 <= x <= 1.0, f"lm[{index}].x が正規化されていない: {x}"
+        assert 0.0 <= y <= 1.0, f"lm[{index}].y が正規化されていない: {y}"
+
+    px, py = frame.pixel_xy(0)
+    assert 0 <= px <= frame.width
+    assert 0 <= py <= frame.height
+
+
+def test_frames_flow_through_the_sync_buffer():
+    """実際の電文を同期バッファに入れて、ペアが組めること。
+
+    decode できるだけでは足りない。下流まで通ることを確かめる。
+    """
+    from app.net.sync_buffer import SyncBuffer
+
+    frames = [p.decode(m) for m in _messages() if json.loads(m).get("type") == "landmarks"]
+    by_role = {frame.role: frame for frame in frames}
+    assert set(by_role) == {"cam0", "cam1"}, "両方のロールのサンプルが要る"
+
+    buffer = SyncBuffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0)
+    base = min(frame.t_capture_ns for frame in frames)
+
+    # 実サンプルを 100ms 刻みで並べ直して流す
+    for step in range(6):
+        for role, template in by_role.items():
+            buffer.push(
+                p.LandmarkFrame(
+                    role=role,
+                    seq=step,
+                    t_capture_ns=base + step * 100_000_000,
+                    width=template.width,
+                    height=template.height,
+                    landmarks=template.landmarks,
+                )
+            )
+
+    pairs = buffer.drain()
+    assert pairs, "実電文からペアが組めていない"
+    assert all(set(pair.frames) == {"cam0", "cam1"} for pair in pairs)
