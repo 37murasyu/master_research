@@ -42,6 +42,23 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+# これらはフレームが流れ始める前に払っておく。関数内 import にすると、
+# 最初の数フレームの中で utils(0.12s) + utils_dynamic(0.70s) の読み込みが走り、
+# その間 asyncio の受信ループが止まる（同期バッファの窓 2 秒の 1/3 を食う）。
+from body_part_storage_module import BodyPartDataStorage
+# 部位キーと重力は config.py が持っている。utils 経由で既に読み込まれているので
+# 追加コストなしで再利用できる。
+from config import g as GRAVITY
+from config import part_keys as _PART_KEYS
+from link_vector_calculator_module import LinkVectorCalculator
+from utils import PushCycleDetector, compute_local_torque
+from utils_dynamic import (
+    calculate_individual_torques,
+    calculate_inertia_tensor,
+    calculate_M_and_F,
+    compute_triangulate_transform_native,
+)
+
 from app.net.sync_buffer import PairedSample
 
 __all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig"]
@@ -91,7 +108,8 @@ OMEGA_SOURCE: dict[str, str] = {
     "shoulder_L": "both_shoulder",
 }
 
-PART_KEYS = ("wrist_R", "elbow_R", "shoulder_R", "wrist_L", "elbow_L", "shoulder_L")
+# 部位キーは config.py が持っている（順序も一致）。
+PART_KEYS = tuple(_PART_KEYS)
 
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
@@ -161,9 +179,6 @@ class NetworkMeasurement:
         self.pose_keypoints = list(pose_keypoints)
         self.config = config or MeasurementConfig()
 
-        from body_part_storage_module import BodyPartDataStorage
-        from link_vector_calculator_module import LinkVectorCalculator
-
         self.storage = BodyPartDataStorage()
         self.calculators = {
             part: LinkVectorCalculator(start, end) for part, (start, end) in PART_LINKS.items()
@@ -229,26 +244,14 @@ class NetworkMeasurement:
     def _triangulate(self, keypoints0, keypoints1) -> np.ndarray:
         """三角測量して既存と同じ座標系に変換する。
 
-        変換 (x, y, z) -> (-x, -z, -y) と 0.01 倍のスケールは
-        `_triangulate_transform_batch` に合わせてある。単位は m。
+        既存 USB 経路（``master_research_code._triangulate_transform_batch``）が
+        呼ぶのと同じ関数に委譲する。手書きすると、変換 (x,y,z)->(-x,-z,-y) と
+        0.01 倍のスケール、欠測の扱いを二重に管理することになり、
+        ネイティブ DLL の高速経路も使えない。
         """
-        # pylint: disable=no-member
-        import cv2 as cv
-
-        pts0 = np.asarray(keypoints0, dtype=np.float64).T
-        pts1 = np.asarray(keypoints1, dtype=np.float64).T
-        homogeneous = cv.triangulatePoints(self.P0, self.P1, pts0, pts1)
-
-        w = homogeneous[3, :]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            raw = (homogeneous[:3, :] / w).T
-        raw = np.where(np.isfinite(raw), raw, np.nan) * 0.01
-
-        transformed = np.empty_like(raw)
-        transformed[:, 0] = -raw[:, 0]
-        transformed[:, 1] = -raw[:, 2]
-        transformed[:, 2] = -raw[:, 1]
-        return transformed
+        return compute_triangulate_transform_native(
+            self.P0, self.P1, keypoints0, keypoints1, scale=0.01
+        )
 
     def _timestep(self, t_ns: int) -> float:
         """前フレームとの実時間差。
@@ -284,8 +287,6 @@ class NetworkMeasurement:
         その 1 フレームが欠測だと以後一度も検出されない。ここでは
         実際に集まったサンプル数で平均し、範囲を過ぎた時点で確定させる。
         """
-        from utils import PushCycleDetector
-
         config = self.config
         value = self._cycle_value(points)
 
@@ -314,8 +315,6 @@ class NetworkMeasurement:
 
     def _build_inertia(self, points: np.ndarray) -> None:
         """慣性テンソルを確定させる。部位行と引数は既存と同じ。"""
-        from utils_dynamic import calculate_inertia_tensor
-
         mass = self.config.body_mass_kg
 
         def length(a: int, b: int) -> float:
@@ -332,9 +331,6 @@ class NetworkMeasurement:
         }
 
     def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:
-        from utils import compute_local_torque
-        from utils_dynamic import calculate_individual_torques, calculate_M_and_F
-
         data = {name: self.storage.get_data(name) for name in PART_LINKS}
         if any(not values for values in data.values()):
             return None
@@ -345,7 +341,6 @@ class NetworkMeasurement:
         m_forearm = mass * 0.016
         m_thigh = mass * 0.11
 
-        gravity = np.array([0.0, 0.0, -9.81])
         inertia = self._inertia
 
         def chain(arm: str, forearm: str, leg: str, condition: int):
@@ -371,12 +366,11 @@ class NetworkMeasurement:
                 ),
                 (inertia["thigh"], m_thigh, data[leg], {}),
             ]
-            moments, forces, parts = [], [], []
-            for tensor, segment_mass, part_data, kwargs in specs:
-                M, F, name = calculate_M_and_F(tensor, segment_mass, part_data, gravity, **kwargs)
-                moments.append(M)
-                forces.append(F)
-                parts.append(name)
+            rows = [
+                calculate_M_and_F(tensor, mass_i, data_i, GRAVITY, **kwargs)
+                for tensor, mass_i, data_i, kwargs in specs
+            ]
+            moments, forces, parts = (list(col) for col in zip(*rows))
             return moments, forces, parts
 
         try:
@@ -490,7 +484,7 @@ class NetworkMeasurement:
         捨てる仕組みが無い。参照されるのは ``[-1]`` だけなので、
         少し残しておけば足りる。
         """
-        keep = max(self._REQUIRED_FRAMES, 2)
+        keep = self._REQUIRED_FRAMES
         for part, entries in self.storage.storage.items():
             if len(entries) > keep:
                 self.storage.storage[part] = entries[-keep:]
