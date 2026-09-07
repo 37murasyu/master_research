@@ -93,3 +93,64 @@ def test_survives_jitter_and_packet_loss():
         f"平均位相差が 1 フレームを超えている: {stats['mean_role_skew_ms']:.1f}ms "
         f"(最大 {stats['max_role_skew_ms']:.1f}ms)"
     )
+
+
+def test_full_chain_from_phones_to_torques():
+    """模擬端末 -> サーバ -> 同期バッファ -> 三角測量 -> 逆動力学 の通し。
+
+    値の物理的な妥当性は見ない。mock_sender の合成動作は任意の往復運動で
+    視差もごく小さく、3D 再構成が退化するため、トルクの数値に意味は無い。
+    ここで確かめるのは配管が通っていること。実際の値は実機で確認する。
+    """
+    import numpy as np
+
+    from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
+
+    width, height = 1280, 720
+    pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
+    intrinsics = np.array([[900.0, 0.0, width / 2], [0.0, 900.0, height / 2], [0.0, 0.0, 1.0]])
+    p_left = intrinsics @ np.hstack([np.eye(3), np.zeros((3, 1))])
+    p_right = intrinsics @ np.hstack([np.eye(3), np.array([[-0.5], [0.0], [0.0]])])
+
+    measurement = NetworkMeasurement(
+        p_left, p_right, pose_keypoints, MeasurementConfig(body_mass_kg=60.0)
+    )
+    processed: list = []
+
+    async def scenario():
+        server = LandmarkServer(
+            host="127.0.0.1",
+            port=0,
+            buffer=SyncBuffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0),
+            on_pairs=lambda pairs: processed.extend(
+                r for r in (measurement.process(p) for p in pairs) if r is not None
+            ),
+        )
+        await server.start()
+        try:
+            url = f"ws://127.0.0.1:{server.port}"
+            phones = [
+                MockPhone(url, "cam0", fps=30.0, jitter_ms=5.0, loss=0.0, seed=1),
+                MockPhone(url, "cam1", fps=30.0, jitter_ms=5.0, loss=0.0, seed=2),
+            ]
+            await asyncio.gather(*(phone.run(3.0) for phone in phones))
+            await asyncio.sleep(0.3)
+            for pair in server.buffer.drain():
+                result = measurement.process(pair)
+                if result is not None:
+                    processed.append(result)
+        finally:
+            await server.stop()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=60))
+
+    assert processed, "1 フレームも処理されていない"
+
+    with_torque = [r for r in processed if r.local_torques]
+    assert with_torque, "トルクが 1 フレームも計算されていない"
+
+    for result in with_torque:
+        for name, vector in result.local_torques.items():
+            assert np.all(np.isfinite(vector)), f"{name} に非有限値が混入"
+
+    assert measurement.cycle_count > 0, "サイクルが 1 回も検出されていない"
