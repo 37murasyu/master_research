@@ -1,8 +1,6 @@
 package com.murayama.wheelchairsensor.pose
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
@@ -28,6 +26,10 @@ class PoseAnalyzer(
     private val onResult: (Detection) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
+    // PoseLandmarker が Context を保持する場合に Activity 全体（PreviewView や
+    // フレームバッファを含む）を道連れにしないよう、application の方を使う。
+    private val appContext: Context = context.applicationContext
+
     /** 1 フレーム分の結果。時刻は端末の単調時計。 */
     data class Detection(
         val captureDeviceNanos: Long,
@@ -51,7 +53,12 @@ class PoseAnalyzer(
      * 正規化座標に w/h を掛けてピクセルに直すので、取り違えると
      * 3D 再構成が静かに狂う。
      */
-    private val pendingFrames = HashMap<Long, PendingFrame>()
+    private val pendingFrames = object : LinkedHashMap<Long, PendingFrame>(32, 0.75f, false) {
+        // 溢れたら最古を 1 件落とす。以前は毎回 keys.minOrNull() で全体を走査しており、
+        // 一度上限に達すると毎フレーム O(n) の探索がロックの中で走っていた。
+        override fun removeEldestEntry(eldest: Map.Entry<Long, PendingFrame>): Boolean =
+            size > PENDING_LIMIT
+    }
 
     init {
         try {
@@ -70,7 +77,7 @@ class PoseAnalyzer(
                 .setErrorListener { error -> Log.e(TAG, "推論に失敗しました", error) }
                 .build()
 
-            landmarker = PoseLandmarker.createFromOptions(context, options)
+            landmarker = PoseLandmarker.createFromOptions(appContext, options)
         } catch (e: Exception) {
             Log.e(TAG, "PoseLandmarker を初期化できませんでした", e)
         }
@@ -85,17 +92,14 @@ class PoseAnalyzer(
 
         try {
             val captureNanos = SystemClock.elapsedRealtimeNanos()
-            val bitmap = image.toUprightBitmap()
+            // CameraSetup が setOutputImageRotationEnabled(true) を指定しているので、
+            // ここに届く時点で既に正立している。
+            val bitmap = image.toBitmap()
             val timestampMs = captureNanos / 1_000_000
 
             synchronized(pendingFrames) {
                 pendingFrames[timestampMs] =
                     PendingFrame(captureNanos, bitmap.width, bitmap.height)
-                // 結果が返らなかったフレームの記録が溜まらないようにする
-                if (pendingFrames.size > PENDING_LIMIT) {
-                    val oldest = pendingFrames.keys.minOrNull()
-                    if (oldest != null) pendingFrames.remove(oldest)
-                }
             }
 
             detector.detectAsync(BitmapImageBuilder(bitmap).build(), timestampMs)
@@ -108,15 +112,17 @@ class PoseAnalyzer(
     }
 
     private fun handleResult(result: PoseLandmarkerResult) {
-        val poses = result.landmarks()
-        if (poses.isEmpty()) return  // 人が写っていないフレームは送らない
-
-        val timestampMs = result.timestampMs()
         // 対応するフレームが見つからない結果は捨てる。サイズを推測して
         // 送ると、PC 側で誤ったピクセル座標になる。
+        //
+        // 姿勢が空でも先に remove するのが要点。後回しにすると、人が写って
+        // いないフレームの記録が永久に残り、接続直後の数秒で上限に達する。
         val pending = synchronized(pendingFrames) {
-            pendingFrames.remove(timestampMs)
+            pendingFrames.remove(result.timestampMs())
         } ?: return
+
+        val poses = result.landmarks()
+        if (poses.isEmpty()) return  // 人が写っていないフレームは送らない
 
         val points = poses[0].map { landmark ->
             floatArrayOf(
@@ -135,20 +141,6 @@ class PoseAnalyzer(
                 landmarks = points,
             )
         )
-    }
-
-    /**
-     * ImageProxy を、画面表示と同じ向きの Bitmap にする。
-     *
-     * 回転を戻しておかないと、正規化座標の x/y が横倒しのままになり、
-     * PC 側で `x * w`, `y * h` としたときに軸が入れ替わる。
-     */
-    private fun ImageProxy.toUprightBitmap(): Bitmap {
-        val source = toBitmap()
-        val degrees = imageInfo.rotationDegrees
-        if (degrees == 0) return source
-        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
-        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
     fun close() {

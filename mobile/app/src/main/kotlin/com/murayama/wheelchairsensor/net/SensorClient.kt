@@ -55,8 +55,6 @@ class SensorClient(
     var state: State = State.IDLE
         private set
 
-    val isStreaming: Boolean get() = state == State.STREAMING
-
     // -- 接続 ---------------------------------------------------------------
     fun connect(target: ConnectionTarget, deviceName: String) {
         disconnect()

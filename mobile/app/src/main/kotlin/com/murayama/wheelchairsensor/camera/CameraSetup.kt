@@ -57,6 +57,10 @@ class CameraSetup(
             // 遅れて届いたフレームは使われない。常に最新だけを見る。
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            // CameraX 側で正立させる。Java 側で回すと 1280x720 の Bitmap を
+            // 毎フレーム 2 枚確保して 1 枚捨てることになり、30fps で約 210MB/s の
+            // アロケーションになる。
+            .setOutputImageRotationEnabled(true)
 
         applyFixedOptics(analysisBuilder)
 

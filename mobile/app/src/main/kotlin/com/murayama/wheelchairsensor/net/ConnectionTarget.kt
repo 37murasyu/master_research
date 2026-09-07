@@ -15,10 +15,11 @@ data class ConnectionTarget(
     val url: String,
     val role: String,
     val session: String,
+    // parse() の時点で分かっているので値で持つ。プロパティにすると
+    // 参照するたびに Uri.parse をやり直すことになる。
+    val host: String,
+    val port: Int,
 ) {
-    val host: String get() = Uri.parse(url).host ?: ""
-    val port: Int get() = Uri.parse(url).port
-
     companion object {
 
         /**
@@ -61,7 +62,13 @@ data class ConnectionTarget(
             val session = uri.getQueryParameter("session").orEmpty()
 
             return Result.success(
-                ConnectionTarget(url = text, role = role!!, session = session)
+                ConnectionTarget(
+                    url = text,
+                    role = role!!,
+                    session = session,
+                    host = uri.host!!,
+                    port = uri.port,
+                )
             )
         }
     }
