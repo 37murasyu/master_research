@@ -9,6 +9,7 @@ from app.core.settings import APP_NAME, Settings
 from app.shell.page_analyze import AnalyzePage
 from app.shell.page_calibrate import CalibratePage
 from app.shell.page_measure import MeasurePage
+from app.shell.widgets import RunnerPage
 
 __all__ = ["MainWindow"]
 
@@ -24,7 +25,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(WINDOW_TITLE)
         self.resize(1100, 720)
 
-        self._pages: list[QtWidgets.QWidget] = []
+        self._pages: list[RunnerPage] = []
         self._build_ui()
 
     # -- 画面 --------------------------------------------------------------
@@ -73,7 +74,7 @@ class MainWindow(QtWidgets.QMainWindow):
         黙って親だけ終了すると、計測プロセスが残って次回の起動時に
         カメラを掴んだままになる。
         """
-        running = [page for page in self._pages if getattr(page, "is_running", False)]
+        running = [page for page in self._pages if page.is_running]
         if running:
             answer = QtWidgets.QMessageBox.question(
                 self,
@@ -87,9 +88,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
         for page in self._pages:
-            shutdown = getattr(page, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+            page.shutdown()
 
         try:
             self._settings.save(self._settings_path)
@@ -105,14 +104,8 @@ def run_gui(argv: list[str] | None = None) -> int:
 
     qt.assert_lgpl_backend()
 
-    # 日本語フォントの登録は失敗しても起動を止めない。
-    # 凍結ビルドで同梱が漏れた場合など、資産が無いことは起こりうる。
-    # グラフの日本語が豆腐になるだけで、計測そのものは行える。
-    # （他の呼び出し箇所も同様にフォールバックしている）
-    try:
-        resources.configure_matplotlib_japanese()
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"[警告] 日本語フォントを登録できませんでした: {exc}")
+    # 失敗しても投げない契約（app/core/resources.py）。
+    resources.configure_matplotlib_japanese()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(list(argv or []))
     app.setApplicationName(APP_NAME)

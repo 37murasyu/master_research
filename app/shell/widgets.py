@@ -7,7 +7,7 @@ from typing import Callable
 from app.core.qt import QtCore, QtGui, QtWidgets
 from app.core.settings import SCHEMA, Setting, Settings
 
-__all__ = ["LogView", "SettingsForm", "StatusBadge"]
+__all__ = ["LogView", "SettingsForm", "StatusBadge", "RunnerPage"]
 
 
 class LogView(QtWidgets.QPlainTextEdit):
@@ -147,3 +147,117 @@ class SettingsForm(QtWidgets.QWidget):
         except (TypeError, ValueError):
             return  # 入力途中の不正値は無視する
         self.changed.emit()
+
+
+class RunnerPage(QtWidgets.QWidget):
+    """「左に操作パネル、右にログ」という 3 画面共通の骨格。
+
+    計測・キャリブレーション・解析はどれも「子プロセスを起動して、
+    その出力を眺める」画面で、違うのは左パネルの中身だけだった。
+    以前は 3 ファイルがヘッダ・ログパネル・状態遷移・終了処理を
+    それぞれ書いており、合わせて約 90 行が同じ仕事をしていた。
+
+    サブクラスが決めるのは:
+        TITLE / LOG_LABEL / SPLIT_SIZES
+        build_side_panel()                左パネル（唯一の必須実装）
+        header_widgets()                  ヘッダに置く追加ウィジェット
+        widgets_disabled_while_running()  実行中に触れなくするもの
+        widgets_enabled_while_running()   実行中だけ押せるもの（中止ボタンなど）
+    """
+
+    TITLE: str = ""
+    LOG_LABEL: str = "ログ"
+    SPLIT_SIZES: tuple[int, int] = (360, 640)
+
+    def __init__(
+        self,
+        settings: Settings,
+        role: str,
+        parent: QtWidgets.QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._settings = settings
+
+        # 循環 import を避けるためここで読む（worker -> entry -> settings の順）
+        from app.runners.worker import WorkerRunner
+
+        self._runner = WorkerRunner(role, self)
+        self._runner.output.connect(self.append_log)
+        self._runner.state_changed.connect(self._on_state)
+
+        self._build_ui()
+        self._on_state("stopped")
+
+    # -- 骨格 --------------------------------------------------------------
+    def _build_ui(self) -> None:
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+        outer.addLayout(self._build_header())
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(self.build_side_panel())
+        splitter.addWidget(self._build_log_panel())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes(list(self.SPLIT_SIZES))
+        outer.addWidget(splitter, 1)
+
+    def _build_header(self) -> QtWidgets.QHBoxLayout:
+        row = QtWidgets.QHBoxLayout()
+
+        title = QtWidgets.QLabel(self.TITLE)
+        font = title.font()
+        font.setPointSize(font.pointSize() + 4)
+        font.setBold(True)
+        title.setFont(font)
+        row.addWidget(title)
+        row.addStretch(1)
+
+        self._badge = StatusBadge()
+        row.addWidget(self._badge)
+        for widget in self.header_widgets():
+            row.addWidget(widget)
+        return row
+
+    def _build_log_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QtWidgets.QLabel(self.LOG_LABEL))
+        self._log = LogView()
+        layout.addWidget(self._log, 1)
+        return panel
+
+    # -- サブクラスが実装する部分 ------------------------------------------
+    def build_side_panel(self) -> QtWidgets.QWidget:
+        raise NotImplementedError
+
+    def header_widgets(self) -> list[QtWidgets.QWidget]:
+        return []
+
+    def widgets_disabled_while_running(self) -> list[QtWidgets.QWidget]:
+        return []
+
+    def widgets_enabled_while_running(self) -> list[QtWidgets.QWidget]:
+        return []
+
+    # -- 共通の振る舞い ----------------------------------------------------
+    def append_log(self, text: str) -> None:
+        self._log.append_text(text)
+
+    def _on_state(self, state: str) -> None:
+        self._badge.set_state(state)
+        running = state in ("starting", "running")
+        for widget in self.widgets_disabled_while_running():
+            widget.setEnabled(not running)
+        for widget in self.widgets_enabled_while_running():
+            widget.setEnabled(running)
+
+    def shutdown(self) -> None:
+        """ウィンドウを閉じるとき、子プロセスを残さない。"""
+        self._runner.stop()
+
+    @property
+    def is_running(self) -> bool:
+        return self._runner.is_running

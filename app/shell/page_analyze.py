@@ -15,10 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.core.platform_compat import user_output_dir
-from app.core.qt import QtCore, QtWidgets
+from app.core.qt import QtWidgets
 from app.core.settings import APP_NAME, Settings
-from app.runners.worker import WorkerRunner
-from app.shell.widgets import LogView, StatusBadge
+from app.shell.widgets import RunnerPage
 
 __all__ = ["AnalyzePage"]
 
@@ -76,44 +75,23 @@ TASKS: tuple[AnalysisTask, ...] = (
 )
 
 
-class AnalyzePage(QtWidgets.QWidget):
+class AnalyzePage(RunnerPage):
+    TITLE = "収録データの解析"
+    LOG_LABEL = "解析ログ"
+    SPLIT_SIZES = (380, 620)
+
     def __init__(self, settings: Settings, parent: QtWidgets.QWidget | None = None):
-        super().__init__(parent)
-        self._settings = settings
-        self._runner = WorkerRunner("script", self)
-
-        self._runner.output.connect(lambda text: self._log.append_text(text))
-        self._runner.state_changed.connect(self._on_state)
-
-        self._build_ui()
-        self._on_state("stopped")
+        super().__init__(settings, "script", parent)
         self._on_task_changed(0)
 
-    # -- 画面 --------------------------------------------------------------
-    def _build_ui(self) -> None:
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(12)
+    # -- 骨格への差し込み --------------------------------------------------
+    def widgets_disabled_while_running(self) -> list[QtWidgets.QWidget]:
+        return [self._run_button, self._task_combo]
 
-        header = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("収録データの解析")
-        font = title.font()
-        font.setPointSize(font.pointSize() + 4)
-        font.setBold(True)
-        title.setFont(font)
-        header.addWidget(title)
-        header.addStretch(1)
-        self._badge = StatusBadge()
-        header.addWidget(self._badge)
-        outer.addLayout(header)
+    def widgets_enabled_while_running(self) -> list[QtWidgets.QWidget]:
+        return [self._stop_button]
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        splitter.addWidget(self._build_control_panel())
-        splitter.addWidget(self._build_log_panel())
-        splitter.setSizes([380, 620])
-        outer.addWidget(splitter, 1)
-
-    def _build_control_panel(self) -> QtWidgets.QWidget:
+    def build_side_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -170,15 +148,6 @@ class AnalyzePage(QtWidgets.QWidget):
         layout.addStretch(1)
         return panel
 
-    def _build_log_panel(self) -> QtWidgets.QWidget:
-        panel = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QtWidgets.QLabel("解析ログ"))
-        self._log = LogView()
-        layout.addWidget(self._log, 1)
-        return panel
-
     # -- 動作 --------------------------------------------------------------
     @property
     def _current_task(self) -> AnalysisTask:
@@ -201,7 +170,7 @@ class AnalyzePage(QtWidgets.QWidget):
         task = self._current_task
         target = self._input_edit.text().strip()
         if not target:
-            self._log.append_text("[エラー] 入力を選択してください。\n")
+            self.append_log("[エラー] 入力を選択してください。\n")
             return
 
         args: list[str] = []
@@ -211,19 +180,4 @@ class AnalyzePage(QtWidgets.QWidget):
             args.append(target)
         args += self._extra_edit.text().split()
 
-        self._runner.module = task.module
-        self._runner.start(self._settings, args)
-
-    def _on_state(self, state: str) -> None:
-        self._badge.set_state(state)
-        running = state in ("starting", "running")
-        self._run_button.setEnabled(not running)
-        self._stop_button.setEnabled(running)
-        self._task_combo.setEnabled(not running)
-
-    def shutdown(self) -> None:
-        self._runner.stop()
-
-    @property
-    def is_running(self) -> bool:
-        return self._runner.is_running
+        self._runner.start(self._settings, args, module=task.module)
