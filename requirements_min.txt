@@ -5,7 +5,14 @@ pandas
 opencv-python
 matplotlib
 japanize-matplotlib
-mediapipe
+
+# mediapipe のバージョンは固定する。
+# master_research_code.py:1299-1301 が旧 Solutions API（mp.solutions.pose 等）を
+# 参照しているが、これは mediapipe 1.0 と 0.10.20 以降で削除されている。
+# 0.10.14 は Solutions API を持ち、Python 3.12 の macOS arm64 wheel もある。
+# （0.10.9 以前は cp312 の wheel が無い）
+mediapipe==0.10.14
+
 pygame
 pillow
 pyyaml

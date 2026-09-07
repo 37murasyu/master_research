@@ -117,3 +117,79 @@ def test_calib_exposes_camera_helpers_without_wmi():
     calib = importlib.import_module("calib")
     names = calib.enumerate_camera_device_names_windows()
     assert isinstance(names, list)
+
+
+# パス区切りにバックスラッシュを含む文字列。POSIX ではファイル名の一部として
+# 扱われ、'/path/to/repo\rm_method.csv' のような存在しないパスになる。
+_PATH_HINTS = (".csv", ".txt", ".dat", ".json", ".ttc", ".ttf", ".npy", ".mp4")
+
+
+def _windows_path_literals(path: Path) -> list[tuple[int, str]]:
+    """パスらしき文字列リテラルのうち、バックスラッシュ区切りのものを返す。"""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        return []
+
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        text = node.value
+        if "\\" not in text or len(text) > 120:
+            continue
+        looks_like_path = text.endswith(_PATH_HINTS) or "\\\\" in text or text.count("\\") > 1
+        if looks_like_path and any(c.isalnum() for c in text):
+            found.append((node.lineno, text))
+    return found
+
+
+def test_no_windows_path_separators_in_core_modules():
+    """アプリが依存するモジュールで、パスをバックスラッシュで組み立てていないこと。
+
+    ``config.py`` の ``folder_path + "\\\\rm_method.csv"`` は macOS で
+    ``/Users/.../master_research\\rm_method.csv`` という存在しないパスになり、
+    計測が FileNotFoundError で止まっていた。os.path.join / pathlib を使う。
+    """
+    modules = [
+        "config.py",
+        "utils.py",
+        "utils_dynamic.py",
+        "master_research_code.py",
+        "JpText.py",
+        "video_io.py",
+    ]
+    offenders = []
+    for name in modules:
+        path = REPO_ROOT / name
+        if not path.is_file():
+            continue
+        for lineno, text in _windows_path_literals(path):
+            offenders.append(f"{name}:{lineno}  {text!r}")
+
+    assert not offenders, (
+        "パスをバックスラッシュで組み立てている箇所があります。\n"
+        "os.path.join か pathlib を使ってください:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_bundled_font_is_used_instead_of_meiryo():
+    """Meiryo はライセンス上同梱できないので、参照が残っていないこと。"""
+    offenders = []
+    for path in _own_source_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if "meiryo" not in line.lower():
+                continue
+            # 説明のためのコメントや docstring での言及は許す
+            stripped = line.strip()
+            if stripped.startswith("#") or "``" in line or "以前" in line:
+                continue
+            if "truetype" in line or "font_path" in line:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}  {stripped}")
+
+    assert not offenders, (
+        "Meiryo を読み込んでいる箇所があります。Microsoft の商用フォントなので\n"
+        "配布物に同梱できません。app.core.resources.japanese_font_path() を使ってください:\n  "
+        + "\n  ".join(offenders)
+    )

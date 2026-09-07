@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -40,7 +42,9 @@ def calculate_inertia_tensor(k, mass, l):
     - 対角行列の形でのみ出力され、オフダイアゴナル要素（慣性積）は常に0とされる。
     """
 
-    csv_path = folder_path + "\\Moment of inertia estimation coefficient boys.csv"
+    csv_path = os.path.join(
+        folder_path, "Moment of inertia estimation coefficient boys.csv"
+    )
 
     row = pd.read_csv(csv_path).iloc[k]
     coeffs = np.array([row.iloc[i] for i in range(1, 10)], dtype=np.float64)

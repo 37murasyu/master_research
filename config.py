@@ -77,7 +77,7 @@ IO_DEBUG = int(os.environ.get("IO_DEBUG", "0"))
 # 1: 最新の録画ペア (cam0/1_output_*.mp4) を優先
 PREFER_RECORDING_PAIRS = int(os.environ.get("PREFER_RECORDING_PAIRS", "1"))
 # CSVファイルの絶対パス
-rm_path = folder_path + "\\rm_method.csv"
+rm_path = os.path.join(folder_path, "rm_method.csv")
 # カメラの解像度を720pに設定
 frame_shape = [720, 1280]
 fps = 30

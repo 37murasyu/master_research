@@ -8,7 +8,10 @@ def putText_jp(img, text, position, font_size, color, line_width):
     draw = ImageDraw.Draw(img_pil)
     # 日本語対応フォントの指定
     # Windows のバックスラッシュでエスケープ警告が出ないよう raw 文字列に変更
-    font = ImageFont.truetype(r"meiryo\meiryo.ttc", font_size)
+    # 同梱の IPAexゴシックを使う（Meiryo は再配布できないため）
+    from app.core.resources import japanese_font_path
+
+    font = ImageFont.truetype(str(japanese_font_path()), font_size)
         # line_width = 20  # 1行あたりの最大文字数
 
     # テキストを指定幅で改行

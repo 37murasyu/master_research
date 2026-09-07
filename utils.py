@@ -51,8 +51,9 @@ def DLT(P1, P2, point1, point2):
     return X
 
 
-def read_camera_parameters(camera_id, savefolder=folder_path + "\\camera_parameters\\"):
-    path = f"{savefolder}c{camera_id}.dat"
+def read_camera_parameters(camera_id, savefolder=None):
+    savefolder = savefolder or os.path.join(folder_path, "camera_parameters")
+    path = os.path.join(savefolder, f"c{camera_id}.dat")
     with open(path, "r", encoding="utf-8") as inf:
         _ = inf.readline()
         cmtx = [[float(en) for en in inf.readline().split()] for _ in range(3)]
@@ -61,8 +62,9 @@ def read_camera_parameters(camera_id, savefolder=folder_path + "\\camera_paramet
     return np.array(cmtx), np.array([dist])
 
 
-def read_rotation_translation(camera_id, savefolder=folder_path + "\\camera_parameters\\"):
-    path = f"{savefolder}rot_trans_c{camera_id}.dat"
+def read_rotation_translation(camera_id, savefolder=None):
+    savefolder = savefolder or os.path.join(folder_path, "camera_parameters")
+    path = os.path.join(savefolder, f"rot_trans_c{camera_id}.dat")
     with open(path, "r", encoding="utf-8") as inf:
         _ = inf.readline()
         rot = [[float(en) for en in inf.readline().split()] for _ in range(3)]
@@ -82,9 +84,11 @@ def _convert_to_homogeneous(pts):
 
 def get_projection_matrix(camera_id, file_mode, base_dir=None):
     if base_dir:
-        base = os.path.join(base_dir, "")
+        base = base_dir
     else:
-        base = folder_path + ("\\camera_parameters\\Param_for_MYvideo\\" if file_mode else "\\camera_parameters\\")
+        base = os.path.join(folder_path, "camera_parameters")
+        if file_mode:
+            base = os.path.join(base, "Param_for_MYvideo")
     cmtx, _ = read_camera_parameters(camera_id, base)
     rvec, tvec = read_rotation_translation(camera_id, base)
     return cmtx @ _make_homogeneous_rep_matrix(rvec, tvec)[:3]
@@ -209,14 +213,17 @@ def put_text_jp(img, text, position, font_size, color, line_width):
     # フォント取得（キャッシュあり）
     def _get_jp_font(sz: int):
         # シンプルなキャッシュ
-        cache_key = f"meiryo_{sz}"
+        cache_key = f"jp_{sz}"
         font_obj = _FONT_CACHE.get(cache_key)
         if font_obj is not None:
             return font_obj
         try:
-            font_path = folder_path + "\\meiryo\\meiryo.ttc"
-            font_obj = ImageFont.truetype(font_path, sz)
-        except OSError:
+            # 同梱の IPAexゴシックを使う。以前は Meiryo を参照していたが、
+            # Microsoft の商用フォントなので配布物に含められない。
+            from app.core.resources import japanese_font_path
+
+            font_obj = ImageFont.truetype(str(japanese_font_path()), sz)
+        except (OSError, ImportError, FileNotFoundError):
             font_obj = ImageFont.load_default()
         _FONT_CACHE[cache_key] = font_obj
         return font_obj

@@ -1677,7 +1677,7 @@ if one_rm_row.empty:
     )
 one_rm_percentage = one_rm_row["1RM%"].values[0] / 100
 # ファイルを読み込みモードで開く
-with open(folder_path + "\\max_value.txt", "r", encoding="utf-8") as file:
+with open(os.path.join(folder_path, "max_value.txt"), "r", encoding="utf-8") as file:
     # ファイルからデータを一行読み込む
     line = file.readline().strip()  # strip()で余計な空白や改行を除去
     if line == "":
@@ -2648,8 +2648,12 @@ DRAW_LABEL_CACHE = os.getenv('DRAW_LABEL_CACHE', '1') not in ('0', 'false', 'Fal
 def _label_font(size: int):
     from PIL import ImageFont as _IF
     try:
-        return _IF.truetype(os.path.join(folder_path, 'meiryo', 'meiryo.ttc'), size)
-    except OSError:
+        # 同梱の IPAexゴシックを使う。以前は Meiryo を参照していたが、
+        # Microsoft の商用フォントなので配布物に含められない。
+        from app.core.resources import japanese_font_path
+
+        return _IF.truetype(str(japanese_font_path()), size)
+    except (OSError, ImportError, FileNotFoundError):
         return _IF.load_default()
 
 
