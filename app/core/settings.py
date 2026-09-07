@@ -95,17 +95,34 @@ CURATED: dict[str, dict[str, Any]] = {
         ),
     },
     # --- (b) 利用者が触る項目 --------------------------------------------
+    # 被験者番号。これを渡さないと master_research_code.py:905 が input() で
+    # 標準入力を待つ。GUI から起動すると端末が無いのでハングする
+    # （ランナー側で stdin を閉じる保険も入れてあるが、値は明示的に渡すべき）。
+    "SUBJECT_ID": {
+        "type": "str",
+        "ui_visible": True,
+        "group": "被験者",
+        "description": (
+            "被験者番号（例: S001）。最大保持重量 m_max_part_<番号>.json の"
+            "読み込みに使う。未指定だと既定値で動く。"
+        ),
+    },
+    # config.py 側は int(os.environ.get(...)) で読むが、実質は 0/1 の真偽値。
+    # UI ではチェックボックスにする。"1"/"0" を渡せば int() は問題なく解釈する。
     "HEADLESS": {
+        "type": "bool",
         "ui_visible": True,
         "group": "表示",
         "description": "ウィンドウを一切開かずに実行する。計測を裏で走らせたいときに使う。",
     },
     "USE_SAMPLE_VIDEOS": {
+        "type": "bool",
         "ui_visible": True,
         "group": "入力ソース",
         "description": "カメラの代わりに収録済み動画を入力にする。動作確認や再解析に使う。",
     },
     "AUTO_FALLBACK_TO_FILES": {
+        "type": "bool",
         "ui_visible": True,
         "group": "入力ソース",
         "description": "カメラを開けなかったとき、自動で動画ファイルに切り替える。",
@@ -121,6 +138,7 @@ CURATED: dict[str, dict[str, Any]] = {
         "description": "カメラ1の指定。数字ならデバイス番号、それ以外は名前やパスとして扱う。",
     },
     "IO_DEBUG": {
+        "type": "bool",
         "ui_visible": True,
         "group": "診断",
         "description": "入出力まわりの詳細ログを出す。カメラが開かないときの切り分けに使う。",
@@ -143,17 +161,16 @@ def _load_schema() -> dict[str, Setting]:
     for name, overrides in CURATED.items():
         base = schema.get(name)
         if base is None:
-            # 生成元に無い設定も UI に出せるようにしておく（config.py 側の変数など）
+            # 生成元に無い設定も UI に出せるようにしておく
             base = Setting(
                 name=name,
                 type=overrides.get("type", "str"),
                 code_default=overrides.get("code_default"),
                 group=overrides.get("group", "その他"),
             )
-        schema[name] = replace(
-            base,
-            **{k: v for k, v in overrides.items() if k not in ("type", "code_default")},
-        )
+        # 型も上書きできる。機械推定では int になるが実質は真偽値、という項目が
+        # あるため（config.py の int(os.environ.get("HEADLESS", "0")) など）。
+        schema[name] = replace(base, **overrides)
 
     return schema
 

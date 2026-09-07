@@ -1,7 +1,18 @@
 {
-  "_generated_from": "master_research_code.py",
+  "_generated_from": [
+    "master_research_code.py",
+    "config.py"
+  ],
   "_note": "tools/extract_env_schema.py で生成。手で編集せず、上書きは settings.py の CURATED で行う。",
   "settings": {
+    "AUTO_FALLBACK_TO_FILES": {
+      "type": "int",
+      "default": "1",
+      "group": "その他",
+      "lines": [
+        66
+      ]
+    },
     "BODY_MASS_KG": {
       "type": "float",
       "default": "65",
@@ -16,6 +27,22 @@
       "group": "キャリブレーション",
       "lines": [
         1692
+      ]
+    },
+    "CAM0": {
+      "type": "str",
+      "default": null,
+      "group": "カメラ",
+      "lines": [
+        55
+      ]
+    },
+    "CAM1": {
+      "type": "str",
+      "default": null,
+      "group": "カメラ",
+      "lines": [
+        56
       ]
     },
     "CAMERA_DIAG": {
@@ -556,6 +583,14 @@
         1396
       ]
     },
+    "HEADLESS": {
+      "type": "int",
+      "default": "0",
+      "group": "その他",
+      "lines": [
+        70
+      ]
+    },
     "HEALTH_INTERVAL": {
       "type": "int",
       "default": "150",
@@ -610,6 +645,14 @@
       "group": "その他",
       "lines": [
         1439
+      ]
+    },
+    "IO_DEBUG": {
+      "type": "int",
+      "default": "0",
+      "group": "その他",
+      "lines": [
+        73
       ]
     },
     "KPS_FAST_ON": {
@@ -858,6 +901,14 @@
         761
       ]
     },
+    "PREFER_RECORDING_PAIRS": {
+      "type": "int",
+      "default": "1",
+      "group": "その他",
+      "lines": [
+        78
+      ]
+    },
     "RT_CYCLE_AXIS": {
       "type": "str",
       "default": "y",
@@ -1018,6 +1069,14 @@
         2547
       ]
     },
+    "SKIP_FRAMES": {
+      "type": "int",
+      "default": "0",
+      "group": "その他",
+      "lines": [
+        105
+      ]
+    },
     "STOP_AFTER": {
       "type": "str",
       "default": "",
@@ -1032,6 +1091,14 @@
       "group": "その他",
       "lines": [
         902
+      ]
+    },
+    "TIMESTAMP_OVERRIDE": {
+      "type": "str",
+      "default": "",
+      "group": "その他",
+      "lines": [
+        85
       ]
     },
     "TRACE_DYN": {
@@ -1097,6 +1164,14 @@
       "group": "入力ソース",
       "lines": [
         706
+      ]
+    },
+    "USE_SAMPLE_VIDEOS": {
+      "type": "int",
+      "default": "0",
+      "group": "入力ソース",
+      "lines": [
+        65
       ]
     },
     "VIDEO_TRACE_EVERY": {

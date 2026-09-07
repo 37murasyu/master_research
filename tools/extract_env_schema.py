@@ -28,6 +28,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# 既定の走査対象。config.py も含めるのは、入力ソースや HEADLESS など
+# 実行を左右する設定がそちらで定義されているため。
+DEFAULT_SOURCES = (
+    REPO_ROOT / "master_research_code.py",
+    REPO_ROOT / "config.py",
+)
+
 # bool として扱う比較先。既存コードの慣用句。
 BOOL_LITERALS = {"1", "true", "True", "yes", "on"}
 
@@ -63,12 +70,29 @@ def _attach_parents(tree: ast.AST) -> None:
 
 
 def _is_getenv(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "getenv"
+    """``os.getenv(...)`` と ``os.environ.get(...)`` の両方を拾う。
+
+    config.py は後者を使っており、片方だけ見ていると HEADLESS や
+    USE_SAMPLE_VIDEOS のような重要な設定を取りこぼす。
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return False
+
+    # os.getenv(...)
+    if (
+        node.func.attr == "getenv"
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "os"
+    ):
+        return True
+
+    # os.environ.get(...)
+    return (
+        node.func.attr == "get"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "environ"
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "os"
     )
 
 
@@ -152,15 +176,27 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source",
-        default=str(REPO_ROOT / "master_research_code.py"),
-        help="走査対象の Python ファイル",
+        action="append",
+        default=None,
+        help="走査対象の Python ファイル（複数指定可）",
     )
     parser.add_argument("--out", default="-", help="出力先（既定は標準出力）")
     args = parser.parse_args()
 
-    schema = extract(Path(args.source))
+    sources = [Path(s) for s in (args.source or DEFAULT_SOURCES)]
+    schema: dict[str, dict] = {}
+    for source in sources:
+        for name, entry in extract(source).items():
+            if name in schema:
+                schema[name]["lines"].extend(entry["lines"])
+                if schema[name]["type"] == "str" and entry["type"] != "str":
+                    schema[name]["type"] = entry["type"]
+            else:
+                schema[name] = entry
+    schema = dict(sorted(schema.items()))
+
     payload = {
-        "_generated_from": Path(args.source).name,
+        "_generated_from": [s.name for s in sources],
         "_note": "tools/extract_env_schema.py で生成。手で編集せず、上書きは settings.py の CURATED で行う。",
         "settings": schema,
     }
