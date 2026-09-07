@@ -19,11 +19,7 @@ import os
 import platform
 import subprocess
 import sys
-from functools import lru_cache
 from pathlib import Path
-
-# pylint: disable=no-member
-import cv2 as cv
 
 __all__ = [
     "is_windows",
@@ -65,7 +61,14 @@ def camera_backends() -> list[int]:
 
     定数は OpenCV のビルド構成によって存在しないことがあるので ``getattr`` で確認する
     （``video_io.py:100`` が既に同じ配慮をしている）。
+
+    cv2 をこの関数の中で import するのが要点。トップレベルに置くと、
+    このモジュールを使うだけの GUI（設定ディレクトリの取得など）が
+    起動時に OpenCV を読み込む羽目になる（実測 0.23 秒 / RSS +52MB）。
     """
+    # pylint: disable=no-member,import-outside-toplevel
+    import cv2 as cv
+
     if is_windows():
         preferred = ["CAP_DSHOW", "CAP_MSMF"]
     elif is_macos():
@@ -73,13 +76,8 @@ def camera_backends() -> list[int]:
     else:
         preferred = ["CAP_V4L2"]
 
-    backends: list[int] = []
-    for name in preferred:
-        value = getattr(cv, name, None)
-        if value is not None and value not in backends:
-            backends.append(value)
-    if cv.CAP_ANY not in backends:
-        backends.append(cv.CAP_ANY)
+    backends = [v for v in (getattr(cv, n, None) for n in preferred) if v is not None]
+    backends.append(cv.CAP_ANY)
     return backends
 
 
@@ -89,31 +87,19 @@ def enumerate_camera_device_names() -> list[str]:
     名前は「どのカメラを校正済みか」の対応付け（``calib.load_camera_mapping``）に使う。
     取得できなくても計測自体は index 指定で動くので、**失敗は空リストで返し、例外にしない**。
 
-    結果はキャッシュする（macOS の ``system_profiler`` は 1 秒前後かかるため、
-    UI から繰り返し呼ばれても平気なように）。キャッシュ本体は tuple で保持し、
-    呼び出し側にはコピーした list を返すので、呼び出し側が破壊してもキャッシュは汚れない。
-    カメラを挿し直したときは ``enumerate_camera_device_names.cache_clear()`` を呼ぶ。
+    キャッシュはしない。唯一の呼び出し元は「カメラを検出」ボタンで、
+    押すたびに現在の接続状態を知りたい（挿し直した直後が典型）。
+    macOS の ``system_profiler`` は 1 秒前後かかるが、呼び出し側は
+    ワーカースレッドで回している。
     """
-    return list(_camera_device_names_cached())
-
-
-def _cache_clear() -> None:
-    _camera_device_names_cached.cache_clear()
-
-
-enumerate_camera_device_names.cache_clear = _cache_clear  # type: ignore[attr-defined]
-
-
-@lru_cache(maxsize=1)
-def _camera_device_names_cached() -> tuple[str, ...]:
     try:
         if is_windows():
-            return tuple(_camera_names_windows())
+            return _camera_names_windows()
         if is_macos():
-            return tuple(_camera_names_macos())
-        return tuple(_camera_names_linux())
+            return _camera_names_macos()
+        return _camera_names_linux()
     except Exception:  # pragma: no cover - 環境依存の失敗は握りつぶす
-        return ()
+        return []
 
 
 def _camera_names_windows() -> list[str]:

@@ -4,13 +4,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# 日本語表示。同梱の IPAexゴシックを matplotlib に登録する。
-try:
-    from app.core.resources import configure_matplotlib_japanese
+# 日本語表示。同梱の IPAexゴシックを matplotlib に登録する（失敗しても投げない）。
+from app.core.resources import configure_matplotlib_japanese
 
-    configure_matplotlib_japanese()
-except Exception:  # pylint: disable=broad-except
-    pass  # フォントが無くても図は出る（日本語が豆腐になるだけ）
+configure_matplotlib_japanese()
 
 
 def main():

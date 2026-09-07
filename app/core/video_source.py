@@ -29,7 +29,14 @@ import numpy as np
 
 from app.core.platform_compat import camera_backends
 
-__all__ = ["SourceKind", "SourceSpec", "parse_spec", "open_source", "VideoSource"]
+__all__ = [
+    "SourceKind",
+    "SourceSpec",
+    "parse_spec",
+    "open_capture",
+    "open_source",
+    "VideoSource",
+]
 
 
 class SourceKind(Enum):
@@ -124,14 +131,6 @@ class VideoSource:
         return self._capture is not None and self._capture.isOpened()
 
     @property
-    def is_live(self) -> bool:
-        return self.spec.is_live
-
-    @property
-    def is_seekable(self) -> bool:
-        return self.spec.is_seekable
-
-    @property
     def fps(self) -> float:
         """ソースが申告する fps。信用できない値は 0 を返す。
 
@@ -175,10 +174,16 @@ class VideoSource:
             self._capture.release()
 
 
-def open_source(spec: int | str) -> VideoSource | None:
-    """入力を開く。開けなければ **例外ではなく None** を返す。
+def open_capture(spec: int | str) -> "tuple[SourceSpec, cv.VideoCapture] | None":
+    """種類に応じたバックエンドを順に試して開く。開けなければ None。
 
-    無線化すると接続失敗は日常的に起きるので、呼び出し側で扱えるようにする。
+    「OS ごとの定数」ではなく「開き方」をここに集約するのが要点。
+    定数だけを配ると、呼び出し側が全員「順に試す・失敗したら release する」
+    ループを書き直すことになる（実際 5 箇所に複製されていた）。
+
+    素の ``cv.VideoCapture`` を返すのは、解像度設定など OpenCV の API を
+    直接使いたい呼び出し側（``calib.py``）があるため。
+    ラップした形が欲しい場合は :func:`open_source` を使う。
     """
     parsed = parse_spec(spec)
 
@@ -188,8 +193,20 @@ def open_source(spec: int | str) -> VideoSource | None:
         except Exception:
             continue
         if capture is not None and capture.isOpened():
-            return VideoSource(parsed, capture)
+            return parsed, capture
         if capture is not None:
             capture.release()
 
     return None
+
+
+def open_source(spec: int | str) -> VideoSource | None:
+    """入力を開く。開けなければ **例外ではなく None** を返す。
+
+    無線化すると接続失敗は日常的に起きるので、呼び出し側で扱えるようにする。
+    """
+    opened = open_capture(spec)
+    if opened is None:
+        return None
+    parsed, capture = opened
+    return VideoSource(parsed, capture)

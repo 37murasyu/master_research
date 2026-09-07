@@ -112,11 +112,16 @@ def test_no_unconditional_windows_only_imports():
     )
 
 
-def test_calib_exposes_camera_helpers_without_wmi():
-    """calib のカメラ列挙が wmi 非依存で呼べること（Windows 以外では空を返す）。"""
-    calib = importlib.import_module("calib")
-    names = calib.enumerate_camera_device_names_windows()
-    assert isinstance(names, list)
+def test_camera_enumeration_works_without_wmi():
+    """カメラ列挙が wmi 非依存で呼べること（Windows 以外では空を返す）。
+
+    calib.py:13 の無条件 `import wmi` が macOS でモジュール全体を
+    import 不能にしていた問題の回帰テスト。
+    """
+    importlib.import_module("calib")  # import 自体が通ること
+    from app.core.platform_compat import enumerate_camera_device_names
+
+    assert isinstance(enumerate_camera_device_names(), list)
 
 
 # パス区切りにバックスラッシュを含む文字列。POSIX ではファイル名の一部として

@@ -20,6 +20,7 @@ __all__ = [
     "asset_path",
     "require_asset",
     "japanese_font_path",
+    "japanese_font",
     "configure_matplotlib_japanese",
 ]
 
@@ -84,15 +85,54 @@ def japanese_font_path() -> Path:
     return require_asset("fonts", "ipaexg.ttf")
 
 
+_MISSING_FONT_WARNED = False
+
+
+def _warn_missing_font_once(exc: Exception) -> None:
+    global _MISSING_FONT_WARNED  # pylint: disable=global-statement
+    if _MISSING_FONT_WARNED:
+        return
+    _MISSING_FONT_WARNED = True
+    print(f"[警告] 同梱の日本語フォントを読み込めません: {exc}\n"
+          f"        日本語が豆腐になりますが、計測そのものは行えます。")
+
+
+@lru_cache(maxsize=16)
+def japanese_font(size: int):
+    """日本語描画用の PIL フォントを返す。**絶対に例外を投げない**。
+
+    フォントが無ければ既定フォントにフォールバックし、警告を 1 回だけ出す。
+    「資産が無いことは起こりうる」という判断はここで 1 度だけ下す。
+    呼び出し側が各々 try/except を書くと、扱いが 4 通りに分かれて
+    ``require_asset`` の丁寧なメッセージが半分捨てられる（実際そうなっていた）。
+
+    サイズ別にキャッシュする。``utils.py`` と ``master_research_code.py`` に
+    別々のフォントキャッシュがあったのを 1 つに寄せている。
+    """
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.truetype(str(japanese_font_path()), size)
+    except Exception as exc:  # pylint: disable=broad-except
+        _warn_missing_font_once(exc)
+        return ImageFont.load_default()
+
+
 def configure_matplotlib_japanese() -> None:
     """matplotlib が日本語を豆腐にしないよう、同梱フォントを登録する。
 
-    ``import japanize_matplotlib`` の置き換え。冪等なので何度呼んでもよい。
+    ``import japanize_matplotlib`` の置き換え。冪等で、**絶対に例外を投げない**。
+    凍結ビルドで同梱が漏れることは起こりうるが、それで起動を止める理由はない。
     """
     import matplotlib
     from matplotlib import font_manager
 
-    font_path = japanese_font_path()
+    try:
+        font_path = japanese_font_path()
+    except Exception as exc:  # pylint: disable=broad-except
+        _warn_missing_font_once(exc)
+        return
+
     font_manager.fontManager.addfont(str(font_path))
     family = font_manager.FontProperties(fname=str(font_path)).get_name()
 

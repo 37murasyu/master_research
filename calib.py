@@ -15,7 +15,8 @@ import yaml
 # OS 差（カメラのバックエンド優先順・デバイス名列挙）はここに集約している。
 # 以前は wmi をトップレベルで import していたため、macOS ではこのモジュールを
 # import した時点で ModuleNotFoundError になっていた。
-from app.core.platform_compat import camera_backends, enumerate_camera_device_names
+from app.core.platform_compat import enumerate_camera_device_names
+from app.core.video_source import open_capture
 
 # import sys
 from scipy import linalg
@@ -24,7 +25,7 @@ from botocore.exceptions import NoCredentialsError, BotoCoreError
 # from config import (PADDING, dt, folder_path, fps, frame_shape, g,
 #                    input_stream1, input_stream2, m1, m2, pose_keypoints,
 #                    rm_path, save_dir, timestamp, w)
-from JpText import putText_jp
+from utils import put_text_jp as putText_jp
 from lambda_receive import invoke
 
 RMSE = 0
@@ -179,19 +180,12 @@ def save_frames_single_camera(camera_name):
     view_resize = calibration_settings["view_resize"]
     cooldown_time = calibration_settings["cooldown"]
 
-    # open video stream（OS ごとの優先順。Windows は MSMF の失敗を避けるため DSHOW を先に、
-    # macOS は AVFoundation を先に試す）
-    cap = None
-    for be in camera_backends():
-        cap = cv.VideoCapture(camera_device_id, be)
-        if cap is not None and cap.isOpened():
-            print(f"[INFO] Opened {camera_name} index={camera_device_id} backend={be}")
-            break
-        if cap:
-            cap.release()
-            cap = None
-    if cap is None or not cap.isOpened():
+    # open video stream（OS ごとの優先順は video_source が持っている）
+    opened = open_capture(camera_device_id)
+    if opened is None:
         raise RuntimeError(f"{camera_name} (index {camera_device_id}) をオープンできません。USB接続/他アプリ占有を確認してください。")
+    _spec, cap = opened
+    print(f"[INFO] Opened {camera_name} index={camera_device_id}")
 
     # change resolution (with verification)
     width, height = _set_and_verify_resolution(cap, width, height, label=camera_name)
@@ -392,17 +386,12 @@ def save_frames_two_cams(camera0_name, camera1_name):
     number_to_save = calibration_settings["stereo_calibration_frames"]
 
     def _open_cam(index, label):
-        preferred_backends = camera_backends()
-        last_cap = None
-        for be in preferred_backends:
-            cap = cv.VideoCapture(index, be)
-            if cap is not None and cap.isOpened():
-                print(f"[INFO] Opened {label} index={index} backend={be}")
-                return cap
-            if cap:
-                cap.release()
-        print(f"[ERROR] {label} (index {index}) をオープンできません。")
-        return last_cap
+        opened = open_capture(index)
+        if opened is None:
+            print(f"[ERROR] {label} (index {index}) をオープンできません。")
+            return None
+        print(f"[INFO] Opened {label} index={index}")
+        return opened[1]
 
     cam0_index = calibration_settings[camera0_name]
     cam1_index = calibration_settings[camera1_name]
@@ -1210,32 +1199,17 @@ def process_camera_intrinsics(label, current_device_name, image_prefix):
     return cmtx, dist
 
 
-def enumerate_camera_device_names_windows():
-    """後方互換のための別名。実体は platform_compat 側にある。
-
-    Windows 以外でも空リストを返すだけで例外にはならない。
-    """
-    return enumerate_camera_device_names()
-
-
 def probe_cameras(max_index=10):
     print(f"[INFO] Probing camera indices 0..{max_index-1}")
     available = []
-    backends = camera_backends()
     for i in range(max_index):
-        # OS ごとの優先順で試す。以前は CAP_DSHOW 固定だったため、
+        # OS ごとの優先順で開く。以前は CAP_DSHOW 固定だったため、
         # macOS では接続済みのカメラが 1 台も見つからなかった。
-        cap = None
-        for be in backends:
-            cap = cv.VideoCapture(i, be)
-            if cap is not None and cap.isOpened():
-                break
-            if cap is not None:
-                cap.release()
-                cap = None
-        if cap is None:
+        opened = open_capture(i)
+        if opened is None:
             print(f"  Index {i}: (open failed)")
             continue
+        cap = opened[1]
 
         ok, frame = cap.read()
         if ok and frame is not None:

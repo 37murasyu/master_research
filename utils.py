@@ -213,10 +213,10 @@ def put_text_jp(img, text, position, font_size, color, line_width):
     # フォント取得（キャッシュあり）
     def _get_jp_font(sz: int):
         # シンプルなキャッシュ
-        cache_key = f"jp_{sz}"
-        font_obj = _FONT_CACHE.get(cache_key)
-        if font_obj is not None:
-            return font_obj
+        # フォントの取得と欠落時の扱いは resources に集約してある。
+        from app.core.resources import japanese_font
+
+        return japanese_font(sz)
         try:
             # 同梱の IPAexゴシックを使う。以前は Meiryo を参照していたが、
             # Microsoft の商用フォントなので配布物に含められない。

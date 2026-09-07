@@ -2649,17 +2649,11 @@ USE_NATIVE_DRAW = os.getenv('USE_NATIVE_DRAW', '1') in ('1','true','True')
 DRAW_LABEL_CACHE = os.getenv('DRAW_LABEL_CACHE', '1') not in ('0', 'false', 'False')
 
 
-@lru_cache(maxsize=8)
 def _label_font(size: int):
-    from PIL import ImageFont as _IF
-    try:
-        # 同梱の IPAexゴシックを使う。以前は Meiryo を参照していたが、
-        # Microsoft の商用フォントなので配布物に含められない。
-        from app.core.resources import japanese_font_path
+    # フォントの取得・キャッシュ・欠落時の扱いは resources に集約してある。
+    from app.core.resources import japanese_font
 
-        return _IF.truetype(str(japanese_font_path()), size)
-    except (OSError, ImportError, FileNotFoundError):
-        return _IF.load_default()
+    return japanese_font(size)
 
 
 @lru_cache(maxsize=512)
