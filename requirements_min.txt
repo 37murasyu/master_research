@@ -4,7 +4,6 @@ scipy
 pandas
 opencv-python
 matplotlib
-japanize-matplotlib
 
 # mediapipe のバージョンは固定する。
 # master_research_code.py:1299-1301 が旧 Solutions API（mp.solutions.pose 等）を
@@ -23,13 +22,6 @@ pyyaml
 # バックエンドを確定させたい場合は PYQTGRAPH_QT_LIB=PySide6 を設定する。
 pyqtgraph
 PySide6
-
-### Python 3.12 対応
-# 3.12 で distutils が標準ライブラリから削除された。japanize-matplotlib が
-# distutils.version.LooseVersion を import するため、setuptools のシムが要る。
-# NOTE: 恒久対応としては japanize-matplotlib をやめ、同梱フォントを
-#       matplotlib に直接登録する方式へ移行する（アプリ側で実施）。
-setuptools
 
 ### スマホ接続用の QR 表示（PC が接続先を端末に渡す手段）
 segno

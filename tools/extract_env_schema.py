@@ -187,12 +187,19 @@ def main() -> int:
     schema: dict[str, dict] = {}
     for source in sources:
         for name, entry in extract(source).items():
-            if name in schema:
-                schema[name]["lines"].extend(entry["lines"])
-                if schema[name]["type"] == "str" and entry["type"] != "str":
-                    schema[name]["type"] = entry["type"]
-            else:
+            if name not in schema:
                 schema[name] = entry
+                continue
+
+            existing = schema[name]
+            existing["lines"].extend(entry["lines"])
+            if existing["type"] == "str" and entry["type"] != "str":
+                existing["type"] = entry["type"]
+            # ファイルをまたぐ既定値の食い違いも記録する。ここを黙って
+            # 先勝ちにすると、Settings.as_env() が片方の値を全プロセスへ
+            # 強制することになり、衝突検出を書いた意味が失われる。
+            if existing["default"] != entry["default"]:
+                existing.setdefault("conflicting_defaults", []).append(entry["default"])
     schema = dict(sorted(schema.items()))
 
     payload = {

@@ -7,7 +7,12 @@ from app.core.platform_compat import beep
 
 # pylint: disable=no-member
 import cv2 as cv
-import japanize_matplotlib  # pylint: disable=unused-import # 日本語表示のサポート
+# 日本語表示。同梱の IPAexゴシックを matplotlib に登録する。
+# japanize_matplotlib は distutils.version を import するため Python 3.12 で動かない
+# （distutils が標準ライブラリから削除された）。
+from app.core.resources import configure_matplotlib_japanese
+
+configure_matplotlib_japanese()
 import matplotlib.pyplot as plt
 import mediapipe as mp
 import numpy as np

@@ -9,8 +9,6 @@ cd "$SCRIPT_DIR"
 #
 # mediapipe は 3.9〜3.12 にしか対応していない。素の `python3` を使うと、
 # 3.13 以降が入っている環境では mediapipe の wheel が見つからず失敗する。
-# さらに 3.12 で distutils が標準ライブラリから消えたため、japanize-matplotlib が
-# import できるよう setuptools も入れる（詳細は requirements_min.txt を参照）。
 # ---------------------------------------------------------------------------
 REQUIRED_PY="${REQUIRED_PY:-3.12}"
 

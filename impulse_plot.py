@@ -1,17 +1,21 @@
+import os
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Optional: 日本語表示対応
+# 日本語表示。同梱の IPAexゴシックを matplotlib に登録する。
 try:
-    import japanize_matplotlib  # pylint: disable=unused-import
-except ImportError:
-    pass
+    from app.core.resources import configure_matplotlib_japanese
+
+    configure_matplotlib_japanese()
+except Exception:  # pylint: disable=broad-except
+    pass  # フォントが無くても図は出る（日本語が豆腐になるだけ）
 
 
 def main():
     # 結合済み統計CSVファイルパス
-    stats_csv = "output_data\\all_sessions_stats_combined_grouped.csv"
+    stats_csv = os.path.join("output_data", "all_sessions_stats_combined_grouped.csv")
     # 各セッションのサイクル数（滝沢1～柳瀬4）
     # 実データのサイクル数に合わせて設定してください
     cycle_counts = [10, 12, 11, 9, 10, 12, 11, 9]

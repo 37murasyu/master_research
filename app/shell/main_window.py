@@ -104,7 +104,15 @@ def run_gui(argv: list[str] | None = None) -> int:
     from app.core import qt
 
     qt.assert_lgpl_backend()
-    resources.configure_matplotlib_japanese()
+
+    # 日本語フォントの登録は失敗しても起動を止めない。
+    # 凍結ビルドで同梱が漏れた場合など、資産が無いことは起こりうる。
+    # グラフの日本語が豆腐になるだけで、計測そのものは行える。
+    # （他の呼び出し箇所も同様にフォールバックしている）
+    try:
+        resources.configure_matplotlib_japanese()
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[警告] 日本語フォントを登録できませんでした: {exc}")
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(list(argv or []))
     app.setApplicationName(APP_NAME)

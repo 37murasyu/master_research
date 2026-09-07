@@ -8,7 +8,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Rectangle
 from matplotlib.ticker import PercentFormatter
-import japanize_matplotlib  # Enable Japanese font rendering
+# 日本語表示。同梱の IPAexゴシックを matplotlib に登録する。
+# japanize_matplotlib は distutils.version を import するため Python 3.12 で動かない
+# （distutils が標準ライブラリから削除された）。
+from app.core.resources import configure_matplotlib_japanese
+
+configure_matplotlib_japanese()
 
 plt.rcParams.update(
     {
