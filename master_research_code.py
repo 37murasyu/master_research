@@ -45,8 +45,8 @@ from energy_pipeline import angle_between
 from body_part_storage_module import BodyPartDataStorage
 from config import (
     PADDING,
-    dt,
     folder_path,
+    resolve_dynamics_dt,
     fps,
     g,
     input_stream1,
@@ -186,7 +186,7 @@ _fc_current = E_FC  # 現在のfc値（Hz）
 _fc_update_counter = 0  # 更新フレームカウンタ
 _fc_update_interval = None  # lazy set: int(fps / E_FC_UPDATE_HZ)
 _lpf_fps_ema = None  # 実効fps推定（loop_dt由来EMA）
-_e_dt_sec_current = float(dt) if (isinstance(dt, (int, float)) and dt > 0) else (1.0 / 30.0)
+_e_dt_sec_current = 1.0 / 30.0  # ループ開始前に実 fps から上書きされる（後段参照）
 
 # ===================== 重力推定のグローバル状態 =====================
 _grav_up_samples = collections.deque(maxlen=max(10, GRAVITY_DETECT_FRAMES))
@@ -2947,6 +2947,36 @@ _src_fps = float(_src_fps_candidates[0]) if _src_fps_candidates else 30.0
 _rt_fixed_skip = int(max(0, round(_src_fps / max(RT_POSE_FIXED_HZ, 1e-6)) - 1))
 _lpf_fps_ema = float(np.clip(_src_fps, E_FPS_MIN, E_FPS_MAX))
 _e_dt_sec_current = 1.0 / max(_lpf_fps_ema, 1e-6)
+
+# ===================== 力学計算のサンプル間隔 =====================
+# 微分（速度・加速度・角速度）と積分（エネルギー・力積）が必要とするのは、
+# カメラのフレーム間隔ではなく「連続して**処理される**フレームの実時間間隔」。
+# 既定では RT_POSE_FIXED_HZ_ON=1 により 8 フレームに 1 回しか処理しないので、
+# 1/fps では 8 倍小さすぎる。逆に config.dt にあった 0.3 は
+#   素の既定（4Hz 処理 = 0.267s）に対して約 12% 過大
+#   アプリ既定（RT_POSE_FIXED_HZ_ON=0 = 0.0333s）に対して 9 倍過大
+# であり、1/dt^2 で効く慣性項を実質ゼロに潰していた。
+#
+# 実測タイムスタンプ差ではなく設定から算出するのは、ループのジッタが
+# そのまま速度・加速度のノイズになり、同じ入力でも結果が変わってしまうため。
+# 実測との突き合わせは下のループ内で行い、乖離したら警告する。
+# DT_SEC を指定すれば手で上書きできる（旧挙動の再現は DT_SEC=0.3）。
+_DYN_DT, _dyn_dt_source = resolve_dynamics_dt(
+    _src_fps,
+    fixed_hz_on=RT_POSE_FIXED_HZ_ON,
+    fixed_skip=_rt_fixed_skip,
+    skip_mod=skip_mod,
+    override=os.getenv('DT_SEC', '').strip() or None,
+)
+_dt_sec_override = os.getenv('DT_SEC', '').strip()
+print(f"[DT] dt={_DYN_DT:.5f}s ({_dyn_dt_source})"
+      + ("  ※RT_DELAY_SKIP_ON のため実際の間隔は変動します"
+         if (RT_DELAY_SKIP_ON and not _dt_sec_override) else ""))
+
+# 実測との検算用。処理された反復の開始時刻の差を見る。
+# frame_dt は間引かれたフレームの時間を含まないので使えない。
+_dyn_dt_prev_start = None
+_dyn_dt_warned = False
 if E_DEBUG:
     print(f"[RTSKIP] src_fps={_src_fps:.3f} (cam0={_src_fps0:.3f}, cam1={_src_fps1:.3f})")
     if RT_POSE_FIXED_HZ_ON:
@@ -3020,6 +3050,16 @@ while True:
     if (skip_counter % skip_mod != 0) and (_rt_burst_remaining <= 0):
         _perf.next()
         continue
+
+    # 設定から算出した _DYN_DT が実態と合っているかを一度だけ検算する。
+    # 立ち上がりは重いので、しばらく回してから見る。
+    if (not _dyn_dt_warned) and WHILE_COUNT > 30 and _dyn_dt_prev_start is not None:
+        _measured_dt = start_time - _dyn_dt_prev_start
+        if _measured_dt > 0 and abs(_measured_dt - _DYN_DT) / _DYN_DT > 0.2:
+            print(f"[DT][警告] 設定 dt={_DYN_DT:.4f}s に対し実測 {_measured_dt:.4f}s。"
+                  f" カメラが想定のレートを出せていない可能性があります。")
+            _dyn_dt_warned = True
+    _dyn_dt_prev_start = start_time
     # このタイミングのフレームのみ retrieve してデコード
     # 各カメラのretrieve時間を個別に計測（ブロッキング源の特定）
     t_seg0 = time.perf_counter()
@@ -3247,7 +3287,7 @@ while True:
         print(f"[DBG] frame {WHILE_COUNT}: non-finite 3D points={nan_3d}")
     if landmark_ekf is not None:
         try:
-            transformed_p3ds, _vel_filt, _acc_filt = landmark_ekf.step(transformed_p3ds, dt)
+            transformed_p3ds, _vel_filt, _acc_filt = landmark_ekf.step(transformed_p3ds, _DYN_DT)
         except Exception as _ekf_step_e:  # noqa: BLE001
             if WHILE_COUNT % 120 == 0:
                 print(f"[EKF] step failed (frame={WHILE_COUNT}): {_ekf_step_e}")
@@ -3339,7 +3379,7 @@ while True:
             i = len(kpts_3d) - 1
         else:
             i = 0
-        result = calculator.calculate_link_vectors(kpts_3d, file_mode, i, dt)
+        result = calculator.calculate_link_vectors(kpts_3d, file_mode, i, _DYN_DT)
 
         # 結果が不完全ならスキップ
         if result[0] is None:
@@ -3753,7 +3793,7 @@ while True:
                 lt = locals_map.get(k)
                 if lt is None or not np.all(np.isfinite(lt)):
                     continue
-                pseudo_E = float(np.linalg.norm(lt)) * dt  # 単純スケール
+                pseudo_E = float(np.linalg.norm(lt)) * _DYN_DT  # 単純スケール
                 impulse_records[k].append(pseudo_E)
                 current_impulses[k] = pseudo_E
                 pseudo_impulses[k] = pseudo_E
@@ -3848,7 +3888,7 @@ while True:
                     if pk in ELBOW_KEYS:
                         buf = _E_buffers.get(pk, {'theta': [], 'tau': []})
                         e_pos, e_neg, info = compute_cycle_energy_filtered(
-                            np.array(buf['theta']), np.array(buf['tau']), _e_dt_sec_current,
+                            np.array(buf['theta']), np.array(buf['tau']), _DYN_DT,
                             fc_override=_fc_current if E_FC_ADAPTIVE_ON else None
                         )
                         energy = e_pos  # ゲージ用途: 正仕事
@@ -3858,17 +3898,20 @@ while True:
                             'e_pos': float(e_pos),
                             'e_neg': float(e_neg),
                             'fc_current': float(_fc_current),
-                            'dt_sec': float(_e_dt_sec_current),
+                            'dt_sec': float(_DYN_DT),
+                            # 適応LPFの設計に使っている値。dt_sec と食い違っていたら
+                            # サンプル間隔の推定がどこかでずれている。
+                            'lpf_dt_sec': float(_e_dt_sec_current),
                             'n_u': int(info.get('n_u', 0)) if isinstance(info, dict) else 0,
                         })
                         if E_DEBUG:
                             print(f"[EPIPE] {pk} E+= {energy:.4f} info={info}")
                     elif pk in WRIST_KEYS:
                         comp_series = pd.Series(current_energy_component_history[pk])
-                        energy = float(comp_series.sum() * dt)
+                        energy = float(comp_series.sum() * _DYN_DT)
                     else:
                         p_series = pd.Series(current_power_history[pk])
-                        energy = float(p_series.sum() * dt)
+                        energy = float(p_series.sum() * _DYN_DT)
                     impulse_records[pk].append(energy)
                     if gauge is not None:
                         current_impulses[pk] = energy
@@ -3968,7 +4011,7 @@ while True:
                     energy_cont = float(_continuous_energy_J.get(pk, 0.0))
                 elif pk in WRIST_KEYS:
                     # 暫定: 旧トルク成分の時間積分をスケールダウン
-                    raw_sum = float(sum(current_energy_component_history.get(pk, [])) * dt)
+                    raw_sum = float(sum(current_energy_component_history.get(pk, [])) * _DYN_DT)
                     energy_cont = raw_sum / 50.0
                     if energy_cont == 0.0:
                         # 微小代替: ローカルトルクy絶対値で最初の僅かな動きを可視化
@@ -3977,9 +4020,9 @@ while True:
                             ty_abs = abs(float(lt[1])) if lt is not None and np.all(np.isfinite(lt)) else 0.0
                         except Exception:
                             ty_abs = 0.0
-                        energy_cont = float(ty_abs * dt)
+                        energy_cont = float(ty_abs * _DYN_DT)
                 else:
-                    energy_cont = float(sum(current_power_history.get(pk, [])) * dt)
+                    energy_cont = float(sum(current_power_history.get(pk, [])) * _DYN_DT)
                 current_impulses[pk] = energy_cont
             gauge.update_impulses(current_impulses)
             try:

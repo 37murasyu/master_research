@@ -6,8 +6,7 @@ from datetime import datetime
 absolutepath = os.path.abspath(__file__)
 folder_path = os.path.dirname(absolutepath)
 
-# 時間刻みと体重（仮）
-dt = 0.3  # 0.1秒ごと
+# 体重（仮）
 w = 60  # 体重60kg
 
 # 質量（リンクの部位ごとの質量）
@@ -81,6 +80,51 @@ rm_path = os.path.join(folder_path, "rm_method.csv")
 # カメラの解像度を720pに設定
 frame_shape = [720, 1280]
 fps = 30
+
+# 力学計算のサンプル間隔のフォールバック。
+#
+# 以前は 10 行目に dt = 0.3（コメントは「0.1秒ごと」）と書かれており、値もコメントも
+# fps も三者三様に食い違っていた。微分と積分が必要とするのは「連続して処理される
+# フレームの実時間間隔」であって、それは間引き設定に依存するため定数では決まらない。
+# master_research_code.py は起動時に間引き係数から _DYN_DT を算出して使う。
+# ここに残しているのは twin_video_capture.py と master_research_code_00.py 向けの後方互換。
+dt = 1.0 / fps
+
+
+def resolve_dynamics_dt(src_fps, *, fixed_hz_on, fixed_skip, skip_mod=1, override=None):
+    """力学計算に使うサンプル間隔 [秒] を決める。
+
+    速度・加速度・角速度の微分と、エネルギー・力積の積分が必要とするのは
+    **連続して処理されるフレームの実時間間隔**であって、カメラのフレーム間隔ではない。
+    実行時は既定でフレームを間引く（RT_POSE_FIXED_HZ_ON / SKIP_FRAMES）ため、
+    1/fps では間隔を過小に見積もる。
+
+    Parameters
+    ----------
+    src_fps:
+        カメラが実際に出しているフレームレート。
+    fixed_hz_on:
+        固定 Hz 間引き（RT_POSE_FIXED_HZ_ON）が有効か。
+    fixed_skip:
+        固定 Hz 間引きで飛ばすフレーム数（処理間隔は fixed_skip + 1 フレーム）。
+    skip_mod:
+        SKIP_FRAMES による間引き。1 なら間引きなし。
+    override:
+        文字列または数値。与えられればそれをそのまま採る（DT_SEC 用）。
+
+    戻り値は (dt_sec, 由来を説明する文字列)。
+    """
+    if override not in (None, ""):
+        value = float(override)
+        if not (value > 0):
+            raise ValueError(f"dt は正の値である必要があります: {override!r}")
+        return value, f"override={override}"
+
+    stride = (int(fixed_skip) + 1) if fixed_hz_on else max(1, int(skip_mod))
+    rate = float(src_fps)
+    if not (rate > 0):
+        rate = float(fps)
+    return stride / rate, f"{stride}frame / {rate:.3f}fps"
 # 実行毎に新しいタイムスタンプを生成。バッチ処理等で固定したい場合は環境変数 TIMESTAMP_OVERRIDE を設定。
 _ts_override = os.environ.get("TIMESTAMP_OVERRIDE", "").strip()
 if _ts_override:

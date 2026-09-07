@@ -4,7 +4,10 @@ from scipy.stats import ttest_ind
 import matplotlib.pyplot as plt
 
 
-def compute_impulse(torque_series, dt=0.3):
+# 既定は 1/30 秒。以前は 0.3 で、config.py の壊れた値のハードコピーだった
+# （import 関係は無い独立の複製）。力積は Σ τ·dt で dt に直接比例するため、
+# ここが 9 倍違うと力積がそのまま 9 倍ずれる。
+def compute_impulse(torque_series, dt=1.0 / 30.0):
     torque_array = np.array(torque_series)
     positive_impulse = np.sum(torque_array[torque_array > 0]) * dt
     negative_impulse = np.sum(torque_array[torque_array < 0]) * dt
