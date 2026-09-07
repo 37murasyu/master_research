@@ -16,8 +16,11 @@ from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 
 WIDTH, HEIGHT = 1280, 720
 
-# 既存 config.pose_keypoints と同じ 12 点
-POSE_KEYPOINTS = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
+# config から引く。値を写すと config 側の変更を検知できない。
+# 抽出は ID 昇順で行われるので、点列の並びも昇順になる（再検算 R-1）。
+from config import pose_keypoints as POSE_KEYPOINTS  # noqa: E402
+
+POSE_KEYPOINTS_ORDERED = sorted(POSE_KEYPOINTS)
 
 
 def _stereo_projections(baseline_cm: float = 50.0, focal_px: float = 900.0):
@@ -50,7 +53,8 @@ def _pair_from_pixels(t_ns: int, pixels0: np.ndarray, pixels1: np.ndarray) -> Pa
 
     def to_frame(role: str, pixels: np.ndarray) -> InterpolatedFrame:
         landmarks = [(0.0, 0.0, 0.0, 1.0)] * LANDMARK_COUNT
-        for slot, landmark_id in enumerate(POSE_KEYPOINTS):
+        # 実装が sorted(pose_keypoints) の順で取り出すので、埋める側も昇順で揃える
+        for slot, landmark_id in enumerate(POSE_KEYPOINTS_ORDERED):
             x, y = pixels[slot]
             landmarks[landmark_id] = (x / WIDTH, y / HEIGHT, 0.0, 1.0)
         return InterpolatedFrame(role, t_ns, WIDTH, HEIGHT, landmarks)

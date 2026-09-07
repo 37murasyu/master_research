@@ -119,7 +119,8 @@ def extract_keypoints(results0, results1, pose_keypoints, frame0, frame1):
         results1 (mediapipe.framework.formats.landmark_pb2.NormalizedLandmarkList):
             フレーム1に対応する姿勢推定結果。
         pose_keypoints (List[int]):
-            抽出対象となる関節インデックスのリスト。これに含まれるキーポイントだけを抽出・描画する。
+            抽出対象となる関節インデックスの集合。これに含まれるキーポイントだけを抽出・描画する。
+            **戻り値の並びはこのリストの順ではなくランドマーク ID の昇順**。
         frame0 (np.ndarray):
             キーポイントを描画する対象となる画像（フレーム0）。
         frame1 (np.ndarray):
@@ -135,11 +136,15 @@ def extract_keypoints(results0, results1, pose_keypoints, frame0, frame1):
     draw_kpts = os.getenv('DRAW_KEYPOINTS', '1') not in ('0','false','False')
 
     def _extract(results, frame):
-        # pose_keypoints の並び順で返す（ランドマークIDを明示するため）
+        # ランドマーク ID の昇順で返す。pose_keypoints の並び順ではない。
+        # 元実装 TemugeB/bodypose3d は enumerate で昇順に走査しており、リストの
+        # 並びは「どの点を使うか」のフィルタでしかない。ここをリスト順で回すと
+        # 3D 点列の並びが part_calculations の前提とずれ、8 リンク中 7 本が
+        # 体を斜めに横切るベクトルになる（再検算 R-1）。
         if not results.pose_landmarks:
             return [[-1, -1]] * len(pose_keypoints)
         out = []
-        for pid in pose_keypoints:
+        for pid in sorted(pose_keypoints):
             lm = results.pose_landmarks.landmark[pid]
             px = int(round(lm.x * frame.shape[1]))
             py = int(round(lm.y * frame.shape[0]))

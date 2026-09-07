@@ -1,10 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from utils import DLT
+from config import pose_keypoints as _pose_keypoints
 plt.style.use('seaborn')
 
 
-pose_keypoints = np.array([16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28])
+# 値を写さず config から引く。ここでは点数（12）としてしか使わないが、
+# 下の骨格エッジは 3D 点列がランドマーク ID の昇順に並んでいることを前提にしている
+# （[0][1]=両肩 [6][7]=両腰 …）。新しく保存した CSV はこの並びになる。
+pose_keypoints = np.array(_pose_keypoints)
 
 def read_keypoints(filename):
     fin = open(filename, 'r')

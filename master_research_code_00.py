@@ -409,6 +409,10 @@ while True:
     new_height = frame0.shape[0]
     new_width = frame0.shape[1] + PADDING
 
+    # 索引は utils.extract_keypoints の戻り順 = ランドマーク ID の昇順
+    # （[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首）。
+    # したがって [0]->[2] は左上腕、[2]->[4] は左前腕を描く。
+    # 注意: 下の torques がどちらのチェーンのものかは未検証（旧版スクリプト）。
     frame0 = draw_rotated_rectangle(
         frame0,
         np.array(frame0_keypoints[0]),

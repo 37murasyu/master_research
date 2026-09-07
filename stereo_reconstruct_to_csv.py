@@ -84,8 +84,11 @@ def _write_kpts3d_csv(frames_xyz: List[np.ndarray], out_csv: str, pose_ids: List
         rows.append(row)
     df = pd.DataFrame(rows)
 
-    # 先頭に bodypose3d 順序のメタ情報をコメントとして書く
-    meta = "# order=bodypose3d kpt_0..kpt_11 -> mp_ids " + ",".join(map(str, pose_ids)) + "\n"
+    # 先頭に関節の並び順をメタ情報としてコメントで書く。
+    # extract_keypoints はランドマーク ID の昇順で返すので、列もその順になる
+    # （かつては pose_ids の宣言順と書いていたが、実体と食い違っていた。再検算 R-1）。
+    meta = ("# order=mediapipe_id_ascending kpt_0..kpt_11 -> mp_ids "
+            + ",".join(map(str, sorted(pose_ids))) + "\n")
     with open(out_csv, "w", encoding="utf-8") as f:
         f.write(meta)
     df.to_csv(out_csv, mode="a", index=False, encoding="utf-8")

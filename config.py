@@ -21,8 +21,19 @@ g = np.array([0, 0, -9.81])
 PADDING = 400  # 余白として追加するピクセル数
 # add here if you need more keypoints
 
-# MediaPipe Pose ランドマーク出力で使用するインデックス。
-# bodypose3d の順序に合わせて12点のみ（右手首→右肘→右肩→左肩→左肘→左手首→右/左腰→右/左膝→右/左足首）。
+# MediaPipe Pose ランドマーク出力で使用するインデックス（12 点）。
+#
+# **このリストの並び順に意味は無い。** 元実装 TemugeB/bodypose3d は
+#     for i, landmark in enumerate(results.pose_landmarks.landmark):
+#         if i not in pose_keypoints: continue
+# とランドマーク ID の昇順に走査しており、pose_keypoints は「どの点を使うか」の
+# フィルタとしてしか働かない。したがって 3D 点列の並びは常に昇順になる:
+#
+#   [0]=11 左肩  [1]=12 右肩  [2]=13 左肘  [3]=14 右肘  [4]=15 左手首  [5]=16 右手首
+#   [6]=23 左腰  [7]=24 右腰  [8]=25 左膝  [9]=26 右膝  [10]=27 左足首 [11]=28 右足首
+#
+# master_research_code.py の part_calculations や慣性テンソルのリンク長は
+# この並びを前提にしている。抽出側は sorted() を通すこと（再検算 R-1）。
 pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
 # this will load the sample videos if no camera ID is given
 # input_stream1 = folder_path + "\\media\\output1.mp4"

@@ -1109,18 +1109,19 @@ def draw_all_local_axes(frame0, frame1, P0, P1, transformed_p3ds, links, x_offse
         # 既知: wrist_R link = hand - elbow (近位=肘), など個別条件化
         origin = None
         try:
+            # 索引は config.pose_keypoints の昇順（links と同じ規約）
             if name == 'wrist_R':
-                origin = transformed_p3ds[2]
+                origin = transformed_p3ds[3]  # 右肘
             elif name == 'elbow_R':
-                origin = transformed_p3ds[0]
+                origin = transformed_p3ds[1]  # 右肩
             elif name == 'shoulder_R':
-                origin = transformed_p3ds[0]  # 右肩基準
+                origin = transformed_p3ds[1]  # 右肩基準
             elif name == 'wrist_L':
-                origin = transformed_p3ds[3]
+                origin = transformed_p3ds[2]  # 左肘
             elif name == 'elbow_L':
-                origin = transformed_p3ds[1]
+                origin = transformed_p3ds[0]  # 左肩
             elif name == 'shoulder_L':
-                origin = transformed_p3ds[1]
+                origin = transformed_p3ds[0]  # 左肩基準
         except Exception:
             origin = None
         R = _compute_local_rotation_from_link(vec)
@@ -2191,7 +2192,8 @@ def _extract_keypoints_fast_single(results, pose_ids, frame_shape):
 
     h, w = frame_shape[:2]
     out = []
-    for pid in pose_ids:
+    # utils.extract_keypoints と同じくランドマーク ID の昇順。並び順の根拠はそちらを参照。
+    for pid in sorted(pose_ids):
         lm = lm_list[pid]
         out.append([int(round(float(lm.x) * w)), int(round(float(lm.y) * h))])
     return out
@@ -3626,14 +3628,17 @@ while True:
         _perf.next()
         break
 
-    # 各リンクベクトルとグローバルトルクを辞書に集約
+    # 各リンクベクトルとグローバルトルクを辞書に集約。
+    # 索引は config.pose_keypoints の昇順（[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首）。
+    # かつて [0]右肩 [1]左肩 [2]右肘 … という左右が逆の規約で書かれており、
+    # wrist_R として出ていたのは左前腕だった（再検算 R-1）。
     links = {
-        "wrist_R": transformed_p3ds[4] - transformed_p3ds[2],
-        "elbow_R": transformed_p3ds[2] - transformed_p3ds[0],
-        "shoulder_R": -(transformed_p3ds[1] - transformed_p3ds[0]),
-        "wrist_L": transformed_p3ds[5] - transformed_p3ds[3],
-        "elbow_L": transformed_p3ds[3] - transformed_p3ds[1],
-        "shoulder_L": (transformed_p3ds[1] - transformed_p3ds[0]),
+        "wrist_R": transformed_p3ds[5] - transformed_p3ds[3],    # 右手首 - 右肘
+        "elbow_R": transformed_p3ds[3] - transformed_p3ds[1],    # 右肘 - 右肩
+        "shoulder_R": (transformed_p3ds[1] - transformed_p3ds[0]),   # 右肩 - 左肩
+        "wrist_L": transformed_p3ds[4] - transformed_p3ds[2],    # 左手首 - 左肘
+        "elbow_L": transformed_p3ds[2] - transformed_p3ds[0],    # 左肘 - 左肩
+        "shoulder_L": -(transformed_p3ds[1] - transformed_p3ds[0]),  # 左肩 - 右肩
     }
     if DEBUG_LOGS and WHILE_COUNT % TRACE_EVERY == 0:
         link_norms = {k: float(np.linalg.norm(v)) if v is not None and np.all(np.isfinite(v)) else None for k, v in links.items()}

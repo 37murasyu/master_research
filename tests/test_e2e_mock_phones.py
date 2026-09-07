@@ -106,8 +106,9 @@ def test_full_chain_from_phones_to_torques():
 
     from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 
+    from config import pose_keypoints  # 値を写すと config 側の変更を検知できない
+
     width, height = 1280, 720
-    pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
     intrinsics = np.array([[900.0, 0.0, width / 2], [0.0, 900.0, height / 2], [0.0, 0.0, 1.0]])
     p_left = intrinsics @ np.hstack([np.eye(3), np.zeros((3, 1))])
     # 並進は cm 単位。既存パイプラインが三角測量結果を 0.01 倍して m にするため。

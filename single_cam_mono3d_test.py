@@ -11,6 +11,12 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # 対象キーポイント (既存 config.py の pose_keypoints に合わせる)
+#
+# このファイルは utils.extract_keypoints を使わず、下の _extract で
+# `for idx in POSE_KEYPOINTS` と自前に走査している。つまりこの宣言順が
+# そのまま点列の並びになり、:42 の pairs（手首→肘→肩→肩→肘→手首の鎖）も
+# その前提で書かれている。自己完結しているので、2026-09-08 の抽出昇順化
+# （再検算 R-1）の影響を受けない。**この並びは変えないこと。**
 POSE_KEYPOINTS = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
 
 # 出力ディレクトリ

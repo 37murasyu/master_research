@@ -76,14 +76,15 @@ PART_LINKS: dict[str, tuple[int, int]] = {
     "upper_Leg_L": (6, 8),
 }
 
-# 局所トルクの基準リンク（既存の links 辞書と同じ）
+# 局所トルクの基準リンク（既存の links 辞書と同じ）。
+# 索引は config.pose_keypoints の昇順（[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首）。
 TORQUE_LINKS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
-    "wrist_R": lambda p: p[4] - p[2],
-    "elbow_R": lambda p: p[2] - p[0],
-    "shoulder_R": lambda p: -(p[1] - p[0]),
-    "wrist_L": lambda p: p[5] - p[3],
-    "elbow_L": lambda p: p[3] - p[1],
-    "shoulder_L": lambda p: (p[1] - p[0]),
+    "wrist_R": lambda p: p[5] - p[3],       # 右手首 - 右肘
+    "elbow_R": lambda p: p[3] - p[1],       # 右肘 - 右肩
+    "shoulder_R": lambda p: (p[1] - p[0]),  # 右肩 - 左肩
+    "wrist_L": lambda p: p[4] - p[2],       # 左手首 - 左肘
+    "elbow_L": lambda p: p[2] - p[0],       # 左肘 - 左肩
+    "shoulder_L": lambda p: -(p[1] - p[0]), # 左肩 - 右肩
 }
 
 # 親リンク。局所座標の y 軸を親×z（肘面の法線）で取るために使う。
@@ -238,8 +239,9 @@ class NetworkMeasurement:
         frame = pair.frames.get(role)
         if frame is None:
             return None
-        # 既存 `_extract_keypoints_fast_single` と同じく pose_keypoints の宣言順。
-        return [list(frame.pixel_xy(index)) for index in self.pose_keypoints]
+        # 既存 `_extract_keypoints_fast_single` と同じくランドマーク ID の昇順。
+        # pose_keypoints の宣言順ではない（再検算 R-1。根拠は utils.extract_keypoints）。
+        return [list(frame.pixel_xy(index)) for index in sorted(self.pose_keypoints)]
 
     def _triangulate(self, keypoints0, keypoints1) -> np.ndarray:
         """三角測量して既存と同じ座標系に変換する。
