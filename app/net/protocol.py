@@ -27,6 +27,7 @@ from typing import Any, Iterable, Sequence
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "PixelCoordinates",
     "LANDMARK_COUNT",
     "ROLES",
     "ProtocolError",
@@ -63,8 +64,34 @@ class ProtocolError(ValueError):
 # ---------------------------------------------------------------------------
 # メッセージ
 # ---------------------------------------------------------------------------
+class PixelCoordinates:
+    """``landmarks`` / ``width`` / ``height`` を持つ型に、ピクセル換算を与える。
+
+    「正規化座標に w/h を掛けてピクセルにする」という規約はプロトコルの一部で、
+    ``tests/test_protocol_contract.py`` が検証している。送信側の
+    ``LandmarkFrame`` と受信側の ``sync_buffer.InterpolatedFrame`` が
+    別々に実装していると、片方だけ直したときに黙ってずれる。
+
+    フィールドを持たないミックスインにしてあるのは、両者の
+    コンストラクタの形（seq の有無、時刻フィールドの名前）を変えないため。
+    """
+
+    landmarks: Sequence[tuple[float, float, float, float]]
+    width: int
+    height: int
+
+    def pixel_xy(self, index: int) -> tuple[float, float]:
+        """正規化座標をピクセル座標に直す。
+
+        既存 ``utils.extract_keypoints`` が
+        ``landmark.x * frame.shape[1]`` としているのと同じ規約に揃える。
+        """
+        x, y, _z, _v = self.landmarks[index]
+        return (x * self.width, y * self.height)
+
+
 @dataclass(frozen=True)
-class LandmarkFrame:
+class LandmarkFrame(PixelCoordinates):
     """1 フレーム分の姿勢ランドマーク。"""
 
     role: str
@@ -75,15 +102,6 @@ class LandmarkFrame:
     height: int
     # (x, y, z, visibility)。x, y は [0,1] の正規化座標。
     landmarks: Sequence[tuple[float, float, float, float]]
-
-    def pixel_xy(self, index: int) -> tuple[float, float]:
-        """正規化座標をピクセル座標に直す。
-
-        既存 ``utils.extract_keypoints`` が
-        ``landmark.x * frame.shape[1]`` としているのと同じ規約に揃える。
-        """
-        x, y, _z, _v = self.landmarks[index]
-        return (x * self.width, y * self.height)
 
 
 @dataclass(frozen=True)

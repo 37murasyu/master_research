@@ -241,15 +241,31 @@ def _print_qr(url: str) -> None:
 # ---------------------------------------------------------------------------
 # 単体起動（動作確認・Phase 3 の GUI から切り離してのデバッグ用）
 # ---------------------------------------------------------------------------
+class _PairCounter:
+    """受け取ったペアの数だけ数える。
+
+    ``received.extend`` を渡すとリスト全体が実行中ずっと生き続ける。
+    このデバッグ用サーバは Ctrl-C まで流しっぱなしで使うので、
+    30fps で 10 分回すと 18,000 サンプル（100MB 超）が溜まる。
+    最後に件数を出すだけなら int 1 個で足りる。
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __call__(self, pairs) -> None:
+        self.count += len(pairs)
+
+
 async def _main_async(args: argparse.Namespace) -> int:
-    received: list[PairedSample] = []
+    received = _PairCounter()
     server = LandmarkServer(
         host=args.host,
         port=args.port,
         buffer=SyncBuffer(
             target_hz=args.hz, window_sec=args.window, max_gap_ms=args.max_gap_ms
         ),
-        on_pairs=received.extend,
+        on_pairs=received,
     )
     try:
         await server.start()
@@ -302,7 +318,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         pass
     finally:
         await server.stop()
-        print(f"\n終了しました。取り出したペア: {len(received)}")
+        print(f"\n終了しました。取り出したペア: {received.count}")
     return 0
 
 

@@ -19,26 +19,31 @@ import bisect
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from app.net.protocol import ROLES, LandmarkFrame
+from app.net.protocol import ROLES, LandmarkFrame, PixelCoordinates
 
 __all__ = ["InterpolatedFrame", "PairedSample", "SyncBuffer"]
 
 Landmarks = Sequence[tuple[float, float, float, float]]
 
 
+def _time_of(frame: LandmarkFrame) -> int:
+    """bisect の key。フレーム自身が持つ撮影時刻で並べる。"""
+    return frame.t_capture_ns
+
+
 @dataclass(frozen=True)
-class InterpolatedFrame:
-    """グリッド時刻における 1 台ぶんのランドマーク。"""
+class InterpolatedFrame(PixelCoordinates):
+    """グリッド時刻における 1 台ぶんのランドマーク。
+
+    ピクセル換算の規約は ``PixelCoordinates`` が持つ。送信側と受信側で
+    別々に実装すると、片方だけ直したときに黙ってずれる。
+    """
 
     role: str
     t_ns: int
     width: int
     height: int
     landmarks: Landmarks
-
-    def pixel_xy(self, index: int) -> tuple[float, float]:
-        x, y, _z, _v = self.landmarks[index]
-        return (x * self.width, y * self.height)
 
 
 @dataclass(frozen=True)
@@ -121,7 +126,9 @@ class SyncBuffer:
         self.max_gap_ns = round(max_gap_ms * 1_000_000)
 
         # ロールごとに時刻昇順で保持する。到着順は当てにしない。
-        self._times: dict[str, list[int]] = {r: [] for r in self.roles}
+        # 時刻はフレーム自身が持っているので別のリストにはしない
+        # （二重管理すると「2 本の index が揃っている」という不変条件を
+        #  push / evict のたびに維持する責任が生まれる）。
         self._frames: dict[str, list[LandmarkFrame]] = {r: [] for r in self.roles}
 
         self._next_grid_ns: int | None = None
@@ -130,14 +137,14 @@ class SyncBuffer:
     # -- 入力 --------------------------------------------------------------
     def push(self, frame: LandmarkFrame) -> None:
         """フレームを受け取る。未知のロールや遅すぎるものは捨てる。"""
-        if frame.role not in self._times:
+        frames = self._frames.get(frame.role)
+        if frames is None:
             self._stats.rejected += 1
             return
 
-        times = self._times[frame.role]
-        index = bisect.bisect_left(times, frame.t_capture_ns)
+        index = bisect.bisect_left(frames, frame.t_capture_ns, key=_time_of)
 
-        if index < len(times) and times[index] == frame.t_capture_ns:
+        if index < len(frames) and frames[index].t_capture_ns == frame.t_capture_ns:
             return  # 同時刻の重複。再送などで起こりうる
 
         # 既に処理を終えた時刻より古いフレームは使い道がない
@@ -145,8 +152,7 @@ class SyncBuffer:
             self._stats.dropped_late += 1
             return
 
-        times.insert(index, frame.t_capture_ns)
-        self._frames[frame.role].insert(index, frame)
+        frames.insert(index, frame)
 
     # -- 出力 --------------------------------------------------------------
     def drain(self) -> list[PairedSample]:
@@ -186,26 +192,26 @@ class SyncBuffer:
         """
         if self._next_grid_ns is not None:
             return True
-        if any(not times for times in self._times.values()):
+        if any(not frames for frames in self._frames.values()):
             return False
-        self._next_grid_ns = max(times[0] for times in self._times.values())
+        self._next_grid_ns = max(f[0].t_capture_ns for f in self._frames.values())
         return True
 
     def _can_resolve(self, t: int) -> str:
         """グリッド時刻 t を解決できるか。"ok" / "skip" / "wait" を返す。"""
         for role in self.roles:
-            times = self._times[role]
-            if not times:
+            frames = self._frames[role]
+            if not frames:
                 return "wait"
-            if t > times[-1]:
+            if t > frames[-1].t_capture_ns:
                 return "wait"  # 将来のデータで解決できるかもしれない
-            if t < times[0]:
+            if t < frames[0].t_capture_ns:
                 return "skip"  # もう手に入らない
 
-            index = bisect.bisect_left(times, t)
-            if index < len(times) and times[index] == t:
+            index = bisect.bisect_left(frames, t, key=_time_of)
+            if index < len(frames) and frames[index].t_capture_ns == t:
                 continue  # ちょうどサンプルがある
-            gap = times[index] - times[index - 1]
+            gap = frames[index].t_capture_ns - frames[index - 1].t_capture_ns
             if gap > self.max_gap_ns:
                 return "skip"  # 欠測が長すぎる。補間で埋めない
         return "ok"
@@ -220,11 +226,10 @@ class SyncBuffer:
         return PairedSample(t_ns=t, frames=frames)
 
     def _interpolate(self, role: str, t: int) -> InterpolatedFrame | None:
-        times = self._times[role]
         buffered = self._frames[role]
 
-        index = bisect.bisect_left(times, t)
-        if index < len(times) and times[index] == t:
+        index = bisect.bisect_left(buffered, t, key=_time_of)
+        if index < len(buffered) and buffered[index].t_capture_ns == t:
             exact = buffered[index]
             return InterpolatedFrame(
                 role=role,
@@ -234,7 +239,7 @@ class SyncBuffer:
                 landmarks=list(exact.landmarks),
             )
 
-        if index == 0 or index >= len(times):
+        if index == 0 or index >= len(buffered):
             return None
 
         before, after = buffered[index - 1], buffered[index]
@@ -267,11 +272,13 @@ class SyncBuffer:
         """2 台の位相差を記録する。UI で同期品質を見せるのに使う。"""
         nearest: list[int] = []
         for role in self.roles:
-            times = self._times[role]
-            if not times:
+            frames = self._frames[role]
+            if not frames:
                 return
-            index = bisect.bisect_left(times, t)
-            candidates = [times[i] for i in (index - 1, index) if 0 <= i < len(times)]
+            index = bisect.bisect_left(frames, t, key=_time_of)
+            candidates = [
+                frames[i].t_capture_ns for i in (index - 1, index) if 0 <= i < len(frames)
+            ]
             if not candidates:
                 return
             nearest.append(min(candidates, key=lambda x: abs(x - t)))
@@ -279,23 +286,23 @@ class SyncBuffer:
 
     def _evict(self) -> None:
         """時間窓より古いフレームを捨てる。長時間の計測でメモリを食わないため。"""
-        newest = max((times[-1] for times in self._times.values() if times), default=None)
+        newest = max(
+            (f[-1].t_capture_ns for f in self._frames.values() if f), default=None
+        )
         if newest is None:
             return
         cutoff = newest - self.window_ns
 
-        for role in self.roles:
-            times = self._times[role]
-            keep_from = bisect.bisect_left(times, cutoff)
+        for frames in self._frames.values():
+            keep_from = bisect.bisect_left(frames, cutoff, key=_time_of)
             # 補間には「t の直前のサンプル」が要るので、必ず 2 個は残す
-            keep_from = min(keep_from, max(0, len(times) - 2))
+            keep_from = min(keep_from, max(0, len(frames) - 2))
             if keep_from > 0:
-                del times[:keep_from]
-                del self._frames[role][:keep_from]
+                del frames[:keep_from]
 
     # -- 観測 --------------------------------------------------------------
     def buffered_count(self, role: str) -> int:
-        return len(self._times.get(role, ()))
+        return len(self._frames.get(role, ()))
 
     @property
     def stats(self) -> dict[str, float | int]:

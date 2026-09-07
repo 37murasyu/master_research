@@ -50,7 +50,6 @@ def _pair_from_pixels(t_ns: int, pixels0: np.ndarray, pixels1: np.ndarray) -> Pa
 
     def to_frame(role: str, pixels: np.ndarray) -> InterpolatedFrame:
         landmarks = [(0.0, 0.0, 0.0, 1.0)] * LANDMARK_COUNT
-        landmarks = list(landmarks)
         for slot, landmark_id in enumerate(POSE_KEYPOINTS):
             x, y = pixels[slot]
             landmarks[landmark_id] = (x / WIDTH, y / HEIGHT, 0.0, 1.0)
