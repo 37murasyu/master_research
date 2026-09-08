@@ -39,10 +39,22 @@ from config import pose_keypoints
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN_SCRIPT = os.path.join(REPO_ROOT, "master_research_code.py")
 
-# ランドマーク ID の昇順に並んだときの、位置索引と部位の対応
-EXPECTED_ORDER = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
-SLOT_NAME = ["左肩", "右肩", "左肘", "右肘", "左手首", "右手首",
-             "左腰", "右腰", "左膝", "右膝", "左足首", "右足首"]
+# 抽出はランドマーク ID の昇順で返す。期待値は config から導出する
+# （値を写すと config 側の変更を検知できない）。
+EXPECTED_ORDER = sorted(pose_keypoints)
+
+LANDMARK_NAME = {
+    11: "左肩", 12: "右肩", 13: "左肘", 14: "右肘", 15: "左手首", 16: "右手首",
+    17: "左小指", 18: "右小指", 19: "左人差指", 20: "右人差指",
+    21: "左親指", 22: "右親指", 23: "左腰", 24: "右腰",
+    25: "左膝", 26: "右膝", 27: "左足首", 28: "右足首",
+}
+
+
+def _slot_name(index: int, keypoints=None) -> str:
+    """位置索引から部位名を引く。構成が変われば対応も変わる。"""
+    ids = sorted(pose_keypoints if keypoints is None else keypoints)
+    return LANDMARK_NAME[ids[index]]
 
 
 def _load_from_script(name: str, kind: str):
@@ -125,22 +137,39 @@ class TestExtractKeypointsOrder:
         )
 
 
+# ランドマーク ID ごとの位置。解剖学的にもっともらしい配置。単位は m。
+# ここから任意の pose_keypoints 構成の点列を組み立てられる。
+LANDMARK_POSITIONS = {
+    11: [-0.15, 0.0, 1.40],   # 左肩
+    12: [0.15, 0.0, 1.40],    # 右肩
+    13: [-0.18, 0.0, 1.16],   # 左肘（上腕 0.24）
+    14: [0.18, 0.0, 1.16],    # 右肘
+    15: [-0.20, 0.0, 0.95],   # 左手首（前腕 0.21）
+    16: [0.20, 0.0, 0.95],    # 右手首
+    17: [-0.24, 0.0, 0.88],   # 左小指 MCP（手 0.09）
+    18: [0.24, 0.0, 0.88],    # 右小指 MCP
+    19: [-0.20, 0.04, 0.87],  # 左人差指 MCP
+    20: [0.20, 0.04, 0.87],   # 右人差指 MCP
+    21: [-0.18, 0.05, 0.92],  # 左親指
+    22: [0.18, 0.05, 0.92],   # 右親指
+    23: [-0.10, 0.0, 1.00],   # 左腰
+    24: [0.10, 0.0, 1.00],    # 右腰
+    25: [-0.10, 0.0, 0.60],   # 左膝（大腿 0.40）
+    26: [0.10, 0.0, 0.60],    # 右膝
+    27: [-0.10, 0.0, 0.20],   # 左足首
+    28: [0.10, 0.0, 0.20],    # 右足首
+}
+
+
+def _skeleton(keypoints=None) -> np.ndarray:
+    """指定した構成の点列を、抽出と同じ ID 昇順で組み立てる。"""
+    ids = sorted(pose_keypoints if keypoints is None else keypoints)
+    return np.array([LANDMARK_POSITIONS[pid] for pid in ids], dtype=float)
+
+
 def _synthetic_skeleton() -> np.ndarray:
-    """昇順の並びで、解剖学的にもっともらしい 12 点を作る。単位は m。"""
-    points = np.zeros((12, 3), dtype=float)
-    points[0] = [-0.15, 0.0, 1.40]   # 左肩
-    points[1] = [0.15, 0.0, 1.40]    # 右肩
-    points[2] = [-0.18, 0.0, 1.16]   # 左肘（上腕 0.24）
-    points[3] = [0.18, 0.0, 1.16]    # 右肘
-    points[4] = [-0.20, 0.0, 0.95]   # 左手首（前腕 0.21）
-    points[5] = [0.20, 0.0, 0.95]    # 右手首
-    points[6] = [-0.10, 0.0, 1.00]   # 左腰
-    points[7] = [0.10, 0.0, 1.00]    # 右腰
-    points[8] = [-0.10, 0.0, 0.60]   # 左膝（大腿 0.40）
-    points[9] = [0.10, 0.0, 0.60]    # 右膝
-    points[10] = [-0.10, 0.0, 0.20]  # 左足首
-    points[11] = [0.10, 0.0, 0.20]   # 右足首
-    return points
+    """現行構成（`config.pose_keypoints`）の点列。"""
+    return _skeleton()
 
 
 # 名前ごとの、もっともらしいリンク長の範囲 [m]
@@ -175,7 +204,7 @@ class TestPartLinksAreAnatomical:
             span = float(np.linalg.norm(points[end] - points[start]))
             low, high = EXPECTED_SPAN[name]
             assert low <= span <= high, (
-                f"{name} が {SLOT_NAME[start]}→{SLOT_NAME[end]} を結んでおり、"
+                f"{name} が {_slot_name(start)}→{_slot_name(end)} を結んでおり、"
                 f" 長さ {span:.3f} m が想定 {low}〜{high} m から外れる。"
                 " 体を斜めに横切るリンクになっていないか確認すること"
             )
@@ -253,3 +282,88 @@ class TestTorqueLinksHandedness:
                 f"{right} と {left} が鏡像になっていない: {vr} / {vl}。"
                 " 左右の索引を取り違えていないか確認すること"
             )
+
+
+class TestLinkDefinitionsSurviveAddedLandmarks:
+    """リンク定義がランドマーク ID で書かれており、点を足しても壊れない。
+
+    `config.PART_LINK_IDS` が正本で、`part_calculations` はそこから
+    `build_part_calculations()` で組み立てられる。位置索引を直書きすると
+    `pose_keypoints` に点を足したときに別の関節を指すようになる（再検算 R-1 と同じ壊れ方）。
+    """
+
+    # 手のランドマークを足した構成。A-3 でこれを既定にする予定
+    WITH_HANDS = sorted(list(pose_keypoints) + [17, 18, 19, 20])
+
+    def test_part_calculations_are_derived_not_literal(self):
+        """`part_calculations` が `PART_LINK_IDS` から導出されている。"""
+        from config import MP_LANDMARK, SLOT, PART_LINK_IDS, part_calculations
+
+        assert set(part_calculations) == set(PART_LINK_IDS), "リンク名の集合が食い違う"
+        for name, (start, end, com) in PART_LINK_IDS.items():
+            spec = part_calculations[name]
+            assert spec["start"] == SLOT[MP_LANDMARK[start]], f"{name} の start が導出値と違う"
+            assert spec["end"] == SLOT[MP_LANDMARK[end]], f"{name} の end が導出値と違う"
+            assert spec["com_fraction"] == com, f"{name} の com_fraction が導出値と違う"
+
+    def test_links_connect_the_same_joints_after_adding_hands(self):
+        """手のランドマークを足しても、各リンクは同じ関節どうしを結ぶ。"""
+        from config import MP_LANDMARK, PART_LINK_IDS, build_part_calculations
+
+        extended = build_part_calculations(self.WITH_HANDS)
+        order = sorted(self.WITH_HANDS)
+        for name, (start, end, _) in PART_LINK_IDS.items():
+            spec = extended[name]
+            assert order[spec["start"]] == MP_LANDMARK[start], (
+                f"{name} の start が {LANDMARK_NAME[order[spec['start']]]} を指している"
+                f"（期待 {LANDMARK_NAME[MP_LANDMARK[start]]}）"
+            )
+            assert order[spec["end"]] == MP_LANDMARK[end], (
+                f"{name} の end が {LANDMARK_NAME[order[spec['end']]]} を指している"
+                f"（期待 {LANDMARK_NAME[MP_LANDMARK[end]]}）"
+            )
+
+    def test_links_stay_anatomical_after_adding_hands(self):
+        """手を足した構成でも、リンク長が解剖学的に妥当なまま。"""
+        from config import build_part_calculations
+
+        points = _skeleton(self.WITH_HANDS)
+        for name, spec in build_part_calculations(self.WITH_HANDS).items():
+            span = float(np.linalg.norm(points[spec["end"]] - points[spec["start"]]))
+            low, high = EXPECTED_SPAN[name]
+            assert low <= span <= high, (
+                f"{name} が {_slot_name(spec['start'], self.WITH_HANDS)}"
+                f"→{_slot_name(spec['end'], self.WITH_HANDS)} を結んでおり、"
+                f" 長さ {span:.3f} m が想定 {low}〜{high} m から外れる"
+            )
+
+    def test_hard_coded_indices_would_break(self):
+        """対照: 位置索引を直書きしていたら手を足した時点で壊れる。
+
+        このテストが落ちるようになったら、それは索引がずれない構成に
+        変わったということなので、上の 3 つと合わせて見直すこと。
+        """
+        literal = _config_links()          # 現行構成での位置索引
+        order = sorted(self.WITH_HANDS)    # 手を足したときの並び
+        hands = {17, 18, 19, 20}
+        pointing_at_hands = [
+            name for name, (start, end) in literal.items()
+            if order[start] in hands or order[end] in hands
+        ]
+        assert pointing_at_hands, (
+            "手を足しても直書き索引が 1 つも手のランドマークを指さない。"
+            " 前提（腰・膝・足首がずれる）が崩れている"
+        )
+        # 実際にずれるのは下肢と胴体。上肢は [0..5] のままなので無傷
+        assert "both_hip" in pointing_at_hands, (
+            f"both_hip が手を指していない（実際に壊れたのは {pointing_at_hands}）"
+        )
+
+    def test_missing_landmark_fails_loudly(self):
+        """`pose_keypoints` に無い点を指したら KeyError で落ちる。"""
+        from config import build_part_calculations
+
+        # 手首を外した構成では forearm_* が引けない
+        without_wrist = [p for p in pose_keypoints if p not in (15, 16)]
+        with pytest.raises(KeyError):
+            build_part_calculations(without_wrist)

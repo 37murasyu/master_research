@@ -189,11 +189,50 @@ COM_FRACTIONS = {
     "thigh": 0.433,   # 出典要確認。上 3 つと違い、リポジトリ内に既存値が無かった
 }
 
-# リンク定義。索引は pose_keypoints をランドマーク ID の昇順に並べたときの位置
-# （[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首 [6]左腰 [7]右腰
-#   [8]左膝 [9]右膝 [10]左足首 [11]右足首）。
+# MediaPipe Pose のランドマーク ID に名前を付ける。
+MP_LANDMARK = {
+    "L_SHOULDER": 11, "R_SHOULDER": 12,
+    "L_ELBOW": 13, "R_ELBOW": 14,
+    "L_WRIST": 15, "R_WRIST": 16,
+    "L_PINKY": 17, "R_PINKY": 18,
+    "L_INDEX": 19, "R_INDEX": 20,
+    "L_THUMB": 21, "R_THUMB": 22,
+    "L_HIP": 23, "R_HIP": 24,
+    "L_KNEE": 25, "R_KNEE": 26,
+    "L_ANKLE": 27, "R_ANKLE": 28,
+}
+
+
+def landmark_slots(keypoints=None):
+    """ランドマーク ID → 3D 点列における位置索引 の対応を作る。
+
+    抽出は ID の昇順で行われる（utils.extract_keypoints）ので、
+    並びは sorted(keypoints) で決まる。
+    """
+    return {pid: i for i, pid in enumerate(sorted(
+        pose_keypoints if keypoints is None else keypoints))}
+
+
+SLOT = landmark_slots()
+
+
+def slot_of(name, slots=None):
+    """ランドマーク名（MP_LANDMARK のキー）から位置索引を引く。
+
+    pose_keypoints に含まれていない点を指すと KeyError で落ちる。
+    黙って別の関節を指すよりよい（再検算 R-1 の再発防止）。
+    """
+    return (SLOT if slots is None else slots)[MP_LANDMARK[name]]
+
+
+# リンク定義の正本。**位置索引ではなくランドマーク名で書く。**
 #
-# start/end は **遠位 → 近位** の向きで書かれている（例: upper_arm_R は肘→肩）。
+# 位置索引を直書きすると、pose_keypoints に点を足したときに昇順の並びが変わり、
+# 索引が別の関節を指すようになる。例えば手のランドマーク（17〜20）を足すと
+# 腰・膝・足首が [6..11] から [10..15] へずれ、both_hip が「両小指」を指す。
+# 上肢（[0..5]）は偶然無傷なので、テストが上肢しか見ていないと気づけない。
+#
+# start/end は **遠位 → 近位** の向きで書く（例: upper_arm_R は肘→肩）。
 # したがって重心は end 側（近位端）から測る:
 #     centroid = p_end + com_fraction * (p_start - p_end)
 # com_fraction = 0.5 なら両端の中点になり、2026-09-08 以前の挙動と一致する。
@@ -201,16 +240,32 @@ COM_FRACTIONS = {
 # both_shoulder / both_hip は体節ではなく「両肩の中点」「両腰の中点」であり、
 # r_g の組み立て側（master_research_code.py の r_g_R）が肩:腰 = 3:1 の重み付けで
 # 上胴体・下胴体の重心を作る。したがってここは 0.5 のままにする。
-part_calculations = {
-    "upper_arm_R": {"start": 3, "end": 1, "com_fraction": COM_FRACTIONS["upper_arm"]},
-    "forearm_R": {"start": 5, "end": 3, "com_fraction": COM_FRACTIONS["forearm"]},
-    "both_shoulder": {"start": 0, "end": 1, "com_fraction": 0.5},
-    "both_hip": {"start": 6, "end": 7, "com_fraction": 0.5},
-    "up_arm_l": {"start": 2, "end": 0, "com_fraction": COM_FRACTIONS["upper_arm"]},
-    "forearm_L": {"start": 4, "end": 2, "com_fraction": COM_FRACTIONS["forearm"]},
-    "upper_Leg_R": {"start": 7, "end": 9, "com_fraction": COM_FRACTIONS["thigh"]},
-    "upper_Leg_L": {"start": 6, "end": 8, "com_fraction": COM_FRACTIONS["thigh"]},
+PART_LINK_IDS = {
+    "upper_arm_R": ("R_ELBOW", "R_SHOULDER", COM_FRACTIONS["upper_arm"]),
+    "forearm_R": ("R_WRIST", "R_ELBOW", COM_FRACTIONS["forearm"]),
+    "both_shoulder": ("L_SHOULDER", "R_SHOULDER", 0.5),
+    "both_hip": ("L_HIP", "R_HIP", 0.5),
+    "up_arm_l": ("L_ELBOW", "L_SHOULDER", COM_FRACTIONS["upper_arm"]),
+    "forearm_L": ("L_WRIST", "L_ELBOW", COM_FRACTIONS["forearm"]),
+    "upper_Leg_R": ("R_HIP", "R_KNEE", COM_FRACTIONS["thigh"]),
+    "upper_Leg_L": ("L_HIP", "L_KNEE", COM_FRACTIONS["thigh"]),
 }
+
+
+def build_part_calculations(keypoints=None):
+    """PART_LINK_IDS から位置索引つきのリンク定義を組み立てる。
+
+    keypoints を渡せば任意の構成で索引を計算できる（テスト用）。
+    """
+    slots = landmark_slots(keypoints)
+    return {
+        name: {"start": slot_of(start, slots), "end": slot_of(end, slots),
+               "com_fraction": com}
+        for name, (start, end, com) in PART_LINK_IDS.items()
+    }
+
+
+part_calculations = build_part_calculations()
 
 # 慣性テンソルのリンク長を決めるのに使うフレーム数。
 # 1 フレームの瞬時値だと三角測量の誤差がそのまま全実行に固定される。
