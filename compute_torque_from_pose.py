@@ -198,7 +198,10 @@ def load_pose_csv(path: str, prefer_filtered: bool = True) -> Tuple[np.ndarray, 
                     break
             if col_name is None:
                 raise ValueError(f"Missing column for joint {jid} axis {axis}")
-            series = df[col_name].to_numpy(dtype=np.float64)
+            # copy=True が要る。pandas の Copy-on-Write では to_numpy() が
+            # 読み取り専用のビューを返すことがあり、次行の代入が
+            # ValueError: assignment destination is read-only で落ちる。
+            series = df[col_name].to_numpy(dtype=np.float64, copy=True)
             series[series == -1.0] = np.nan
             pose[:, jid, axis_idx] = series
     return frames, pose
