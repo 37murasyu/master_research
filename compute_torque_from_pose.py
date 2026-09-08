@@ -20,6 +20,7 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from config import SUPPORTED_MASS_FRACTION
 from config import g as CONFIG_GRAVITY
 from config import w as CONFIG_BODY_MASS
 from utils import compute_local_torque
@@ -683,8 +684,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.wrist_base:
         share = float(np.clip(args.support_share, 0.0, 1.0))
-        arm_mass_frac = sum(seg.mass_fraction for seg in RIGHT_SEGMENTS)
-        torso_mass_default = max(body_mass - 2.0 * arm_mass_frac * body_mass, 0.0)
+        # 腕が持ち上げるのは**体幹と頭だけ**。脚は床／フットレストが支える。
+        # 前腕・上腕は鎖の一部として自重が入るので含めない。手は固定端なので含めない。
+        #
+        # かつては「体重 − 両腕（上腕＋前腕）」= 60kg なら 55.36 kg としており、
+        # 脚も手も含んだ「全身を浮かせる」前提だった。体幹＋頭を直接指定する方式にすると、
+        # 手を引くべきかという問題も構造的に消える（計画 A-2）。
+        torso_mass_default = body_mass * SUPPORTED_MASS_FRACTION
         torso_mass_total = args.torso_mass if args.torso_mass is not None else torso_mass_default
         torso_mass_total = max(torso_mass_total, 0.0)
         torso_mass_each = torso_mass_total * share
