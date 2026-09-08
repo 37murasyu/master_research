@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,8 +283,24 @@ def process_file(
     _annotate_cycles(df, cycles, out_csv)
 
 
-def main() -> int:
-    base = Path(r"c:\Users\villa\Desktop\master_Research\MAINCODE\output_data\filtered_pose_lpf")
+def main(argv: List[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="LPF 済み pose CSV からサイクルを検出して *_with_cycles.csv を書く。"
+    )
+    parser.add_argument(
+        "--pose-dir",
+        default=os.environ.get("POSE_LPF_DIR", "output_data/filtered_pose_lpf"),
+        help="LPF 済み pose CSV（*_lpf.csv）のあるディレクトリ。"
+             "既定はリポジトリ相対の output_data/filtered_pose_lpf",
+    )
+    args = parser.parse_args(argv)
+
+    # 以前ここに Windows の絶対パスが直書きされており、他の環境では動かなかった。
+    # 下の被験者ごとの範囲・目標サイクル数・閾値は手で調整した値なので残す。
+    base = Path(args.pose_dir)
+    if not base.is_dir():
+        print(f"[ERROR] pose ディレクトリが無い: {base}")
+        return 1
     ranges: Dict[str, Tuple[int, int | None]] = {
         "2_stereo_pose_lpf.csv": (400, 1000),
         "3_0stereo_pose_scaled_with2d_lpf.csv": (250, 1500),

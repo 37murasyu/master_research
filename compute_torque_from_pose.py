@@ -236,7 +236,20 @@ def interpolate_and_smooth(
     if window < 5:
         return clean
     poly = max(2, min(poly, window - 1))
-    return savgol_filter(clean, window_length=window, polyorder=poly, axis=0, mode="interp")
+
+    # load_pose_csv は max(joint_id) + 1 の疎配列を作るので、使わない関節
+    # （MediaPipe の 0〜10 や 17〜22）が全 NaN のまま残る。上のループはそれを
+    # `if mask.all(): continue` で飛ばすだけなので NaN が残り、そのまま
+    # savgol_filter に渡すと ValueError: array must not contain infs or NaNs で落ちる。
+    # 有効な関節だけに適用する。NaN を 0 で埋めると偽の座標が下流に流れるので避ける。
+    usable = np.isfinite(clean).all(axis=(0, 2))
+    if not usable.any():
+        return clean
+    smoothed = clean.copy()
+    smoothed[:, usable, :] = savgol_filter(
+        clean[:, usable, :], window_length=window, polyorder=poly, axis=0, mode="interp"
+    )
+    return smoothed
 
 
 # ---------------------------------------------------------------------------
