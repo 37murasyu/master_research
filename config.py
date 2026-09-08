@@ -21,7 +21,7 @@ g = np.array([0, 0, -9.81])
 PADDING = 400  # 余白として追加するピクセル数
 # add here if you need more keypoints
 
-# MediaPipe Pose ランドマーク出力で使用するインデックス（12 点）。
+# MediaPipe Pose ランドマーク出力で使用するインデックス（16 点）。
 #
 # **このリストの並び順に意味は無い。** 元実装 TemugeB/bodypose3d は
 #     for i, landmark in enumerate(results.pose_landmarks.landmark):
@@ -29,12 +29,24 @@ PADDING = 400  # 余白として追加するピクセル数
 # とランドマーク ID の昇順に走査しており、pose_keypoints は「どの点を使うか」の
 # フィルタとしてしか働かない。したがって 3D 点列の並びは常に昇順になる:
 #
-#   [0]=11 左肩  [1]=12 右肩  [2]=13 左肘  [3]=14 右肘  [4]=15 左手首  [5]=16 右手首
-#   [6]=23 左腰  [7]=24 右腰  [8]=25 左膝  [9]=26 右膝  [10]=27 左足首 [11]=28 右足首
+#   [0]=11 左肩   [1]=12 右肩   [2]=13 左肘   [3]=14 右肘
+#   [4]=15 左手首 [5]=16 右手首 [6]=17 左小指 [7]=18 右小指
+#   [8]=19 左人差指 [9]=20 右人差指 [10]=23 左腰 [11]=24 右腰
+#   [12]=25 左膝 [13]=26 右膝  [14]=27 左足首 [15]=28 右足首
 #
-# master_research_code.py の part_calculations や慣性テンソルのリンク長は
-# この並びを前提にしている。抽出側は sorted() を通すこと（再検算 R-1）。
-pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28]
+# **位置索引を直書きしないこと。** リンク定義は PART_LINK_IDS（下）に
+# ランドマーク名で書き、build_part_calculations() が索引を組み立てる。
+# 抽出側は sorted() を通すこと（再検算 R-1）。
+#
+# 手のランドマーク（17〜20）を含めるのは、手首の関節軸を手のひら面から
+# 決めるため。従来は「リンク＝前腕、親＝上腕」で軸を作っており、
+# 手首の掌屈/背屈軸ではなく肘の屈曲軸を見ていた（グローバルトルク 149 N·m のうち
+# local_y が 6.4 N·m しか拾えていなかった）。
+#
+# 計算コストは問題にならない。pose_landmarker_lite.task を num_poses=1 で
+# 走らせており MediaPipe は常に 33 点すべてを推論する。ここは抽出フィルタでしかない。
+# 増えるのは三角測量だけで、12 → 16 点で +0.016 ms（30fps 予算の +0.05%）。
+pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28, 20, 18, 19, 17]
 # this will load the sample videos if no camera ID is given
 # input_stream1 = folder_path + "\\media\\output1.mp4"
 # input_stream2 = folder_path + "\\media\\output2.mp4"

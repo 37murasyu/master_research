@@ -52,6 +52,7 @@ from config import INERTIA_LENGTH_FRAMES
 from config import g as GRAVITY
 from config import part_calculations
 from config import part_keys as _PART_KEYS
+from config import slot_of
 from link_vector_calculator_module import LinkVectorCalculator
 from utils import PushCycleDetector, compute_local_torque
 from utils_dynamic import (
@@ -72,15 +73,26 @@ PART_LINKS: dict[str, tuple[int, int]] = {
     name: (spec["start"], spec["end"]) for name, spec in part_calculations.items()
 }
 
-# 局所トルクの基準リンク（既存の links 辞書と同じ）。
-# 索引は config.pose_keypoints の昇順（[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首）。
+# 局所トルクの基準リンク（既存 master_research_code.py の links 辞書と同じ）。
+# 関節はランドマーク名で指す。位置索引を直書きすると pose_keypoints に点を足したときに
+# 別の関節を指す（再検算 R-1 と同じ壊れ方）。
+_TORQUE_LINK_IDS: dict[str, tuple[str, str]] = {
+    "wrist_R": ("R_ELBOW", "R_WRIST"),        # 右手首 - 右肘
+    "elbow_R": ("R_SHOULDER", "R_ELBOW"),     # 右肘 - 右肩
+    "shoulder_R": ("L_SHOULDER", "R_SHOULDER"),   # 右肩 - 左肩
+    "wrist_L": ("L_ELBOW", "L_WRIST"),        # 左手首 - 左肘
+    "elbow_L": ("L_SHOULDER", "L_ELBOW"),     # 左肘 - 左肩
+    "shoulder_L": ("R_SHOULDER", "L_SHOULDER"),   # 左肩 - 右肩
+}
+
+
+def _link_getter(origin: str, tip: str) -> Callable[[np.ndarray], np.ndarray]:
+    a, b = slot_of(origin), slot_of(tip)
+    return lambda p: p[b] - p[a]
+
+
 TORQUE_LINKS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
-    "wrist_R": lambda p: p[5] - p[3],       # 右手首 - 右肘
-    "elbow_R": lambda p: p[3] - p[1],       # 右肘 - 右肩
-    "shoulder_R": lambda p: (p[1] - p[0]),  # 右肩 - 左肩
-    "wrist_L": lambda p: p[4] - p[2],       # 左手首 - 左肘
-    "elbow_L": lambda p: p[2] - p[0],       # 左肘 - 左肩
-    "shoulder_L": lambda p: -(p[1] - p[0]), # 左肩 - 右肩
+    name: _link_getter(*ids) for name, ids in _TORQUE_LINK_IDS.items()
 }
 
 # 親リンク。局所座標の y 軸を親×z（肘面の法線）で取るために使う。
@@ -325,22 +337,26 @@ class NetworkMeasurement:
         ``samples`` は (フレーム, 関節, 3) の点列。リンク長は**中央値**で決める。
         1 フレームの瞬時値だと三角測量の誤差がそのまま固定され、回帰式
         ``I = a*w + b*l + c`` は l に極端に敏感なので大きくずれる（再検算 R-6）。
-        索引は pose_keypoints をランドマーク ID の昇順に並べたときの位置。
+        関節はランドマーク名で指す。位置索引を直書きすると pose_keypoints に
+        点を足したときに別の関節を指す（再検算 R-1 と同じ壊れ方）。
         """
         mass = self.config.body_mass_kg
 
-        def length(a: int, b: int) -> float:
-            return float(np.nanmedian(np.linalg.norm(samples[:, a] - samples[:, b], axis=1)))
+        def length(a: str, b: str) -> float:
+            ia, ib = slot_of(a), slot_of(b)
+            return float(np.nanmedian(np.linalg.norm(samples[:, ia] - samples[:, ib], axis=1)))
 
-        half_body = 0.25 * float(np.nanmedian(np.linalg.norm(
-            samples[:, 0] + samples[:, 1] - samples[:, 7] - samples[:, 6], axis=1)))
+        # 胴体の半長 = |肩中点 − 腰中点| / 2
+        shoulders = samples[:, slot_of("L_SHOULDER")] + samples[:, slot_of("R_SHOULDER")]
+        hips = samples[:, slot_of("L_HIP")] + samples[:, slot_of("R_HIP")]
+        half_body = 0.25 * float(np.nanmedian(np.linalg.norm(shoulders - hips, axis=1)))
 
         self._inertia = {
-            "upper_arm": calculate_inertia_tensor(3, mass, length(0, 2)),
-            "forearm": calculate_inertia_tensor(4, mass, length(2, 4)),
+            "upper_arm": calculate_inertia_tensor(3, mass, length("L_SHOULDER", "L_ELBOW")),
+            "forearm": calculate_inertia_tensor(4, mass, length("L_ELBOW", "L_WRIST")),
             "upper_body": calculate_inertia_tensor(1, mass, half_body),
             "lower_body": calculate_inertia_tensor(0, mass, half_body),
-            "thigh": calculate_inertia_tensor(6, mass, length(9, 7)),
+            "thigh": calculate_inertia_tensor(6, mass, length("R_HIP", "R_KNEE")),
         }
 
     def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:

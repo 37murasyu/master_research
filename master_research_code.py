@@ -55,6 +55,7 @@ from config import (
     m2,
     m4,
     part_calculations,
+    slot_of,
     INERTIA_LENGTH_FRAMES,
     WORK_INTEGRAL_K,
     EFFECTIVE_MASS_BY_JOINT,
@@ -3428,15 +3429,20 @@ while True:
             continue
         _lead = np.stack(kpts_3d[:INERTIA_LENGTH_FRAMES])
 
+        # 関節はランドマーク名で指す。位置索引を直書きすると pose_keypoints に
+        # 点を足したときに別の関節を指す（再検算 R-1 と同じ壊れ方）。
         def _median_span(a, b):
-            return float(np.nanmedian(np.linalg.norm(_lead[:, a] - _lead[:, b], axis=1)))
+            ia, ib = slot_of(a), slot_of(b)
+            return float(np.nanmedian(np.linalg.norm(_lead[:, ia] - _lead[:, ib], axis=1)))
 
-        _len_upper_arm = _median_span(0, 2)   # 左肩 → 左肘
-        _len_forearm = _median_span(2, 4)     # 左肘 → 左手首
-        _len_thigh = _median_span(7, 9)       # 右腰 → 右膝
-        _len_shank = _median_span(9, 11)      # 右膝 → 右足首
-        len_half_body = 0.25 * float(np.nanmedian(np.linalg.norm(
-            _lead[:, 0] + _lead[:, 1] - _lead[:, 7] - _lead[:, 6], axis=1)))
+        _len_upper_arm = _median_span("L_SHOULDER", "L_ELBOW")
+        _len_forearm = _median_span("L_ELBOW", "L_WRIST")
+        _len_thigh = _median_span("R_HIP", "R_KNEE")
+        _len_shank = _median_span("R_KNEE", "R_ANKLE")
+        # 胴体の半長 = |肩中点 − 腰中点| / 2
+        _shoulders = _lead[:, slot_of("L_SHOULDER")] + _lead[:, slot_of("R_SHOULDER")]
+        _hips = _lead[:, slot_of("L_HIP")] + _lead[:, slot_of("R_HIP")]
+        len_half_body = 0.25 * float(np.nanmedian(np.linalg.norm(_shoulders - _hips, axis=1)))
 
         I1 = calculate_inertia_tensor(3, w, _len_upper_arm)  # 上腕
         I2 = calculate_inertia_tensor(4, w, _len_forearm)    # 前腕
@@ -3542,7 +3548,8 @@ while True:
                 return 'n/a'
         print(f"[DBG] frame {WHILE_COUNT}: MsR={_safe_len(MsR)} FsR={_safe_len(FsR)} MsL={_safe_len(MsL)} FsL={_safe_len(FsL)}")
 
-    vector = transformed_p3ds[8] - transformed_p3ds[6]
+    # 左大腿の向きで地面反力を付けるかを決める。ランドマーク名で指す（再検算 R-1）。
+    vector = transformed_p3ds[slot_of("L_KNEE")] - transformed_p3ds[slot_of("L_HIP")]
     norm_vec = np.linalg.norm(vector)
     angle_degrees = 0.0
     if norm_vec > 1e-8:
@@ -3643,13 +3650,14 @@ while True:
     # 索引は config.pose_keypoints の昇順（[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首）。
     # かつて [0]右肩 [1]左肩 [2]右肘 … という左右が逆の規約で書かれており、
     # wrist_R として出ていたのは左前腕だった（再検算 R-1）。
+    _p = transformed_p3ds
     links = {
-        "wrist_R": transformed_p3ds[5] - transformed_p3ds[3],    # 右手首 - 右肘
-        "elbow_R": transformed_p3ds[3] - transformed_p3ds[1],    # 右肘 - 右肩
-        "shoulder_R": (transformed_p3ds[1] - transformed_p3ds[0]),   # 右肩 - 左肩
-        "wrist_L": transformed_p3ds[4] - transformed_p3ds[2],    # 左手首 - 左肘
-        "elbow_L": transformed_p3ds[2] - transformed_p3ds[0],    # 左肘 - 左肩
-        "shoulder_L": -(transformed_p3ds[1] - transformed_p3ds[0]),  # 左肩 - 右肩
+        "wrist_R": _p[slot_of("R_WRIST")] - _p[slot_of("R_ELBOW")],
+        "elbow_R": _p[slot_of("R_ELBOW")] - _p[slot_of("R_SHOULDER")],
+        "shoulder_R": _p[slot_of("R_SHOULDER")] - _p[slot_of("L_SHOULDER")],
+        "wrist_L": _p[slot_of("L_WRIST")] - _p[slot_of("L_ELBOW")],
+        "elbow_L": _p[slot_of("L_ELBOW")] - _p[slot_of("L_SHOULDER")],
+        "shoulder_L": _p[slot_of("L_SHOULDER")] - _p[slot_of("R_SHOULDER")],
     }
     if DEBUG_LOGS and WHILE_COUNT % TRACE_EVERY == 0:
         link_norms = {k: float(np.linalg.norm(v)) if v is not None and np.all(np.isfinite(v)) else None for k, v in links.items()}

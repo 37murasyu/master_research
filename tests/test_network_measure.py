@@ -79,20 +79,28 @@ def _body_points(t: float) -> np.ndarray:
     phase = 2 * np.pi * 1.2 * t
     swing = 10.0 * np.sin(phase)     # 上肢の押し出し
     depth = 250.0 + 15.0 * np.sin(phase)
-    points = np.zeros((12, 3), dtype=np.float64)
-    points[0] = [-18.0 + swing, -30.0, depth]   # 左肩
-    points[1] = [18.0 + swing, -30.0, depth]    # 右肩
-    points[2] = [-22.0 + swing, -6.0, depth]    # 左肘（上腕 約 24cm）
-    points[3] = [22.0 + swing, -6.0, depth]     # 右肘
-    points[4] = [-25.0 + swing, 15.0, depth]    # 左手首（前腕 約 21cm）
-    points[5] = [25.0 + swing, 15.0, depth]     # 右手首
-    points[6] = [-12.0, 20.0, depth]            # 左腰
-    points[7] = [12.0, 20.0, depth]             # 右腰
-    points[8] = [-12.0, 60.0, depth]            # 左膝（大腿 40cm）
-    points[9] = [12.0, 60.0, depth]             # 右膝
-    points[10] = [-12.0, 100.0, depth]          # 左足首（下腿 40cm）
-    points[11] = [12.0, 100.0, depth]           # 右足首
-    return points
+    # ランドマーク ID → 位置。pose_keypoints の構成が変わっても追随する。
+    by_id = {
+        11: [-18.0 + swing, -30.0, depth],   # 左肩
+        12: [18.0 + swing, -30.0, depth],    # 右肩
+        13: [-22.0 + swing, -6.0, depth],    # 左肘（上腕 約 24cm）
+        14: [22.0 + swing, -6.0, depth],     # 右肘
+        15: [-25.0 + swing, 15.0, depth],    # 左手首（前腕 約 21cm）
+        16: [25.0 + swing, 15.0, depth],     # 右手首
+        17: [-29.0 + swing, 22.0, depth],    # 左小指 MCP（手 約 8cm）
+        18: [29.0 + swing, 22.0, depth],     # 右小指 MCP
+        19: [-25.0 + swing, 23.0, depth + 4.0],   # 左人差指 MCP
+        20: [25.0 + swing, 23.0, depth + 4.0],    # 右人差指 MCP
+        21: [-23.0 + swing, 19.0, depth + 5.0],   # 左親指
+        22: [23.0 + swing, 19.0, depth + 5.0],    # 右親指
+        23: [-12.0, 20.0, depth],            # 左腰
+        24: [12.0, 20.0, depth],             # 右腰
+        25: [-12.0, 60.0, depth],            # 左膝（大腿 40cm）
+        26: [12.0, 60.0, depth],             # 右膝
+        27: [-12.0, 100.0, depth],           # 左足首（下腿 40cm）
+        28: [12.0, 100.0, depth],            # 右足首
+    }
+    return np.array([by_id[pid] for pid in POSE_KEYPOINTS_ORDERED], dtype=np.float64)
 
 
 def _measurement() -> NetworkMeasurement:

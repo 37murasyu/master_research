@@ -380,20 +380,23 @@ class TestInertiaLengthFromMedian:
         """1 フレームだけ外れ値を混ぜても、確定するリンク長がほぼ動かない。"""
         from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 
+        from config import pose_keypoints, slot_of
+
         config = MeasurementConfig(body_mass_kg=60.0)
         projection = np.hstack([np.eye(3), np.zeros((3, 1))])
-        measurement = NetworkMeasurement(projection, projection, list(range(12)), config)
+        measurement = NetworkMeasurement(
+            projection, projection, list(pose_keypoints), config)
 
         n = config.inertia_ready_frames
-        clean = np.zeros((12, 3), dtype=float)
-        clean[0] = [-0.15, 0.0, 1.40]
-        clean[1] = [0.15, 0.0, 1.40]
-        clean[2] = [-0.18, 0.0, 1.16]
-        clean[4] = [-0.20, 0.0, 0.95]
-        clean[6] = [-0.10, 0.0, 1.00]
-        clean[7] = [0.10, 0.0, 1.00]
-        clean[9] = [0.10, 0.0, 0.60]
-        clean[11] = [0.10, 0.0, 0.20]
+        # 関節はランドマーク名で置く。pose_keypoints の構成が変わっても追随する。
+        clean = np.zeros((len(pose_keypoints), 3), dtype=float)
+        for name, position in (
+            ("L_SHOULDER", [-0.15, 0.0, 1.40]), ("R_SHOULDER", [0.15, 0.0, 1.40]),
+            ("L_ELBOW", [-0.18, 0.0, 1.16]), ("L_WRIST", [-0.20, 0.0, 0.95]),
+            ("L_HIP", [-0.10, 0.0, 1.00]), ("R_HIP", [0.10, 0.0, 1.00]),
+            ("R_KNEE", [0.10, 0.0, 0.60]), ("R_ANKLE", [0.10, 0.0, 0.20]),
+        ):
+            clean[slot_of(name)] = position
 
         samples = np.stack([clean.copy() for _ in range(n)])
         measurement._build_inertia(samples)
@@ -401,7 +404,7 @@ class TestInertiaLengthFromMedian:
 
         # 1 フレームだけ肘を大きく飛ばす（三角測量の外れ値を模す）
         spoiled = samples.copy()
-        spoiled[n // 2, 2] = [-1.50, 0.0, 1.16]
+        spoiled[n // 2, slot_of("L_ELBOW")] = [-1.50, 0.0, 1.16]
         measurement._inertia = {}
         measurement._build_inertia(spoiled)
         with_outlier = np.diag(measurement._inertia["forearm"])
