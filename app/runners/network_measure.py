@@ -276,8 +276,9 @@ class NetworkMeasurement:
     def _timestep(self, t_ns: int) -> float:
         """前フレームとの実時間差。
 
-        既存のリアルタイム経路は「PC の処理ループ速度」から dt を逆算していたが
-        （master_research_code.py:4149-4154）、こちらは**撮影時刻の差**を使える。
+        USB カメラの経路（master_research_code.py）は撮影時刻を持たず、ループのジッタを
+        速度・加速度に持ち込まないよう間引き設定から dt を算出している
+        （config.resolve_dynamics_dt）。こちらは**撮影時刻の差**を使える。
         無線のジッタがあっても、時刻で再標本化した後のグリッド間隔になる。
         """
         if self._prev_t_ns is None:
