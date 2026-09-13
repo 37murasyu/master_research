@@ -31,20 +31,14 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import resolve_dynamics_dt, w as BODY_MASS_DEFAULT  # noqa: E402
+from config import part_calculations, resolve_dynamics_dt, w as BODY_MASS_DEFAULT  # noqa: E402
 from link_vector_calculator_module import LinkVectorCalculator  # noqa: E402
 from utils_dynamic import calculate_inertia_tensor, compute_impulse  # noqa: E402
 
-# master_research_code.py の part_calculations と同じ組
+# リンク定義の正本は config.PART_LINK_IDS。索引を写すと pose_keypoints の
+# 構成が変わったときに静かにずれるので、ここでは必ず導出する。
 PART_LINKS: dict[str, tuple[int, int]] = {
-    "upper_arm_R": (3, 1),
-    "forearm_R": (5, 3),
-    "both_shoulder": (0, 1),
-    "both_hip": (6, 7),
-    "up_arm_l": (2, 0),
-    "forearm_L": (4, 2),
-    "upper_Leg_R": (7, 9),
-    "upper_Leg_L": (6, 8),
+    name: (spec["start"], spec["end"]) for name, spec in part_calculations.items()
 }
 
 
@@ -73,7 +67,7 @@ def link_series(points: np.ndarray, start: int, end: int, dt: float) -> dict[str
     """1 本のリンクについて |ω|、|ω̇|、|a| の系列を出す。"""
     calc = LinkVectorCalculator(start, end)
     out: dict[str, list[float]] = {"omega": [], "ang_acc": [], "acc": []}
-    frames = [points[i] for i in range(len(points))]
+    frames = list(points)
     for i in range(len(frames)):
         result = calc.calculate_link_vectors(frames[: i + 1], True, i, dt)
         if result[0] is None:
