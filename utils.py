@@ -5,7 +5,7 @@ import time
 # pylint: disable=no-member
 import cv2 as cv
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from config import folder_path
 
 
@@ -215,27 +215,12 @@ def put_text_jp(img, text, position, font_size, color, line_width):
     img_pil = Image.fromarray(img)
     _t1 = time.perf_counter()
 
-    # フォント取得（キャッシュあり）
-    def _get_jp_font(sz: int):
-        # シンプルなキャッシュ
-        # フォントの取得と欠落時の扱いは resources に集約してある。
-        from app.core.resources import japanese_font
-
-        return japanese_font(sz)
-        try:
-            # 同梱の IPAexゴシックを使う。以前は Meiryo を参照していたが、
-            # Microsoft の商用フォントなので配布物に含められない。
-            from app.core.resources import japanese_font_path
-
-            font_obj = ImageFont.truetype(str(japanese_font_path()), sz)
-        except (OSError, ImportError, FileNotFoundError):
-            font_obj = ImageFont.load_default()
-        _FONT_CACHE[cache_key] = font_obj
-        return font_obj
+    # フォントの取得・キャッシュ・欠落時の扱いは resources に集約してある。
+    from app.core.resources import japanese_font
 
     draw = ImageDraw.Draw(img_pil)
     _t2a = time.perf_counter()
-    font = _get_jp_font(int(font_size))
+    font = japanese_font(int(font_size))
     _t2b = time.perf_counter()
 
     wrapped_text = textwrap.fill(text, width=line_width)
@@ -256,9 +241,6 @@ def put_text_jp(img, text, position, font_size, color, line_width):
             )
         )
     return out
-
-# モジュール内フォントキャッシュ（サイズ毎）
-_FONT_CACHE = {}
 
 
 def display_choices(question, a, _=None):
