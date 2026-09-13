@@ -20,7 +20,6 @@ import pandas as pd
 from body_part_storage_module import BodyPartDataStorage
 from config import (
     PADDING,
-    dt,
     folder_path,
     fps,
     frame_shape,

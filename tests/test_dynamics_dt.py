@@ -134,12 +134,7 @@ class TestScalingLaws:
         from link_vector_calculator_module import LinkVectorCalculator
 
         w_true, length, dt, n = 2.0, 0.25, 1 / 30.0, 60
-        pts = []
-        for k in range(n):
-            th = w_true * k * dt
-            pts.append(
-                np.vstack([np.zeros(3), np.array([length * np.cos(th), length * np.sin(th), 0.0])])
-            )
+        pts = _rotating_link(n, dt, omega=w_true, length=length)
         calc = LinkVectorCalculator(0, 1)
         got = []
         for i in range(n):

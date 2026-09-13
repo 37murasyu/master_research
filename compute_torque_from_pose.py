@@ -20,6 +20,7 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from config import SUPPORT_SHARE_DEFAULT
 from config import SUPPORTED_MASS_FRACTION
 from config import g as CONFIG_GRAVITY
 from config import w as CONFIG_BODY_MASS
@@ -147,7 +148,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--support-share",
         type=float,
-        default=0.5,
+        default=SUPPORT_SHARE_DEFAULT,
         help="Fraction of torso mass assigned to a single arm when wrist-base mode is active (0-1)",
     )
     parser.add_argument(

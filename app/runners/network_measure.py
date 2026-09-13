@@ -188,6 +188,8 @@ class NetworkMeasurement:
         self.P0 = np.asarray(projection_left, dtype=np.float64)
         self.P1 = np.asarray(projection_right, dtype=np.float64)
         self.pose_keypoints = list(pose_keypoints)
+        # 取り出し順はランドマーク ID の昇順で固定。毎フレーム並べ替えない。
+        self._keypoints_in_id_order = sorted(self.pose_keypoints)
         self.config = config or MeasurementConfig()
 
         self.storage = BodyPartDataStorage()
@@ -257,7 +259,7 @@ class NetworkMeasurement:
             return None
         # 既存 `_extract_keypoints_fast_single` と同じくランドマーク ID の昇順。
         # pose_keypoints の宣言順ではない（再検算 R-1。根拠は utils.extract_keypoints）。
-        return [list(frame.pixel_xy(index)) for index in sorted(self.pose_keypoints)]
+        return [list(frame.pixel_xy(index)) for index in self._keypoints_in_id_order]
 
     def _triangulate(self, keypoints0, keypoints1) -> np.ndarray:
         """三角測量して既存と同じ座標系に変換する。

@@ -2965,14 +2965,14 @@ _e_dt_sec_current = 1.0 / max(_lpf_fps_ema, 1e-6)
 # そのまま速度・加速度のノイズになり、同じ入力でも結果が変わってしまうため。
 # 実測との突き合わせは下のループ内で行い、乖離したら警告する。
 # DT_SEC を指定すれば手で上書きできる（旧挙動の再現は DT_SEC=0.3）。
+_dt_sec_override = os.getenv('DT_SEC', '').strip()
 _DYN_DT, _dyn_dt_source = resolve_dynamics_dt(
     _src_fps,
     fixed_hz_on=RT_POSE_FIXED_HZ_ON,
     fixed_skip=_rt_fixed_skip,
     skip_mod=skip_mod,
-    override=os.getenv('DT_SEC', '').strip() or None,
+    override=_dt_sec_override or None,
 )
-_dt_sec_override = os.getenv('DT_SEC', '').strip()
 print(f"[DT] dt={_DYN_DT:.5f}s ({_dyn_dt_source})"
       + ("  ※RT_DELAY_SKIP_ON のため実際の間隔は変動します"
          if (RT_DELAY_SKIP_ON and not _dt_sec_override) else ""))
