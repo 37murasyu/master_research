@@ -43,6 +43,36 @@ class EKFConfig:
     h_jac_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None
 
 
+@dataclass(eq=False)  # holds ndarrays, so the generated __eq__ would raise
+class SeriesNoise:
+    """Per-series (q_acc, r, gate_std) for LandmarkEKF: one entry per point and axis.
+
+    LandmarkEKF runs n_points*3 independent scalar filters. A single constant cannot fit
+    them all: fitting real recordings puts the spread at 432x in r and 205x in q_acc.
+    Series are ordered as ``point * 3 + axis``, matching the (n_points, 3) measurement array.
+
+    There is deliberately no h_fn here: LandmarkEKF observes position directly, and a
+    measurement model that cannot be set cannot be silently ignored.
+    """
+
+    q_acc: np.ndarray
+    r: np.ndarray
+    gate_std: np.ndarray
+
+    @classmethod
+    def uniform(cls, n_series: int, cfg: EKFConfig) -> "SeriesNoise":
+        """Same scalar values for every series (what the runtime used before tuning)."""
+        ones = np.ones(int(n_series), dtype=float)
+        return cls(q_acc=ones * cfg.q_acc, r=ones * cfg.r, gate_std=ones * cfg.gate_std)
+
+    def as_arrays(self, n_series: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        arrays = tuple(np.asarray(v, dtype=float).reshape(-1) for v in (self.q_acc, self.r, self.gate_std))
+        for name, arr in zip(("q_acc", "r", "gate_std"), arrays):
+            if arr.shape != (n_series,):
+                raise ValueError(f"{name} must have {n_series} entries, got {arr.shape[0]}")
+        return arrays
+
+
 def constant_acceleration_model(dt: float) -> Tuple[np.ndarray, np.ndarray]:
     """State transition F and unit-intensity process noise Q (q_acc = 1) for one step.
 
@@ -215,8 +245,18 @@ class LandmarkEKF:
         bpf_order: int = 2,
         vectorized: bool = True,
     ) -> None:
+        if isinstance(cfg, EKFConfig) and (cfg.h_fn is not None or cfg.h_jac_fn is not None):
+            raise ValueError(
+                "LandmarkEKF observes position directly; h_fn / h_jac_fn are not supported "
+                "(the vectorised path used to ignore them silently)"
+            )
         self.n_points = int(n_points)
         self.cfg = cfg
+        # 系列（点 × 軸）ごとの (q_acc, r, gate_std)。スカラー設定なら全系列同値にする。
+        # 並びは point*3 + axis で、観測の (n_points, 3) を reshape(-1) した順と一致する。
+        n_series = self.n_points * 3
+        noise = cfg if isinstance(cfg, SeriesNoise) else SeriesNoise.uniform(n_series, cfg)
+        self._q_acc, self._r, self._gate_std = noise.as_arrays(n_series)
         # ベクトル化パス: (n_points*3) 本の独立スカラーEKFを配列で保持
         #   _X: (N,3) 状態 [x,v,a] / _P: (N,3,3) 共分散 / _init: (N,) 初期化済みフラグ
         # 逐次パス（従来）: ExtendedKalman1D のリスト
@@ -233,7 +273,19 @@ class LandmarkEKF:
             self._A = np.tile(self._I3, (_n, 1, 1))
             self.filters = None
         else:
-            self.filters = [[ExtendedKalman1D(cfg) for _ in range(3)] for _ in range(self.n_points)]
+            self.filters = [
+                [
+                    ExtendedKalman1D(
+                        EKFConfig(
+                            q_acc=float(self._q_acc[i * 3 + j]),
+                            r=float(self._r[i * 3 + j]),
+                            gate_std=float(self._gate_std[i * 3 + j]),
+                        )
+                    )
+                    for j in range(3)
+                ]
+                for i in range(self.n_points)
+            ]
         # streaming band-pass (optional)
         self._bpf_enabled = False
         self._bpf_b = None
@@ -271,7 +323,6 @@ class LandmarkEKF:
           - 未初期化 かつ 観測あり  -> x=[z,0,0], P=I で初期化（predict も update もしない）
           - 初期化済み              -> predict。欠測 / S<=0 / ゲート外 なら predict のみ
         """
-        cfg = self.cfg
         X, P, init = self._X, self._P, self._init
         z = arr.reshape(-1)
         valid = np.isfinite(z)
@@ -291,19 +342,22 @@ class LandmarkEKF:
             fq = self._fq
             if fq is None or fq[0] != dt:
                 F, q_unit = constant_acceleration_model(dt)
-                fq = self._fq = (dt, F, cfg.q_acc * q_unit)
+                # Q は系列ごとに違うので (N,3,3)。添字を付け忘れると形は合って値だけ静かに間違う
+                fq = self._fq = (dt, F, self._q_acc[:, None, None] * q_unit)
             _, F, Q = fq
             X[pi] = X[pi] @ F.T
-            P[pi] = F @ P[pi] @ F.T + Q
+            P[pi] = F @ P[pi] @ F.T + Q[pi]
 
             # 3) 観測がある行だけ update（H = [1,0,0] なので行列積は不要）
             ui = pi[valid[pi]]
             if ui.size:
                 y = z[ui] - X[ui, 0]
-                S = P[ui, 0, 0] + cfg.r
+                S = P[ui, 0, 0] + self._r[ui]
                 ok = S > 0.0
-                if cfg.gate_std > 0:
-                    ok[ok] &= np.abs(y[ok]) <= cfg.gate_std * np.sqrt(S[ok])
+                gate = self._gate_std[ui]
+                gated = ok & (gate > 0.0)  # gate_std <= 0 の系列はゲート無効（逐次版と同じ）
+                if gated.any():
+                    ok[gated] = np.abs(y[gated]) <= gate[gated] * np.sqrt(S[gated])
                 si = ui[ok]
                 if si.size:
                     Ps = P[si]
@@ -316,7 +370,7 @@ class LandmarkEKF:
                     np.negative(K, out=A[:, :, 0])
                     A[:, 0, 0] += 1.0
                     P[si] = A @ Ps @ np.transpose(A, (0, 2, 1)) \
-                        + cfg.r * (K[:, :, None] * K[:, None, :])
+                        + self._r[si][:, None, None] * (K[:, :, None] * K[:, None, :])
 
         # 未初期化のものは NaN（逐次版と同じ）
         out = X if init.all() else np.where(init[:, None], X, np.nan)
@@ -351,5 +405,7 @@ __all__ = [
     "ExtendedKalman1D",
     "ExtendedKalmanND",
     "LandmarkEKF",
+    "SeriesNoise",
+    "constant_acceleration_model",
     "run_ekf",
 ]
