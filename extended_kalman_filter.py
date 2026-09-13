@@ -43,6 +43,30 @@ class EKFConfig:
     h_jac_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None
 
 
+def constant_acceleration_model(dt: float) -> Tuple[np.ndarray, np.ndarray]:
+    """State transition F and unit-intensity process noise Q (q_acc = 1) for one step.
+
+    The process is constant acceleration driven by continuous white jerk, so a filter
+    uses ``q_acc * Q``. The tuning code (``app/tuning``) calls this same function, so an
+    estimated ``q_acc`` means exactly what the runtime filter will do with it.
+    """
+    dt2 = dt * dt
+    dt3 = dt2 * dt
+    F = np.array(
+        [[1.0, dt, 0.5 * dt2],
+         [0.0, 1.0, dt],
+         [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    q_unit = np.array(
+        [[dt3 * dt2 / 20.0, dt3 * dt / 8.0, dt3 / 6.0],
+         [dt3 * dt / 8.0, dt3 / 3.0, dt2 / 2.0],
+         [dt3 / 6.0, dt2 / 2.0, dt]],
+        dtype=float,
+    )
+    return F, q_unit
+
+
 class ExtendedKalman1D:
     """1D EKF with constant-acceleration process and configurable measurement."""
 
@@ -59,23 +83,9 @@ class ExtendedKalman1D:
         self.initialized = False
 
     def _predict(self, dt: float) -> None:
-        dt2 = dt * dt
-        dt3 = dt2 * dt
-        F = np.array(
-            [[1.0, dt, 0.5 * dt2],
-             [0.0, 1.0, dt],
-             [0.0, 0.0, 1.0]],
-            dtype=float,
-        )
-        q = self.cfg.q_acc
-        Q = q * np.array(
-            [[dt3 * dt2 / 20.0, dt3 * dt / 8.0, dt3 / 6.0],
-             [dt3 * dt / 8.0, dt3 / 3.0, dt2 / 2.0],
-             [dt3 / 6.0, dt2 / 2.0, dt]],
-            dtype=float,
-        )
+        F, q_unit = constant_acceleration_model(dt)
         self.x = F @ self.x
-        self.P = F @ self.P @ F.T + Q
+        self.P = F @ self.P @ F.T + self.cfg.q_acc * q_unit
 
     def _measure(self, x: np.ndarray) -> Tuple[float, np.ndarray]:
         if self.cfg.h_fn is not None and self.cfg.h_jac_fn is not None:
@@ -280,16 +290,8 @@ class LandmarkEKF:
         if pi.size:
             fq = self._fq
             if fq is None or fq[0] != dt:
-                dt2 = dt * dt
-                dt3 = dt2 * dt
-                F = np.array([[1.0, dt, 0.5 * dt2],
-                              [0.0, 1.0, dt],
-                              [0.0, 0.0, 1.0]], dtype=float)
-                Q = cfg.q_acc * np.array(
-                    [[dt3 * dt2 / 20.0, dt3 * dt / 8.0, dt3 / 6.0],
-                     [dt3 * dt / 8.0, dt3 / 3.0, dt2 / 2.0],
-                     [dt3 / 6.0, dt2 / 2.0, dt]], dtype=float)
-                fq = self._fq = (dt, F, Q)
+                F, q_unit = constant_acceleration_model(dt)
+                fq = self._fq = (dt, F, cfg.q_acc * q_unit)
             _, F, Q = fq
             X[pi] = X[pi] @ F.T
             P[pi] = F @ P[pi] @ F.T + Q

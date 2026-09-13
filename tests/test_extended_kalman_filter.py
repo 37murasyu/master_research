@@ -14,7 +14,11 @@
 もう 1 つ、``_measure`` は ``h_fn`` と ``h_jac_fn`` の片方だけが与えられると、黙って恒等観測に
 落ちていた（``KNOWN_ISSUES.md`` §4-3）。設定したつもりの観測モデルが無視されるので、例外にする。
 
-設計: ``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` の「実装 2」（S2）。
+さらに、状態遷移 F と過程雑音 Q の組み立てが ``ExtendedKalman1D._predict`` と
+``LandmarkEKF._step_vectorized`` に重複していた。推定器（``app/tuning``）が 3 つ目を書くと、
+推定した ``q_acc`` が実行時と違う形の Q に入り得るので、共通の関数にまとめる（S5）。
+
+設計: ``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` の「実装 2」（S2・S5）。
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from extended_kalman_filter import EKFConfig, ExtendedKalman1D, run_ekf
+from extended_kalman_filter import EKFConfig, ExtendedKalman1D, constant_acceleration_model, run_ekf
 
 DT = 1 / 30
 
@@ -73,3 +77,27 @@ class TestMeasurementModel:
             pos, _vel, _acc = f.step(2.0, DT)
 
         assert pos == pytest.approx(1.0, abs=0.05), "h_fn / h_jac_fn が使われていない"
+
+
+class TestConstantAccelerationModel:
+    """推定器と実行時 EKF が、同じ F と Q を使うための共通関数。"""
+
+    def test_matches_the_white_jerk_discretisation(self):
+        dt = 0.1
+        F, q_base = constant_acceleration_model(dt)
+        np.testing.assert_allclose(F, [[1, dt, dt**2 / 2], [0, 1, dt], [0, 0, 1]])
+        np.testing.assert_allclose(
+            q_base,
+            [[dt**5 / 20, dt**4 / 8, dt**3 / 6], [dt**4 / 8, dt**3 / 3, dt**2 / 2], [dt**3 / 6, dt**2 / 2, dt]],
+            err_msg="白色ジャークの連続時間モデルを離散化した Q（q_acc = 1）と合わない",
+        )
+
+    def test_the_filter_predicts_with_q_acc_times_the_shared_q(self):
+        dt, q_acc = 1 / 30, 0.5
+        f = ExtendedKalman1D(EKFConfig(q_acc=q_acc, r=1e-4, gate_std=0.0))
+        f.step(0.0, DT)
+        p_before = f.P.copy()
+        f.step(None, dt)  # 欠測なので predict だけ
+
+        F, q_base = constant_acceleration_model(dt)
+        np.testing.assert_allclose(f.P, F @ p_before @ F.T + q_acc * q_base, err_msg="predict が共通の F・Q と違う")
