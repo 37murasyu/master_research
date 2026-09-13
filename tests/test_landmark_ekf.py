@@ -2,20 +2,22 @@
 
 **なぜこのテストがあるか。**
 
-``master_research_code.py`` の ``LandmarkEKF`` は、同じ EKF を 2 通りに実装している
-（``EKF_VECTORIZED=1`` の配列演算版と、``=0`` の ``ExtendedKalman1D`` を並べた逐次版）。
+``LandmarkEKF`` は、同じ EKF を 2 通りに実装している
+（``vectorized=True`` の配列演算版と、``False`` の ``ExtendedKalman1D`` を並べた逐次版）。
 一致を確かめるテストが無いまま併存しており（``KNOWN_ISSUES.md`` §4-3）、
 NumPy 2 では逐次版が動いてすらいなかった（S2 で修正）。
 
-この後の S4 でクラスを ``extended_kalman_filter.py`` へ移し、S8 で系列別の ``(q_acc, r)`` に
-配列化する。どちらも 2 実装をまとめて書き換えるので、先に一致を固定しておく。
-S2 の修正をメモリ上で当てた確認では、外れ値 2%・欠測 5%・60 フレームの穴・dt 2 通り・
-ゲートの有無のすべてで、最大相対差 1.4e-14、NaN の位置も一致した。
+S4 でクラスを ``master_research_code.py`` から ``extended_kalman_filter.py`` へ移し、
+S8 で系列別の ``(q_acc, r)`` に配列化する。どちらも 2 実装をまとめて書き換えるので、
+先に一致を固定しておく（S3）。S2 の修正をメモリ上で当てた確認では、外れ値 2%・欠測 5%・
+60 フレームの穴・dt 2 通り・ゲートの有無のすべてで、最大相対差 1.4e-14、NaN の位置も一致した。
+ベクトル化版に変異を入れると検出できることも確かめてある
+（共分散更新の K r K^T 項を落とすと相対差 5.8e+02、未初期化の点を NaN にしないと NaN の位置が食い違う）。
 
-``master_research_code.py`` は import するとカメラを開くので、ast でクラス定義だけを
-抜き出して実行する。移設（S4）の後は import に置き換える。
+S3 の時点では ``master_research_code.py`` を import できない（カメラを開く）ので ast で抜き出していた。
+移設後は import する。
 
-設計: ``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` の S3。
+設計: ``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` の S3・S4。
 """
 
 from __future__ import annotations
@@ -25,9 +27,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from scipy.signal import butter, lfilter, lfilter_zi
 
-from extended_kalman_filter import EKFConfig, ExtendedKalman1D
+from extended_kalman_filter import EKFConfig, LandmarkEKF
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 N_POINTS = 16  # config.pose_keypoints の点数
@@ -39,27 +40,6 @@ CONFIGS = {
     "ゲート無し": (0.122, 2.59e-5, 0.0),
 }
 DTS = {"間引きなし": 1 / 30, "4Hz間引き": 8 / 30}
-
-
-def _landmark_ekf_class(vectorized: bool):
-    source = (REPO_ROOT / "master_research_code.py").read_text(encoding="utf-8")
-    node = next(
-        n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "LandmarkEKF"
-    )
-    # クラスが参照する自由変数はこの 8 個だけ（設計メモ「実装 1」）
-    namespace = {
-        "EKFConfig": EKFConfig,
-        "EKF_VECTORIZED": vectorized,
-        "ExtendedKalman1D": ExtendedKalman1D,
-        "_SCIPY_OK": True,
-        "butter": butter,
-        "lfilter": lfilter,
-        "lfilter_zi": lfilter_zi,
-        "np": np,
-    }
-    module = ast.Module(body=[node], type_ignores=[])
-    exec(compile(module, "master_research_code.py", "exec"), namespace)
-    return namespace["LandmarkEKF"]
 
 
 def _measurements(n_frames: int = 600, seed: int = 0) -> np.ndarray:
@@ -76,7 +56,7 @@ def _measurements(n_frames: int = 600, seed: int = 0) -> np.ndarray:
 
 
 def _run(vectorized: bool, cfg: EKFConfig, dt: float, meas: np.ndarray):
-    ekf = _landmark_ekf_class(vectorized)(N_POINTS, fs=30.0, cfg=cfg)
+    ekf = LandmarkEKF(N_POINTS, fs=30.0, cfg=cfg, vectorized=vectorized)
     outputs = [ekf.step(frame, dt) for frame in meas]
     return [np.stack(series) for series in zip(*outputs)]  # pos, vel, acc: (フレーム数, 点数, 3)
 
@@ -106,3 +86,19 @@ class TestSequentialAndVectorizedAgree:
         with_gate = _run(True, EKFConfig(q_acc=0.122, r=2.59e-5, gate_std=3.0), 1 / 30, meas)[0]
         without_gate = _run(True, EKFConfig(q_acc=0.122, r=2.59e-5, gate_std=0.0), 1 / 30, meas)[0]
         assert not np.allclose(with_gate, without_gate, equal_nan=True), "合成データの外れ値がゲートに掛かっていない"
+
+
+class TestSingleDefinition:
+    """移設はコピーではなく移動であること。2 つの定義が並ぶと、片方だけ直す事故が起きる。"""
+
+    def test_measurement_script_imports_instead_of_defining(self):
+        tree = ast.parse((REPO_ROOT / "master_research_code.py").read_text(encoding="utf-8"))
+        defined = [n.lineno for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LandmarkEKF"]
+        imported = any(
+            isinstance(n, ast.ImportFrom)
+            and n.module == "extended_kalman_filter"
+            and any(alias.name == "LandmarkEKF" for alias in n.names)
+            for n in tree.body
+        )
+        assert not defined, f"master_research_code.py:{defined} に LandmarkEKF の定義が残っている"
+        assert imported, "master_research_code.py が extended_kalman_filter から LandmarkEKF を import していない"
