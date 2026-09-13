@@ -37,6 +37,7 @@ IMPORT_SAFE_MODULES = [
     "app.tuning.raw_capture",
     "app.tuning.ekf_likelihood",
     "app.tuning.ekf_estimate",
+    "app.tuning.ekf_profile",
 ]
 
 # Windows でしか存在しないモジュール。使うなら関数内 import か try で囲むこと。
