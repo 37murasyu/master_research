@@ -89,6 +89,7 @@ from utils import (
     extract_keypoints,
     get_projection_matrix,
     put_text_jp,
+    compute_joint_power,
     compute_local_torque,
     PushCycleDetector,
 )
@@ -3777,7 +3778,9 @@ while True:
         # 肩・体幹は未定: 0 のまま
         current_energy_component_history[k].append(contrib)
 
-    # パワー（仕事率）を算出: P = tau · omega（グローバル同士の内積）
+    # 仕事率 P = τ_y × (ω_リンク − ω_親)·y。トルクと同じ局所軸に射影する（utils.compute_joint_power）。
+    # かつて P = τ·ω（全体座標の内積、各部位の絶対角速度）で、肘角を保ったまま腕を振るだけで
+    # 仕事が出ていた（計画メモ A-4 (2)、H-B）。親の対応は parent_links と同じ。
     omega_map = {
         "wrist_R": part_data["forearm_R"][-1]["omega"],
         "elbow_R": part_data["upper_arm_R"][-1]["omega"],
@@ -3786,13 +3789,25 @@ while True:
         "elbow_L": part_data["up_arm_l"][-1]["omega"],
         "shoulder_L": part_data["both_shoulder"][-1]["omega"],
     }
+    parent_key_of = {
+        "wrist_R": "elbow_R", "elbow_R": "shoulder_R", "shoulder_R": None,
+        "wrist_L": "elbow_L", "elbow_L": "shoulder_L", "shoulder_L": None,
+    }
     for key in current_power_history.keys():  # 表示対象に合わせて計算
-        tau_g = globals_map.get(key)
-        omg = omega_map.get(key)
-        if tau_g is None or omg is None or not (np.all(np.isfinite(tau_g)) and np.all(np.isfinite(omg))):
+        parent_key = parent_key_of.get(key)
+        vectors = [globals_map.get(key), omega_map.get(key), links.get(key)]
+        if parent_key is not None:
+            vectors += [omega_map.get(parent_key), parent_links.get(key)]
+        if any(v is None or not np.all(np.isfinite(v)) for v in vectors):
             p_val = 0.0
         else:
-            p_val = float(np.dot(tau_g, omg))
+            p_val = compute_joint_power(
+                globals_map[key],
+                omega_map[key],
+                omega_map[parent_key] if parent_key is not None else None,
+                links[key],
+                parent_links[key],
+            )
         current_power_history[key].append(p_val)
     _perf.add('hist_store', time.perf_counter() - t_u_hist)
 

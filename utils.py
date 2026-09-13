@@ -320,6 +320,47 @@ def display_choices(question, a, _=None):
 
 
 # ローカル座標系に変換する関数
+def compute_joint_power(torque_global, omega_link, omega_parent, link_vec, parent_vec=None):
+    """関節の仕事率を、局所トルクの y 軸まわりで求める。
+
+        P = τ_y × ((ω_link − ω_parent) · y)
+
+    y 軸は ``compute_local_torque`` と同じ作り方にする（z = link_vec、y = parent_vec × z、
+    parent_vec が無い／退化するときは全体座標の基準軸から）。τ と ω を**同じ軸**に射影するので、
+    左右を鏡映すると τ_y と ω_y は必ず揃って符号を変え、積 P は変わらない。
+
+    かつてスコア経路（``compute_cycle_energy_elbow_wrist.py``）は、τ_y に「+Y まわりの角度」や
+    「水平面からの傾き」の微分を掛けていた。軸の作り方が τ と別なので、鏡映で片方だけ
+    符号が反転し、左右で逆の相（押し出しと戻し）を積算していた。
+
+    Parameters
+    ----------
+    torque_global : ndarray, shape (3,)
+        関節トルク（全体座標）。
+    omega_link : ndarray, shape (3,)
+        link_vec の部位の角速度（全体座標）。
+    omega_parent : ndarray, shape (3,) or None
+        親部位の角速度（全体座標）。None は親が動かないことを表す
+        （例: アームレストを押す手を固定端とみなしたときの手首）。
+    link_vec, parent_vec : ndarray, shape (3,)
+        ``compute_local_torque`` と同じ。
+
+    Returns
+    -------
+    float
+        仕事率 [W]。
+    """
+    omega_rel = np.asarray(omega_link, dtype=np.float64)
+    if omega_parent is not None:
+        omega_rel = omega_rel - np.asarray(omega_parent, dtype=np.float64)
+    # compute_local_torque の中身は「局所座標系への回転」なので角速度にもそのまま使える。
+    # τ と ω を必ず同じ関数・同じ引数で射影する。軸を作れず全体座標のまま返るとき
+    # （KNOWN_ISSUES §5-4）も、両者の扱いが揃う。
+    tau_local = compute_local_torque(np.asarray(torque_global, dtype=np.float64), link_vec, parent_vec)
+    omega_local = compute_local_torque(omega_rel, link_vec, parent_vec)
+    return float(tau_local[1] * omega_local[1])
+
+
 def compute_local_torque(torque_global, link_vec, parent_vec=None):
     """
     グローバル座標系のトルクをリンク基準の右手系に変換する。

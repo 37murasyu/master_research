@@ -1,18 +1,20 @@
-"""サイクル仕事量の角度と角速度が正しく出ることを固定する。
+"""スコア経路の関節の仕事率が、正しい角速度・正しい軸・正しい符号で出ることを固定する。
 
 **なぜこのテストがあるか。**
 
-``力学計算_検証結果.md`` §A-1・§A-2（= ``KNOWN_ISSUES.md`` §1-1・§1-2）で確定した
-2 つの誤りを、再発しないよう留める。この 2 つは論文のスコアを **約 350 倍** 押し上げていた。
+``compute_cycle_energy_elbow_wrist.py`` のサイクル仕事量は論文のスコアそのもの。
+これまでに次の誤りがあった。
 
-- §1-1 ``_gradient(angle, dt)`` の戻り値は既に rad/s なのに、さらに fps を掛けていた。
-  ω が一律 30 倍になり、実測で平均 47.5 rad/s（= 7.6 回転/秒）という肘では起こり得ない値が出ていた。
-- §1-2 関節角が ``arctan2`` 由来で値域 ±π なのに unwrap していなかった。
-  折り返し 1 回につき ω に ``2π/dt`` のスパイクが立ち、仕事量が ``max(τω, 0)`` と
-  正側だけを拾う（整流する）ため、符号がランダムなスパイクでも必ず加算されていた。
+- §1-1 角速度に fps を掛けていた（ω が一律 30 倍。実測で平均 47.5 rad/s）
+- §1-2 ``arctan2`` の角度を unwrap せずに微分していた（折り返しごとに 2π/dt のスパイク）
+- 2026-09-13 に判明: 局所トルク ``*_local_y`` に、軸の作り方が別の角速度
+  （肘は「+Y まわりの肘角」、手首は「水平面からの前腕の傾き」の微分）を掛けていた。
+  左右を鏡映すると片方だけ符号が反転し、左右で逆の相を積算していた
+  （被験者 3 を左右反転すると、左の W_pos 301.94 J が右の W_neg と一致した）
 
-検証系は「肩と肘を固定し、手首を y 軸まわりに一定角速度で回す」合成データ。
-``_angle_about_y`` の定義から肘角度は ``-θ`` になるので、角速度の大きさが真値と一致するはず。
+いまは、トルクを出した鎖（``--wrist-base``: 手を固定端として前腕 → 上腕）と同じ部位の
+相対角速度を、トルクと同じ局所軸に射影して掛ける（``utils.compute_joint_power``）。
+角度を経由しないので、fps の掛け戻しも折り返しも構造的に起きない。
 """
 
 from __future__ import annotations
@@ -21,97 +23,162 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from compute_cycle_energy_elbow_wrist import RIGHT, _compute_angles, _compute_omega, _gradient
+from compute_cycle_energy_elbow_wrist import LEFT, RIGHT, _joint_powers
 
 DT = 1.0 / 30.0
 UPPER_ARM = 0.30
 FOREARM = 0.25
+BODY_MASS = 60.0
+GRAVITY = np.array([0.0, 0.0, -9.81])
+MIRROR = np.array([-1.0, 1.0, 1.0])
 
 
-def _swinging_forearm(n: int, omega: float, dt: float = DT) -> pd.DataFrame:
-    """肩と肘を固定し、手首が y 軸まわりに角速度 omega で回る点列。
+def _pose_df(side: dict, wrist: np.ndarray, elbow: np.ndarray, shoulder: np.ndarray) -> pd.DataFrame:
+    """姿勢 CSV と同じ列（joint_{id}_{axis}）の DataFrame を作る。"""
+    columns = {}
+    for name, series in (("wrist", wrist), ("elbow", elbow), ("shoulder", shoulder)):
+        for axis, label in enumerate("xyz"):
+            columns[f"joint_{side[name]}_{label}"] = series[:, axis]
+    return pd.DataFrame(columns)
 
-    肘を原点、肩を +x 方向に置く。手首は xz 平面内を回るので
-    ``_angle_about_y`` が拾う軸と一致する。
+
+def _torque_df(side_name: str, elbow: np.ndarray, wrist: np.ndarray) -> pd.DataFrame:
+    """トルク CSV と同じ列（{part}_{side}_{axis}、全体座標）の DataFrame を作る。"""
+    columns = {}
+    for part, series in (("elbow", elbow), ("wrist", wrist)):
+        for axis, label in enumerate("xyz"):
+            columns[f"{part}_{side_name}_{label}"] = series[:, axis]
+    return pd.DataFrame(columns)
+
+
+def _upper_arm_rotating_about_y(n: int, omega: float, theta0: float = 0.3):
+    """手首と肘を固定し（前腕は鉛直）、上腕だけが y 軸まわりに角速度 omega で回る。
+
+    肩 = 肘 + L (sin θ, 0, cos θ)、θ = θ0 + ω t なので、上腕の r × ṙ / |r|² = (0, ω, 0)。
+    前腕は動かないので、肘の相対角速度も (0, ω, 0)。
     """
-    rows = []
-    for k in range(n):
-        theta = omega * k * dt
-        elbow = np.zeros(3)
-        shoulder = np.array([UPPER_ARM, 0.0, 0.0])
-        wrist = np.array([FOREARM * np.cos(theta), 0.0, FOREARM * np.sin(theta)])
-        row = {}
-        for idx, point in ((RIGHT["shoulder"], shoulder),
-                           (RIGHT["elbow"], elbow),
-                           (RIGHT["wrist"], wrist)):
-            row[f"joint_{idx}_x"], row[f"joint_{idx}_y"], row[f"joint_{idx}_z"] = point
-        rows.append(row)
-    return pd.DataFrame(rows)
+    theta = theta0 + omega * DT * np.arange(n)
+    wrist = np.zeros((n, 3))
+    elbow = np.tile([0.0, 0.0, FOREARM], (n, 1))
+    shoulder = elbow + UPPER_ARM * np.stack([np.sin(theta), np.zeros(n), np.cos(theta)], axis=1)
+    return wrist, elbow, shoulder
+
+
+def _elbow_power_under_constant_torque(n: int, omega: float, dt: float = DT) -> np.ndarray:
+    wrist, elbow, shoulder = _upper_arm_rotating_about_y(n, omega)
+    torque = np.tile([0.0, 2.0, 0.0], (n, 1))
+    elbow_power, _ = _joint_powers(
+        _pose_df(RIGHT, wrist, elbow, shoulder), _torque_df("R", torque, np.zeros((n, 3))), "R", dt)
+    return elbow_power
+
+
+def _lifting_motion(n: int = 121):
+    """前腕を鉛直に固定し、上腕を 30° → 90° へ静止から静止まで持ち上げる（x-z 平面内）。"""
+    progress = (1.0 - np.cos(np.pi * np.arange(n) / (n - 1))) / 2.0
+    phi = np.pi / 6 + (np.pi / 3) * progress
+    wrist = np.zeros((n, 3))
+    elbow = np.tile([0.0, 0.0, FOREARM], (n, 1))
+    shoulder = elbow + UPPER_ARM * np.stack([np.cos(phi), np.zeros(n), np.sin(phi)], axis=1)
+    return wrist, elbow, shoulder
+
+
+def _reaching_motion(n: int = 90):
+    """手首を固定し、前腕と上腕の両方が面に乗らずに動く。"""
+    t = DT * np.arange(n)
+    a = 0.3 + 0.25 * np.sin(2 * np.pi * 0.8 * t)
+    b = 0.2 * np.sin(2 * np.pi * 0.5 * t + 0.4)
+    phi = 0.9 + 0.3 * np.sin(2 * np.pi * 0.8 * t + 1.0)
+    wrist = np.zeros((n, 3))
+    elbow = FOREARM * np.stack([np.sin(a) * np.cos(b), np.sin(b), np.cos(a) * np.cos(b)], axis=1)
+    direction = np.stack([np.cos(phi), np.full(n, 0.3), np.sin(phi)], axis=1) / np.sqrt(1.09)
+    return wrist, elbow, elbow + UPPER_ARM * direction
+
+
+def _wrist_base_powers(wrist, elbow, shoulder, side_name: str, load_kg: float):
+    """--wrist-base と同じ鎖でトルクを出し、そのトルク CSV 相当から仕事率を求める。"""
+    from compute_torque_from_pose import (
+        WRIST_BASE_SEGMENTS_LEFT,
+        WRIST_BASE_SEGMENTS_RIGHT,
+        compute_side_torques,
+    )
+
+    side = RIGHT if side_name == "R" else LEFT
+    segments = WRIST_BASE_SEGMENTS_RIGHT if side_name == "R" else WRIST_BASE_SEGMENTS_LEFT
+    n = len(wrist)
+    pose = np.zeros((n, 17, 3))
+    pose[:, side["wrist"]], pose[:, side["elbow"]], pose[:, side["shoulder"]] = wrist, elbow, shoulder
+    tau, _ = compute_side_torques(
+        pose, segments, BODY_MASS, DT, GRAVITY,
+        external_force=np.tile(load_kg * GRAVITY, (n, 1)), external_point=shoulder)
+    return _joint_powers(
+        _pose_df(side, wrist, elbow, shoulder), _torque_df(side_name, tau[:, 1], tau[:, 0]), side_name, DT)
 
 
 class TestAngularVelocityScale:
-    """§1-1 角速度に fps を掛けてはいけない。"""
+    """§1-1 仕事率は rad/s の角速度で決まり、fps を掛けない。"""
 
-    def test_computed_omega_is_in_radians_per_second(self):
-        """既知の一定角速度を与えると、真値がそのまま出る。"""
-        omega_true = 1.5
-        pose = _swinging_forearm(90, omega_true)
-        elbow_omega, _ = _compute_omega(pose, RIGHT, DT)
-        got = float(np.median(np.abs(elbow_omega)[5:-5]))
-        assert got == pytest.approx(omega_true, rel=0.02), (
-            f"角速度が真値 {omega_true} rad/s から外れた（実測 {got:.4f}）。"
-            " _gradient に fps を掛け戻していないか確認すること"
-        )
-
-    def test_angular_velocity_is_not_scaled_by_fps(self):
-        """fps を掛けた値（30 倍）になっていないことを明示的に否定する。"""
-        omega_true = 1.5
-        pose = _swinging_forearm(90, omega_true)
-        elbow_omega, _ = _compute_omega(pose, RIGHT, DT)
-        got = float(np.median(np.abs(elbow_omega)[5:-5]))
-        assert got != pytest.approx(omega_true * 30.0, rel=0.1), (
-            f"角速度が真値の 30 倍（{omega_true * 30:.1f} rad/s）になっている。"
-            " これは KNOWN_ISSUES §1-1 の再発"
+    def test_power_is_torque_times_angular_velocity(self):
+        # τ = (0, 2, 0) N·m、ω_rel = (0, 1.5, 0) rad/s、局所 y 軸 = ±ŷ → P = 3.0 W
+        # （中心差分は正弦波の振幅を sin(ωdt)/(ωdt) = 0.9996 倍にする）
+        power = _elbow_power_under_constant_torque(60, omega=1.5)
+        got = float(np.median(power[2:-2]))
+        assert got == pytest.approx(3.0, rel=0.01), (
+            f"仕事率が τω = 3.0 W から外れた（{got:.4f}）。"
+            " 30 倍（90 W）なら角速度に fps を掛け戻している（§1-1 の再発）"
         )
 
     def test_the_sampling_interval_is_honoured(self):
-        """dt を変えれば角速度もその分だけ変わる（積分係数として効いている）。"""
-        omega_true = 1.5
-        pose = _swinging_forearm(90, omega_true)
-        fast = float(np.median(np.abs(_compute_omega(pose, RIGHT, DT)[0])[5:-5]))
-        slow = float(np.median(np.abs(_compute_omega(pose, RIGHT, DT * 2)[0])[5:-5]))
-        assert fast / slow == pytest.approx(2.0, rel=0.01), (
-            "dt を 2 倍にしたのに角速度が半分になっていない"
-        )
+        fast = float(np.median(_elbow_power_under_constant_torque(60, 1.5, DT)[2:-2]))
+        slow = float(np.median(_elbow_power_under_constant_torque(60, 1.5, DT * 2)[2:-2]))
+        assert fast / slow == pytest.approx(2.0, rel=0.01), "dt を 2 倍にしたのに仕事率が半分になっていない"
 
 
-class TestAngleUnwrapping:
-    """§1-2 関節角は unwrap してから微分する。"""
+class TestNoWrappingSpikes:
+    """§1-2 何回転しても角速度にスパイクが立たない。"""
 
-    def test_angles_are_unwrapped(self):
-        """±π をまたいでも角度が連続になる。"""
-        # 3 回転させれば必ず折り返しが起きる
-        pose = _swinging_forearm(200, omega=3.0 * 2 * np.pi / (200 * DT) * 3)
-        elbow_angle, _ = _compute_angles(pose, RIGHT)
-        span = float(np.max(elbow_angle) - np.min(elbow_angle))
-        assert span > 2 * np.pi, (
-            f"角度の振れ幅が {span:.2f} rad しかない。unwrap されていれば"
-            " 複数回転で 2π を超えるはず（±π に折り返されている）"
-        )
+    def test_power_stays_constant_over_several_turns(self):
+        # ω = 6 rad/s で 90 フレーム（約 2.9 回転）。P = 2 × 6 × sin(0.2)/0.2 = 11.92 W
+        power = _elbow_power_under_constant_torque(90, omega=6.0)[2:-2]
+        np.testing.assert_allclose(power, 11.92, rtol=0.01, err_msg=(
+            "回転を重ねると仕事率が一定でなくなる。角度の折り返しを微分していないか確認すること（§1-2）"))
 
-    def test_no_spike_from_wrapping(self):
-        """折り返し由来の巨大な角速度スパイクが出ない。"""
-        omega_true = 6.0   # 1 秒で約 1 回転。90 フレームで 3 回転する
-        pose = _swinging_forearm(90, omega_true)
-        omega = np.abs(_compute_omega(pose, RIGHT, DT)[0])[3:-3]
-        spike_threshold = 2 * np.pi / DT * 0.5   # 折り返し 1 回分の半分
-        assert float(np.max(omega)) < spike_threshold, (
-            f"角速度の最大が {np.max(omega):.1f} rad/s に達している"
-            f"（折り返しスパイクの目安 {spike_threshold:.1f}）。unwrap が効いていない"
+
+class TestLiftingTheTrunk:
+    """手を固定端として体幹を持ち上げる動きで、仕事の大きさと符号が物理と合う。"""
+
+    def test_positive_elbow_work_equals_the_potential_energy_gained(self):
+        # 持ち上げる位置エネルギー:
+        #   荷重 20 kg × g × 肩の上昇 0.30 (sin 90° − sin 30°) = 20 × 9.81 × 0.15
+        #   上腕 60 × 0.0227 kg × g × 重心の上昇 0.564 × 0.15（重心は肘から 0.564 L）
+        #   合計 9.81 × (3.0 + 1.362 × 0.0846) = 30.56 J
+        # 静止から静止までなので運動エネルギーの差は 0。
+        elbow_power, _ = _wrist_base_powers(*_lifting_motion(), "R", load_kg=20.0)
+        work_pos = float(np.sum(np.clip(elbow_power, 0, None)) * DT)
+        work_neg = float(np.sum(np.clip(elbow_power, None, 0)) * DT)
+        assert work_pos == pytest.approx(30.56, rel=0.02), (
+            f"持ち上げたときの肘の正の仕事 {work_pos:.2f} J が位置エネルギーの増加 30.56 J と合わない。"
+            " 負なら相対角速度の向き（リンク − 親）が逆"
         )
-        assert float(np.median(omega)) == pytest.approx(omega_true, rel=0.05), (
-            f"折り返しを含む系列で角速度の中央値がずれた（実測 {np.median(omega):.3f}）"
-        )
+        assert abs(work_neg) < 0.3, f"単調に持ち上げているのに負の仕事 {work_neg:.2f} J が出た"
+
+    def test_a_still_forearm_does_no_work_at_the_wrist(self):
+        # 手は固定端、前腕は動かないので手首の相対角速度は 0
+        _, wrist_power = _wrist_base_powers(*_lifting_motion(), "R", load_kg=20.0)
+        assert float(np.sum(np.abs(wrist_power)) * DT) < 1e-9, "前腕が静止しているのに手首が仕事をした"
+
+
+class TestMirrorSymmetry:
+    """左右を鏡映した動きなら、左の仕事率は右と同じ。"""
+
+    def test_left_matches_right_for_mirrored_motion(self):
+        wrist, elbow, shoulder = _reaching_motion()
+        right = _wrist_base_powers(wrist, elbow, shoulder, "R", load_kg=17.0)
+        left = _wrist_base_powers(wrist * MIRROR, elbow * MIRROR, shoulder * MIRROR, "L", load_kg=17.0)
+        assert np.max(np.abs(right[1])) > 1e-3, "比較の前提として、手首が仕事をする動きにすること"
+        for name, r, l in (("肘", right[0], left[0]), ("手首", right[1], left[1])):
+            np.testing.assert_allclose(l, r, rtol=1e-9, atol=1e-9, err_msg=(
+                f"{name}: 鏡映した動きで左の仕事率が右と一致しない。"
+                " トルクと角速度を別の軸に射影すると、左右で逆の相を積算する"))
 
 
 class TestInertiaTensorArgument:

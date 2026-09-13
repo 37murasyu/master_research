@@ -7,7 +7,13 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+from compute_torque_from_pose import (
+    WRIST_BASE_SEGMENTS_LEFT,
+    WRIST_BASE_SEGMENTS_RIGHT,
+    compute_segment_kinematics,
+)
 from config import THEORETICAL_WORK_COEFF
+from utils import compute_joint_power
 
 FOREARM_MASS_FRAC = 0.0160
 HAND_MASS_FRAC = 0.0060
@@ -29,27 +35,6 @@ LEFT = {
 
 def _col_triplet(idx: int) -> List[str]:
     return [f"joint_{idx}_x", f"joint_{idx}_y", f"joint_{idx}_z"]
-
-
-def _angle_about_y(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-    """Signed angle from v1 to v2 around +Y axis."""
-    cross = np.cross(v1, v2)
-    cross_y = cross[:, 1]
-    dot = np.einsum("ij,ij->i", v1, v2)
-    return np.arctan2(cross_y, dot)
-
-
-def _angle_from_xz_plane(v: np.ndarray) -> np.ndarray:
-    """Signed angle of v relative to XZ plane (y component tilt)."""
-    vy = v[:, 1]
-    vxz = np.linalg.norm(v[:, [0, 2]], axis=1)
-    return np.arctan2(vy, vxz)
-
-
-def _gradient(series: np.ndarray, dt: float) -> np.ndarray:
-    if len(series) < 2:
-        return np.zeros_like(series)
-    return np.gradient(series, dt)
 
 
 def _parse_subject_id(stem: str) -> int | None:
@@ -106,31 +91,44 @@ def _compute_lengths(pose_df: pd.DataFrame, side: Dict[str, int]) -> Tuple[np.nd
     return forearm, forearm_len_med, r_x
 
 
-def _compute_angles(pose_df: pd.DataFrame, side: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray]:
-    p_sh = pose_df[_col_triplet(side["shoulder"])].to_numpy(float)
-    p_el = pose_df[_col_triplet(side["elbow"])].to_numpy(float)
-    p_wr = pose_df[_col_triplet(side["wrist"])].to_numpy(float)
-    v1 = p_sh - p_el
-    v2 = p_wr - p_el
-    elbow_angle = _angle_about_y(v1, v2)
-    forearm = v2
-    wrist_angle = _angle_from_xz_plane(forearm)
-    # 両者とも arctan2 なので値域は ±π。折り返しをそのまま微分すると
-    # 1 回につき 2π/dt = 188 rad/s のスパイクが立つ。仕事量は max(τω, 0) と
-    # 正側だけを拾う（整流する）ので、符号がランダムなスパイクでも必ず加算される。
-    # 実データには 1 試技あたり中央 29 回の折り返しがあった。
-    return np.unwrap(elbow_angle), np.unwrap(wrist_angle)
+def _pose_array(pose_df: pd.DataFrame, joint_ids) -> np.ndarray:
+    """姿勢 CSV の列を (フレーム, 最大 ID + 1, 3) の配列にする。使わない関節は NaN。"""
+    pose = np.full((len(pose_df), max(joint_ids) + 1, 3), np.nan)
+    for jid in joint_ids:
+        pose[:, jid, :] = pose_df[_col_triplet(jid)].to_numpy(float)
+    return pose
 
 
-def _compute_omega(pose_df: pd.DataFrame, side: Dict[str, int], dt: float) -> Tuple[np.ndarray, np.ndarray]:
-    """肘と手首の角速度 [rad/s] を返す。
+def _joint_powers(
+    pose_df: pd.DataFrame, torque_df: pd.DataFrame, side_name: str, dt: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """肘と手首の仕事率 [W] を (肘, 手首) で返す。
 
-    ``_gradient`` は ``np.gradient(series, dt)`` で第 2 引数がサンプル間隔なので、
-    戻り値は既に rad/s。**ここで fps を掛け戻してはいけない**（KNOWN_ISSUES §1-1）。
-    かつて掛けており ω が一律 30 倍になっていた。
+    トルク CSV は ``compute_torque_from_pose.py --wrist-base`` の出力（全体座標の列）を前提にする。
+    手を固定端として前腕 → 上腕の順に解いた鎖なので、関節の相対角速度も同じ鎖・同じリンクから取る:
+
+    - 手首: 前腕の角速度（親の手は固定）。局所軸は前腕リンクから作る
+    - 肘: 上腕の角速度 − 前腕の角速度。局所軸は上腕リンクと親の前腕リンクから作る
+
+    どちらもトルクと同じ局所軸に射影して掛ける（``utils.compute_joint_power``）。
+    角度を経由しないので、fps の掛け戻し（§1-1）も ±π の折り返し（§1-2）も起きない。
+
+    かつて ``*_local_y`` に「+Y まわりの肘角」「水平面からの前腕の傾き」の微分を掛けていた。
+    軸の作り方が τ と別なので、左右を鏡映すると片方だけ符号が反転し、左右で逆の相を積算していた。
     """
-    elbow_angle, wrist_angle = _compute_angles(pose_df, side)
-    return _gradient(elbow_angle, dt), _gradient(wrist_angle, dt)
+    segments = WRIST_BASE_SEGMENTS_RIGHT if side_name == "R" else WRIST_BASE_SEGMENTS_LEFT
+    joint_ids = sorted({seg.proximal_joint for seg in segments} | {seg.distal_joint for seg in segments})
+    # 角速度とリンクは、トルクを出した compute_torque_from_pose と同じ関数で求める（0: 前腕、1: 上腕）
+    omegas, _, _, _, _, links = compute_segment_kinematics(_pose_array(pose_df, joint_ids), segments, dt)
+    wrist_tau = torque_df[[f"wrist_{side_name}_{ax}" for ax in "xyz"]].to_numpy(float)
+    elbow_tau = torque_df[[f"elbow_{side_name}_{ax}" for ax in "xyz"]].to_numpy(float)
+    n = min(len(pose_df), len(torque_df))
+    wrist = np.array([
+        compute_joint_power(wrist_tau[t], omegas[t, 0], None, links[t, 0]) for t in range(n)])
+    elbow = np.array([
+        compute_joint_power(elbow_tau[t], omegas[t, 1], omegas[t, 0], links[t, 1], links[t, 0])
+        for t in range(n)])
+    return elbow, wrist
 
 
 def _aggregate_cycles(frame_idx: np.ndarray, power: np.ndarray, cycle_index: np.ndarray, dt: float) -> pd.DataFrame:
@@ -237,7 +235,6 @@ def main() -> int:
         pos_scale = _unit_scale(unit)
 
         for side_name, side in ("R", RIGHT), ("L", LEFT):
-            # angles and omega
             pose_scaled = pose_df.copy()
             if pos_scale != 1.0:
                 for idx in (side["shoulder"], side["elbow"], side["wrist"]):
@@ -245,25 +242,16 @@ def main() -> int:
                         col = f"joint_{idx}_{ax}"
                         if col in pose_scaled.columns:
                             pose_scaled[col] = pose_scaled[col].to_numpy(float) * pos_scale
-            elbow_omega, wrist_omega = _compute_omega(pose_scaled, side, dt)
-
-            # align to torque frames
-            n = min(len(torque_df), len(pose_df))
-            elbow_omega = elbow_omega[:n]
-            wrist_omega = wrist_omega[:n]
-            cycle_idx = torque_cycle[:n]
-
-            # torque y
-            elbow_tau_col = f"elbow_{side_name}_local_y"
-            wrist_tau_col = f"wrist_{side_name}_local_y"
-            if elbow_tau_col not in torque_df.columns or wrist_tau_col not in torque_df.columns:
+            # 仕事率はトルク（全体座標の列）と姿勢から、関節の相対角速度で求める
+            needed = [f"{part}_{side_name}_{ax}" for part in ("elbow", "wrist") for ax in "xyz"]
+            if any(col not in torque_df.columns for col in needed):
                 print(f"[SKIP] missing torque columns for {stem} {side_name}")
                 continue
-            elbow_tau = torque_df[elbow_tau_col].to_numpy(float)[:n] * args.torque_scale
-            wrist_tau = torque_df[wrist_tau_col].to_numpy(float)[:n] * args.torque_scale
-
-            elbow_power = elbow_tau * elbow_omega
-            wrist_power = wrist_tau * wrist_omega
+            elbow_power, wrist_power = _joint_powers(pose_scaled, torque_df, side_name, dt)
+            n = len(elbow_power)
+            elbow_power = elbow_power * args.torque_scale
+            wrist_power = wrist_power * args.torque_scale
+            cycle_idx = torque_cycle[:n]
 
             elbow_cycles = _aggregate_cycles(np.arange(n), elbow_power, cycle_idx, dt)
             wrist_cycles = _aggregate_cycles(np.arange(n), wrist_power, cycle_idx, dt)

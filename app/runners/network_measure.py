@@ -9,7 +9,7 @@
 再利用する**。既存の USB 経路は一切変更しないので回帰リスクがゼロ。
 
 再利用しているもの:
-    utils.compute_local_torque / PushCycleDetector
+    utils.compute_local_torque / compute_joint_power / PushCycleDetector
     utils_dynamic.calculate_inertia_tensor / calculate_M_and_F /
                   calculate_individual_torques
     link_vector_calculator_module.LinkVectorCalculator
@@ -23,11 +23,11 @@
     - ``compute_local_torque`` への parent_vec（肘面を基準に取る）
 
 **揃っていない点（重要）**:
-    サイクルごとの量は τ·ω を積分した**仕事 [J]** で、既存の
-    ``master_research_code.py:3833-3843`` が肘・手首に対して使う特別な経路
+    サイクルごとの量は仕事率 P = τ_y × (ω_リンク − ω_親)·y を積分した**仕事 [J]** で、既存の
+    ``master_research_code.py`` が肘・手首に対して使う特別な経路
     （``compute_cycle_energy_filtered`` と局所 y 成分の片側積算）は再現していない。
     したがって肘・手首の値は USB 経路と**直接比較できない**。肩・体幹に相当する
-    「その他」分岐（P = τ·ω の積分）とは同じ定義。
+    「その他」分岐（同じ仕事率の積分）とは同じ定義。
 
 注記: キーポイントの並び順が下流のインデックス演算と整合しているかには疑義がある
 （code-review 指摘 #1 と同じ論点）。ここでは既存と同じ規約に揃えることを優先し、
@@ -54,7 +54,7 @@ from config import part_calculations
 from config import part_keys as _PART_KEYS
 from config import slot_of
 from link_vector_calculator_module import LinkVectorCalculator
-from utils import PushCycleDetector, compute_local_torque
+from utils import PushCycleDetector, compute_joint_power, compute_local_torque
 from utils_dynamic import (
     calculate_individual_torques,
     calculate_inertia_tensor,
@@ -106,8 +106,8 @@ PARENT_OF: dict[str, str | None] = {
     "shoulder_L": None,
 }
 
-# 仕事率 P = τ·ω を求めるときに、各関節へ対応させる部位の角速度。
-# 既存 master_research_code.py:3790-3797 と同じ。
+# 仕事率を求めるときに、各関節のリンク側として使う部位の角速度。
+# 親側は PARENT_OF の関節の部位を引く（既存 master_research_code.py の omega_map と同じ）。
 OMEGA_SOURCE: dict[str, str] = {
     "wrist_R": "forearm_R",
     "elbow_R": "upper_arm_R",
@@ -471,26 +471,41 @@ class NetworkMeasurement:
             )
             self.storage.add_torque(key, local[key])
 
-        self._accumulate_power(global_torques, data)
+        self._accumulate_power(global_torques, links, data)
         return local
 
     def _accumulate_power(
-        self, global_torques: dict[str, np.ndarray], data: dict[str, list]
+        self,
+        global_torques: dict[str, np.ndarray],
+        links: dict[str, np.ndarray],
+        data: dict[str, list],
     ) -> None:
-        """仕事率 P = τ·ω を溜める。既存 master_research_code.py:3789-3805 と同じ式。"""
-        for key, part in OMEGA_SOURCE.items():
-            torque = global_torques.get(key)
-            entries = data.get(part)
-            omega = entries[-1]["omega"] if entries else None
-            if (
-                torque is None
-                or omega is None
-                or not np.all(np.isfinite(torque))
-                or not np.all(np.isfinite(omega))
-            ):
+        """仕事率 P = τ_y × (ω_リンク − ω_親)·y を溜める（utils.compute_joint_power）。
+
+        局所 y 軸は局所トルクと同じ作り方（リンクと親リンク）。関節の仕事率なので
+        親との相対角速度を使う。かつて絶対角速度との内積 τ·ω で、肘角を保ったまま
+        腕を振るだけで仕事が出ていた（計画メモ A-4 (2)、H-B）。
+        既存 master_research_code.py の仕事率と同じ式。
+        """
+        def latest_omega(key: str):
+            entries = data.get(OMEGA_SOURCE[key])
+            return entries[-1]["omega"] if entries else None
+
+        for key in OMEGA_SOURCE:
+            parent_key = PARENT_OF[key]
+            vectors = [global_torques.get(key), latest_omega(key), links.get(key)]
+            if parent_key is not None:
+                vectors += [latest_omega(parent_key), links.get(parent_key)]
+            if any(v is None or not np.all(np.isfinite(v)) for v in vectors):
                 self._power_history[key].append(0.0)
-            else:
-                self._power_history[key].append(float(np.dot(torque, omega)))
+                continue
+            self._power_history[key].append(compute_joint_power(
+                global_torques[key],
+                latest_omega(key),
+                latest_omega(parent_key) if parent_key is not None else None,
+                links[key],
+                links[parent_key] if parent_key is not None else None,
+            ))
 
     def _accumulate_cycle(self, points: np.ndarray, dt: float, result: FrameResult) -> None:
         """サイクルを検出し、その区間の仕事を積む。"""

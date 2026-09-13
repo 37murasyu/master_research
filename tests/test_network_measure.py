@@ -216,6 +216,51 @@ class TestPipeline:
         assert measurement._timestep(100_000_000) == pytest.approx(0.05)
 
 
+def _body_points_rotating_right_arm(t: float) -> np.ndarray:
+    """_body_points の右腕を、肘を曲げたまま肩まわりに一体で回す。
+
+    肘角が変わらないので、肘での関節の仕事は 0 のはず。回転軸（カメラの z 軸）は
+    上腕と前腕の両方に直交させてある。2 点リンクの角速度は軸に直交する成分しか
+    取れないので、直交していないと両リンクの角速度の推定値が揃わない。
+    """
+    points = _body_points(t)
+    slot = {pid: i for i, pid in enumerate(POSE_KEYPOINTS_ORDERED)}
+    shoulder = points[slot[12]]
+    angle = 1.2 * t   # 一方向に回し続ける（往復だとサイクル内で仕事が相殺して判定にならない）
+    c, s = np.cos(angle), np.sin(angle)
+    rotation = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    elbow = np.array([4.0, 24.0, 0.0])            # 上腕 約 24cm（奥行きは肩と同じ）
+    wrist = elbow + np.array([18.0, 12.0, 0.0])   # 前腕 約 22cm、肘は約 40° 曲げる
+    points[slot[14]] = shoulder + rotation @ elbow
+    points[slot[16]] = shoulder + rotation @ wrist
+    return points
+
+
+class TestJointPower:
+    """サイクルごとの仕事は、関節の相対角速度から求める。"""
+
+    def test_rigid_arm_rotation_does_no_work_at_the_elbow(self):
+        """肘角を保ったまま腕全体が回るだけなら、wrist_R（前腕リンク）の仕事は 0。
+
+        wrist_R の局所 y 軸は「上腕 × 前腕」の法線（肘の屈曲軸）なので、仕事率には
+        前腕と上腕の相対角速度を使う。かつて前腕の絶対角速度との内積 τ·ω を使っており、
+        腕を振るだけで仕事が出ていた（計画メモ A-4 (2)、H-B）。
+        """
+        measurement = _measurement()
+        for index in range(150):
+            t = index / 30.0
+            truth = _body_points_rotating_right_arm(t)
+            measurement.process(_pair_from_pixels(
+                int(t * 1e9), _project(measurement.P0, truth), _project(measurement.P1, truth)))
+
+        assert measurement.cycle_count > 0, "前提のサイクル検出が起きていない"
+        work = np.abs(np.array(measurement.cycle_work["wrist_R"]))
+        assert np.all(work < 0.05), (
+            f"肘角が一定なのに wrist_R のサイクル仕事が {work} J 出た。"
+            " 前腕の絶対角速度を使っていないか確認すること"
+        )
+
+
 class TestRobustness:
     def test_missing_role_is_skipped(self):
         """片方のカメラしか無いペアは処理しない。"""
