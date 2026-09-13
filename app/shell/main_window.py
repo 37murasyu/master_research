@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from app.core import resources
 from app.core.platform_compat import user_config_dir
 from app.core.qt import QtCore, QtWidgets
 from app.core.settings import APP_NAME, Settings
@@ -103,9 +102,6 @@ def run_gui(argv: list[str] | None = None) -> int:
     from app.core import qt
 
     qt.assert_lgpl_backend()
-
-    # 失敗しても投げない契約（app/core/resources.py）。
-    resources.configure_matplotlib_japanese()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(list(argv or []))
     app.setApplicationName(APP_NAME)

@@ -86,8 +86,7 @@ class SourceSpec:
 
         preferred = getattr(cv, "CAP_FFMPEG", None)
         backends = [preferred] if preferred is not None else []
-        if cv.CAP_ANY not in backends:
-            backends.append(cv.CAP_ANY)
+        backends.append(cv.CAP_ANY)
         return backends
 
 
@@ -128,7 +127,7 @@ class VideoSource:
 
     @property
     def is_opened(self) -> bool:
-        return self._capture is not None and self._capture.isOpened()
+        return bool(self._capture.isOpened())
 
     @property
     def fps(self) -> float:
@@ -170,8 +169,7 @@ class VideoSource:
         return bool(self._capture.set(cv.CAP_PROP_POS_FRAMES, 0))
 
     def release(self) -> None:
-        if self._capture is not None:
-            self._capture.release()
+        self._capture.release()
 
 
 def open_capture(spec: int | str) -> "tuple[SourceSpec, cv.VideoCapture] | None":

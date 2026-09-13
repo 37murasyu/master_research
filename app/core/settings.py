@@ -21,6 +21,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from app.core.platform_compat import user_config_dir
+
 __all__ = ["Setting", "Settings", "SCHEMA", "APP_NAME"]
 
 APP_NAME = "WheelchairTorque"
@@ -283,6 +285,4 @@ class Settings:
 
     @classmethod
     def default_path(cls) -> Path:
-        from app.core.platform_compat import user_config_dir
-
         return user_config_dir(APP_NAME) / "settings.json"

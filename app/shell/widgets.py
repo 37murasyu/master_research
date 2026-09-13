@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Callable
-
 from app.core.qt import QtCore, QtGui, QtWidgets
 from app.core.settings import SCHEMA, Setting, Settings
+from app.runners.worker import WorkerRunner
 
 __all__ = ["LogView", "SettingsForm", "StatusBadge", "RunnerPage"]
 
@@ -76,7 +75,6 @@ class SettingsForm(QtWidgets.QWidget):
     def __init__(self, settings: Settings, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
         self._settings = settings
-        self._editors: dict[str, Callable[[], object]] = {}
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -109,7 +107,6 @@ class SettingsForm(QtWidgets.QWidget):
             editor.toggled.connect(
                 lambda checked, name=setting.name: self._on_change(name, checked)
             )
-            self._editors[setting.name] = editor.isChecked
         elif setting.type == "int":
             editor = QtWidgets.QSpinBox()
             editor.setRange(-1_000_000, 1_000_000)
@@ -117,7 +114,6 @@ class SettingsForm(QtWidgets.QWidget):
             editor.valueChanged.connect(
                 lambda v, name=setting.name: self._on_change(name, v)
             )
-            self._editors[setting.name] = editor.value
         elif setting.type == "float":
             editor = QtWidgets.QDoubleSpinBox()
             editor.setRange(-1_000_000.0, 1_000_000.0)
@@ -126,13 +122,11 @@ class SettingsForm(QtWidgets.QWidget):
             editor.valueChanged.connect(
                 lambda v, name=setting.name: self._on_change(name, v)
             )
-            self._editors[setting.name] = editor.value
         else:
             editor = QtWidgets.QLineEdit(str(value or ""))
             editor.textChanged.connect(
                 lambda text, name=setting.name: self._on_change(name, text)
             )
-            self._editors[setting.name] = editor.text
 
         # 説明はツールチップだけでなく、その場に出す。「なぜこの既定値か」は
         # 隠すべきではない（特に既定を意図的に変えた 4 つのフラグ）。
@@ -177,9 +171,6 @@ class RunnerPage(QtWidgets.QWidget):
     ):
         super().__init__(parent)
         self._settings = settings
-
-        # 循環 import を避けるためここで読む（worker -> entry -> settings の順）
-        from app.runners.worker import WorkerRunner
 
         self._runner = WorkerRunner(role, self)
         self._runner.output.connect(self.append_log)

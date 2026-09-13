@@ -169,9 +169,10 @@ class LandmarkServer:
         """実際に待ち受けているポート。port=0 で起動した場合はここで確認する。"""
         if self._server is None:
             return self._requested_port
-        for sock in self._server.sockets:
-            return sock.getsockname()[1]
-        return self._requested_port
+        sockets = self._server.sockets
+        if not sockets:
+            return self._requested_port
+        return sockets[0].getsockname()[1]
 
     # -- 接続の受け口 ------------------------------------------------------
     async def _on_connection(self, connection: ServerConnection) -> None:

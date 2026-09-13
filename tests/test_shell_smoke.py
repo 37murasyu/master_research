@@ -82,12 +82,16 @@ class TestMainWindow:
 
 class TestSettingsForm:
     def test_shows_only_ui_visible_settings(self, qt_app):
+        from app.core.qt import QtWidgets
         from app.core.settings import SCHEMA
         from app.shell.widgets import SettingsForm
 
         form = SettingsForm(Settings())
         expected = sum(1 for s in SCHEMA.values() if s.ui_visible)
-        assert len(form._editors) == expected
+        rows = sum(
+            box.layout().rowCount() for box in form.findChildren(QtWidgets.QGroupBox)
+        )
+        assert rows == expected
 
     def test_editing_updates_the_settings_object(self, qt_app):
         from app.shell.widgets import SettingsForm
