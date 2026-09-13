@@ -35,6 +35,8 @@ IMPORT_SAFE_MODULES = [
     "pose_runtime",
     "app.core.platform_compat",
     "app.tuning.raw_capture",
+    "app.tuning.ekf_likelihood",
+    "app.tuning.ekf_estimate",
 ]
 
 # Windows でしか存在しないモジュール。使うなら関数内 import か try で囲むこと。
