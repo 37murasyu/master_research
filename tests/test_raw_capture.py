@@ -42,9 +42,10 @@ class TestSidecar:
 
     def test_sidecar_is_written_before_any_frame(self, tmp_path):
         csv_path = tmp_path / "kpts3d_raw_0913_120000.csv"
-        RawCaptureWriter(csv_path, IDS, provenance={"dt": 1 / 30})
-
+        writer = RawCaptureWriter(csv_path, IDS, provenance={"dt": 1 / 30})
         meta = json.loads(sidecar_path(csv_path).read_text(encoding="utf-8"))
+        writer.close()
+
         assert meta["stage"] == "pre_ekf", "較正ツールが入力を判定する stage が記録されていない"
         assert meta["landmark_ids"] == IDS, "列の並び（ランドマーク ID）が記録されていない"
         assert meta["dt"] == pytest.approx(1 / 30), "呼び出し側から渡した由来が記録されていない"
@@ -72,9 +73,10 @@ class TestStreaming:
         writer = RawCaptureWriter(csv_path, IDS, provenance={})
         writer.append(0, 0.0, _points(1.0))
         writer.append(8, 0.2667, _points(2.0))
-        # close() を呼ばない。SIGTERM で落ちたのと同じ状態
+        # close() を呼ぶ前に読む。SIGTERM で落ちたのと同じ状態
 
         capture = read_raw_capture(csv_path)
+        writer.close()
         assert capture.points.shape == (2, len(IDS), 3), "flush されておらず、閉じる前の行が読めない"
         np.testing.assert_array_equal(capture.frame, [0, 8])
         np.testing.assert_allclose(capture.t, [0.0, 0.2667])
@@ -96,6 +98,7 @@ class TestStreaming:
         writer = RawCaptureWriter(tmp_path / "raw.csv", IDS, provenance={})
         with pytest.raises(ValueError):
             writer.append(0, 0.0, np.zeros((len(IDS) + 1, 3)))
+        writer.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM の既定動作は POSIX の前提")
@@ -150,7 +153,9 @@ class TestReader:
 
     def test_rejects_a_sidecar_from_another_stage(self, tmp_path):
         csv_path = tmp_path / "raw.csv"
-        RawCaptureWriter(csv_path, IDS, provenance={}).append(0, 0.0, _points(1.0))
+        writer = RawCaptureWriter(csv_path, IDS, provenance={})
+        writer.append(0, 0.0, _points(1.0))
+        writer.close()
         meta_path = sidecar_path(csv_path)
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta["stage"] = "post_ekf"
