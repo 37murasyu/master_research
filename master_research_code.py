@@ -33,6 +33,7 @@ import pandas as pd
 import csv
 import json
 from extended_kalman_filter import EKFConfig, ExtendedKalman1D
+from app.tuning.raw_capture import RawCaptureWriter, git_commit
 from pose_runtime import PoseEstimator
 from logging_setup import setup_logging, get_logger
 from video_io import (
@@ -2981,6 +2982,41 @@ print(f"[DT] dt={_DYN_DT:.5f}s ({_dyn_dt_source})"
 # frame_dt は間引かれたフレームの時間を含まないので使えない。
 _dyn_dt_prev_start = None
 _dyn_dt_warned = False
+
+# ===================== EKF 較正用の生 3D 座標 =====================
+# 三角測量の直後・EKF の手前の値を、処理したフレームごとに追記する
+# （docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md の「実装 0」）。
+# 終了時にまとめて書かないのは、GUI の停止が SIGTERM で終了時処理が走らないため。
+# 3D 点の並びはランドマーク ID の昇順（config.py の pose_keypoints の説明を参照）。
+# frame 列はカメラのフレーム番号（skip_counter）なので、差から間引き幅が読める。
+_raw_capture = RawCaptureWriter(
+    os.path.join(save_dir, f"kpts3d_raw_{timestamp}.csv"),
+    sorted(pose_keypoints),
+    provenance={
+        "unit": "m",
+        "frame": "runtime",
+        "dt": _DYN_DT,
+        "dt_source": _dyn_dt_source,
+        "src_fps": _src_fps,
+        "RT_POSE_FIXED_HZ_ON": bool(RT_POSE_FIXED_HZ_ON),
+        "RT_POSE_FIXED_HZ": RT_POSE_FIXED_HZ,
+        "RT_DELAY_SKIP_ON": bool(RT_DELAY_SKIP_ON),
+        "skip_mod": skip_mod,
+        "EKF_ENABLE": bool(EKF_ENABLE),
+        "EKF_Q_ACC": EKF_Q_ACC,
+        "EKF_R": EKF_R,
+        "EKF_GATE_STD": EKF_GATE_STD,
+        "EKF_BPF_LOW": EKF_BPF_LOW,
+        "EKF_BPF_HIGH": EKF_BPF_HIGH,
+        "EKF_BPF_ORDER": EKF_BPF_ORDER,
+        "EKF_VECTORIZED": bool(EKF_VECTORIZED),
+        "file_mode": bool(file_mode),
+        "CALIB_BASE_DIR": CALIB_BASE_DIR or None,
+        "git_commit": git_commit(folder_path),
+    },
+)
+print(f"[RAW] EKF 手前の 3D 座標を {_raw_capture.path} に追記します")
+_raw_t0 = None
 if E_DEBUG:
     print(f"[RTSKIP] src_fps={_src_fps:.3f} (cam0={_src_fps0:.3f}, cam1={_src_fps1:.3f})")
     if RT_POSE_FIXED_HZ_ON:
@@ -3286,6 +3322,9 @@ while True:
 
     t_seg = time.perf_counter()
     transformed_p3ds = _triangulate_transform_batch(P0_F64, P1_F64, frame0_keypoints, frame1_keypoints)
+    if _raw_t0 is None:
+        _raw_t0 = start_time
+    _raw_capture.append(skip_counter, start_time - _raw_t0, transformed_p3ds)
     nan_3d = int(np.sum(~np.all(np.isfinite(transformed_p3ds), axis=1)))
     if DEBUG_LOGS and WHILE_COUNT % 30 == 0 and nan_3d:
         print(f"[DBG] frame {WHILE_COUNT}: non-finite 3D points={nan_3d}")
@@ -4370,6 +4409,10 @@ else:
 # ファイルに書き込む
 # with open(folder_path + "\\max_value.txt", "w", encoding="utf-8") as file:
 #    file.write(str(max(aim_torque)))
+
+# -------------------------------
+# ⓪ EKF 較正用の生 3D 座標は追記済み。閉じるだけ
+_raw_capture.close()
 
 # -------------------------------
 # ① kpts_3d：3D座標データを保存

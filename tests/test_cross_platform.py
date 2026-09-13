@@ -34,6 +34,7 @@ IMPORT_SAFE_MODULES = [
     "extended_kalman_filter",
     "pose_runtime",
     "app.core.platform_compat",
+    "app.tuning.raw_capture",
 ]
 
 # Windows でしか存在しないモジュール。使うなら関数内 import か try で囲むこと。
