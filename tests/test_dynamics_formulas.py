@@ -389,25 +389,29 @@ class TestInertiaLengthFromMedian:
 
         n = config.inertia_ready_frames
         # 関節はランドマーク名で置く。pose_keypoints の構成が変わっても追随する。
+        # 腕と大腿の慣性テンソルは左右別に作るので、両側とも実寸に近く置く
+        # （片側を原点に残すとリンク長 0 で回帰式の適用範囲外になる）。
         clean = np.zeros((len(pose_keypoints), 3), dtype=float)
         for name, position in (
             ("L_SHOULDER", [-0.15, 0.0, 1.40]), ("R_SHOULDER", [0.15, 0.0, 1.40]),
             ("L_ELBOW", [-0.18, 0.0, 1.16]), ("L_WRIST", [-0.20, 0.0, 0.95]),
+            ("R_ELBOW", [0.18, 0.0, 1.16]), ("R_WRIST", [0.20, 0.0, 0.95]),
             ("L_HIP", [-0.10, 0.0, 1.00]), ("R_HIP", [0.10, 0.0, 1.00]),
+            ("L_KNEE", [-0.10, 0.0, 0.60]), ("L_ANKLE", [-0.10, 0.0, 0.20]),
             ("R_KNEE", [0.10, 0.0, 0.60]), ("R_ANKLE", [0.10, 0.0, 0.20]),
         ):
             clean[slot_of(name)] = position
 
         samples = np.stack([clean.copy() for _ in range(n)])
         measurement._build_inertia(samples)
-        baseline = np.diag(measurement._inertia["forearm"]).copy()
+        baseline = np.diag(measurement._inertia["forearm_L"]).copy()
 
         # 1 フレームだけ肘を大きく飛ばす（三角測量の外れ値を模す）
         spoiled = samples.copy()
         spoiled[n // 2, slot_of("L_ELBOW")] = [-1.50, 0.0, 1.16]
         measurement._inertia = {}
         measurement._build_inertia(spoiled)
-        with_outlier = np.diag(measurement._inertia["forearm"])
+        with_outlier = np.diag(measurement._inertia["forearm_L"])
 
         assert np.allclose(baseline, with_outlier, rtol=1e-9), (
             f"外れ値 1 フレームで慣性テンソルが動いた: {baseline} → {with_outlier}。"

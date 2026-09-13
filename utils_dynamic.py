@@ -108,6 +108,39 @@ def skew_symmetric_matrix(v):
     return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
 
 
+def trunk_segment_inputs(
+    m, omega, dot_omega, dot_dot_pg,
+    add_part_data=None, condition=None, Imode=None, Info_I3=None, body_mass=None,
+):
+    """胴体（Imode=3 上胴体、Imode=4 下胴体）の質量・角速度・重心加速度を補正して返す。
+
+    ``calculate_M_and_F`` と ``master_research_code.py`` のネイティブ一括経路が共有する。
+
+    上胴体は左右のチェーンで共通の剛体なので、ω・ω̇ はどちらの肩として計算しても同じ。
+    かつて右肩（condition=1）でだけ反転しており、その補正が 2 か所に複製されていた
+    （計画メモ E-1b）。左右で変えてよいのは質量の分担だけで、
+    右肩の分担 = 左手首までの距離 / (左 + 右) というテコの分配になっている。
+    """
+    total = w if body_mass is None else body_mass
+    if Imode == 3:
+        points = np.asarray(Info_I3, dtype=np.float64)
+        shoulder_mid = (points[1][:2] + points[0][:2]) * 0.5
+        A1 = np.linalg.norm(shoulder_mid - points[5][:2])
+        A0 = np.linalg.norm(shoulder_mid - points[4][:2])
+        dot_dot_pg = (np.asarray(dot_dot_pg, dtype=np.float64) * 3
+                      + np.asarray(add_part_data[-1]["dot_dot_pg"], dtype=np.float64)) * 0.25
+        if condition == 1:    # 右肩
+            m = total * 0.276 * A0 / max(A0 + A1, EPS)
+        elif condition == 0:  # 左肩
+            m = total * 0.276 * A1 / max(A0 + A1, EPS)
+    elif Imode == 4:
+        omega = np.zeros(3)
+        dot_omega = np.zeros(3)
+        dot_dot_pg = (np.asarray(dot_dot_pg, dtype=np.float64) * 3
+                      + np.asarray(add_part_data[-1]["dot_dot_pg"], dtype=np.float64)) * 0.25
+    return m, omega, dot_omega, dot_dot_pg
+
+
 def calculate_M_and_F(
     I, m, part_data, g, add_part_data=None, condition=None, Imode=None, Info_I3=None
 ):
@@ -152,31 +185,17 @@ def calculate_M_and_F(
     if not part_data:
         return np.zeros(3), np.zeros(3), "unknown"
 
-    omega = part_data[-1]["omega"]
-    dot_omega = part_data[-1]["dot_omega"]
-    dot_dot_pg = part_data[-1]["dot_dot_pg"]
     part_name = part_data[-1]["part_name"]  # 部位名の取り出し
-
-    if Imode == 3:
-        A1 = np.linalg.norm((Info_I3[1][:2] + Info_I3[0][:2]) * 0.5 - Info_I3[5][:2])
-        A0 = np.linalg.norm((Info_I3[1][:2] + Info_I3[0][:2]) * 0.5 - Info_I3[4][:2])
-        dot_dot_pg = (
-            part_data[-1]["dot_dot_pg"] * 3 + add_part_data[-1]["dot_dot_pg"]
-        ) * 0.25
-
-        if condition == 1:
-            # 右肩1
-            m = w * 0.276 * A0 / (A0 + A1)
-            omega = omega * (-1)
-            dot_omega = dot_omega * (-1)
-        elif condition == 0:  # 左肩0
-            m = w * 0.276 * A1 / (A0 + A1)
-    elif Imode == 4:
-        omega = np.array([0, 0, 0])
-        dot_omega = np.array([0, 0, 0])
-        dot_dot_pg = (
-            part_data[-1]["dot_dot_pg"] * 3 + add_part_data[-1]["dot_dot_pg"]
-        ) / 4
+    m, omega, dot_omega, dot_dot_pg = trunk_segment_inputs(
+        m,
+        part_data[-1]["omega"],
+        part_data[-1]["dot_omega"],
+        part_data[-1]["dot_dot_pg"],
+        add_part_data=add_part_data,
+        condition=condition,
+        Imode=Imode,
+        Info_I3=Info_I3,
+    )
 
     # NaN/None対策
     I = np.zeros((3, 3)) if I is None else I
@@ -192,7 +211,7 @@ def calculate_M_and_F(
     # 個々のトルクを計算する関数
 
 
-def calculate_individual_torques(Ms, Fs, r_gs, tau_E, f_E, r_x, parts, storage):
+def calculate_individual_torques(Ms, Fs, r_gs, tau_E, f_E, r_x, parts, storage, p1s=None):
     """
     各身体部位にかかる関節トルクを運動連鎖に沿って再帰的に計算する関数。
 
@@ -214,6 +233,10 @@ def calculate_individual_torques(Ms, Fs, r_gs, tau_E, f_E, r_x, parts, storage):
         各部位の名前リスト。storage.get_data(part)[-1] がその部位データを返す順序に合わせる。
     storage : BodyPartDataStorage
         各部位の p1（関節位置）や重心位置などを保持しているインスタンス。
+    p1s : list of ndarray, shape (3,), optional
+        各部位の関節位置。None なら storage の p1（リンクの始点）を使う。
+        胴体（both_shoulder / both_hip）は左右のチェーンで部位データを共有しているので、
+        始点（左肩・左腰）ではなくチェーン側の点を渡すこと（計画メモ E-1f）。
 
     Returns
     -------
@@ -224,12 +247,14 @@ def calculate_individual_torques(Ms, Fs, r_gs, tau_E, f_E, r_x, parts, storage):
     n = len(Ms)
     for j in range(n):
         part_j = parts[j]
-        data_list = storage.get_data(part_j)
-        if not data_list:
-            torques.append((np.zeros(3), part_j))
-            continue
-        data_j = data_list[-1]
-        p1 = data_j["p1"]  # 関節位置
+        if p1s is not None:
+            p1 = np.asarray(p1s[j], dtype=np.float64)  # 関節位置
+        else:
+            data_list = storage.get_data(part_j)
+            if not data_list:
+                torques.append((np.zeros(3), part_j))
+                continue
+            p1 = data_list[-1]["p1"]  # 関節位置
 
         # 1) 回転モーメントの合計
         sum_M = np.sum(Ms[j:], axis=0)

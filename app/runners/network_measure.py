@@ -354,12 +354,17 @@ class NetworkMeasurement:
         hips = samples[:, slot_of("L_HIP")] + samples[:, slot_of("R_HIP")]
         half_body = 0.25 * float(np.nanmedian(np.linalg.norm(shoulders - hips, axis=1)))
 
+        # 腕と大腿は左右で長さが違うので、テンソルも左右別に持つ。かつて左腕と右脚の
+        # 長さを左右共通で使っており、右腕の慣性が左腕の長さで決まっていた（計画メモ E-1d）。
         self._inertia = {
-            "upper_arm": calculate_inertia_tensor(3, mass, length("L_SHOULDER", "L_ELBOW")),
-            "forearm": calculate_inertia_tensor(4, mass, length("L_ELBOW", "L_WRIST")),
+            "upper_arm_R": calculate_inertia_tensor(3, mass, length("R_SHOULDER", "R_ELBOW")),
+            "upper_arm_L": calculate_inertia_tensor(3, mass, length("L_SHOULDER", "L_ELBOW")),
+            "forearm_R": calculate_inertia_tensor(4, mass, length("R_ELBOW", "R_WRIST")),
+            "forearm_L": calculate_inertia_tensor(4, mass, length("L_ELBOW", "L_WRIST")),
             "upper_body": calculate_inertia_tensor(1, mass, half_body),
             "lower_body": calculate_inertia_tensor(0, mass, half_body),
-            "thigh": calculate_inertia_tensor(6, mass, length("R_HIP", "R_KNEE")),
+            "thigh_R": calculate_inertia_tensor(6, mass, length("R_HIP", "R_KNEE")),
+            "thigh_L": calculate_inertia_tensor(6, mass, length("L_HIP", "L_KNEE")),
         }
 
     def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:
@@ -375,10 +380,10 @@ class NetworkMeasurement:
 
         inertia = self._inertia
 
-        def chain(arm: str, forearm: str, leg: str, condition: int):
+        def chain(side: str, arm: str, forearm: str, leg: str, condition: int):
             specs = [
-                (inertia["upper_arm"], m_upper_arm, data[arm], {}),
-                (inertia["forearm"], m_forearm, data[forearm], {}),
+                (inertia[f"upper_arm_{side}"], m_upper_arm, data[arm], {}),
+                (inertia[f"forearm_{side}"], m_forearm, data[forearm], {}),
                 (
                     inertia["upper_body"],
                     mass,
@@ -396,7 +401,7 @@ class NetworkMeasurement:
                     data["both_hip"],
                     {"add_part_data": data["both_shoulder"], "Imode": 4},
                 ),
-                (inertia["thigh"], m_thigh, data[leg], {}),
+                (inertia[f"thigh_{side}"], m_thigh, data[leg], {}),
             ]
             rows = [
                 calculate_M_and_F(tensor, mass_i, data_i, GRAVITY, **kwargs)
@@ -406,8 +411,8 @@ class NetworkMeasurement:
             return moments, forces, parts
 
         try:
-            Ms_r, Fs_r, parts_r = chain("upper_arm_R", "forearm_R", "upper_Leg_R", condition=1)
-            Ms_l, Fs_l, parts_l = chain("up_arm_l", "forearm_L", "upper_Leg_L", condition=0)
+            Ms_r, Fs_r, parts_r = chain("R", "upper_arm_R", "forearm_R", "upper_Leg_R", condition=1)
+            Ms_l, Fs_l, parts_l = chain("L", "up_arm_l", "forearm_L", "upper_Leg_L", condition=0)
         except (IndexError, KeyError, ValueError):
             return None
 
@@ -426,13 +431,23 @@ class NetworkMeasurement:
         tau_E = np.zeros(3)
         f_E = np.zeros(3)
 
+        def joint_points(parts: list[str], side: str) -> list[np.ndarray]:
+            # 胴体は左右のチェーンで部位データを共有しており、storage の p1 はリンク始点の
+            # 左肩・左腰になる。右肩のトルクが左肩まわりで計算されていたので、
+            # チェーン側の肩・腰を使う（計画メモ E-1f）。
+            own = {
+                "both_shoulder": points[slot_of(f"{side}_SHOULDER")],
+                "both_hip": points[slot_of(f"{side}_HIP")],
+            }
+            return [own[part] if part in own else data[part][-1]["p1"] for part in parts]
+
         torques_r = calculate_individual_torques(
             Ms_r, Fs_r, np.array(centroids("upper_arm_R", "forearm_R", "upper_Leg_R")),
-            tau_E, f_E, r_x, parts_r, self.storage,
+            tau_E, f_E, r_x, parts_r, self.storage, p1s=joint_points(parts_r, "R"),
         )
         torques_l = calculate_individual_torques(
             Ms_l, Fs_l, np.array(centroids("up_arm_l", "forearm_L", "upper_Leg_L")),
-            tau_E, f_E, r_x, parts_l, self.storage,
+            tau_E, f_E, r_x, parts_l, self.storage, p1s=joint_points(parts_l, "L"),
         )
 
         global_torques = {

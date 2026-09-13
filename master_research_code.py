@@ -1508,7 +1508,7 @@ THRESHOLD = None
 
 
 aim_torque = []
-I1 = I2 = I3 = I4 = I5 = I6 = I7 = None
+I1R = I1L = I2R = I2L = I3 = I4 = I5R = I5L = I6 = I7 = None
 
 storage = BodyPartDataStorage()
 # 部位ごとの計算設定を辞書に格納
@@ -2102,7 +2102,7 @@ def run_specs(specs):
     if USE_NATIVE_DYNAMICS and specs:
         try:
             # バッチ入力を収集
-            from utils_dynamic import compute_MF_batch_native
+            from utils_dynamic import compute_MF_batch_native, trunk_segment_inputs
             I_batch = []
             m_batch = []
             omega = []
@@ -2122,32 +2122,24 @@ def run_specs(specs):
                 dwv = np.array(last.get('dot_omega', np.zeros(3)), dtype=np.float64)
                 ag = np.array(last.get('dot_dot_pg', np.zeros(3)), dtype=np.float64)
 
-                # Imode 補正（utils_dynamic.calculate_M_and_F と一致）
+                # 上胴体・下胴体の補正は utils_dynamic.trunk_segment_inputs を共有する。
+                # かつてここに同じ補正が手書きで複製されており、右肩でだけ ω・ω̇ を
+                # 反転する誤り（計画メモ E-1b）も両方に入っていた。
                 Imode = (kwargs or {}).get('Imode', None)
-                if Imode == 3:
+                if Imode in (3, 4):
                     Info_I3 = (kwargs or {}).get('Info_I3', None)
                     add_part_data = (kwargs or {}).get('add_part_data', None)
-                    condition = (kwargs or {}).get('condition', None)
-                    if Info_I3 is None or add_part_data is None or not add_part_data:
+                    if not add_part_data or (Imode == 3 and Info_I3 is None):
                         native_possible = False
                         break
-                    A1 = float(np.linalg.norm((np.array(Info_I3[1][:2]) + np.array(Info_I3[0][:2])) * 0.5 - np.array(Info_I3[5][:2])))
-                    A0 = float(np.linalg.norm((np.array(Info_I3[1][:2]) + np.array(Info_I3[0][:2])) * 0.5 - np.array(Info_I3[4][:2])))
-                    ag = (ag * 3.0 + np.array(add_part_data[-1]['dot_dot_pg'], dtype=np.float64)) * 0.25
-                    if condition == 1:
-                        m_eff = w * 0.276 * A0 / max(A0 + A1, 1e-12)
-                        wv = -wv
-                        dwv = -dwv
-                    elif condition == 0:
-                        m_eff = w * 0.276 * A1 / max(A0 + A1, 1e-12)
-                elif Imode == 4:
-                    add_part_data = (kwargs or {}).get('add_part_data', None)
-                    if add_part_data is None or not add_part_data:
-                        native_possible = False
-                        break
-                    wv = np.zeros(3, dtype=np.float64)
-                    dwv = np.zeros(3, dtype=np.float64)
-                    ag = (ag * 3.0 + np.array(add_part_data[-1]['dot_dot_pg'], dtype=np.float64)) * 0.25
+                    m_eff, wv, dwv, ag = trunk_segment_inputs(
+                        m_eff, wv, dwv, ag,
+                        add_part_data=add_part_data,
+                        condition=(kwargs or {}).get('condition', None),
+                        Imode=Imode,
+                        Info_I3=Info_I3,
+                        body_mass=w,
+                    )
 
                 I_batch.append(np.array(I_use, dtype=np.float64))
                 m_batch.append(m_eff)
@@ -3313,7 +3305,7 @@ while True:
     # L が 0.19→0.30 m で I_xx が 6 倍変わる（再検算 R-6）。
     #
     # 索引は pose_keypoints をランドマーク ID の昇順に並べたときの位置。
-    if I1 is None:
+    if I1R is None:
         if len(kpts_3d) < INERTIA_LENGTH_FRAMES:
             continue
         _lead = np.stack(kpts_3d[:INERTIA_LENGTH_FRAMES])
@@ -3324,25 +3316,34 @@ while True:
             ia, ib = slot_of(a), slot_of(b)
             return float(np.nanmedian(np.linalg.norm(_lead[:, ia] - _lead[:, ib], axis=1)))
 
-        _len_upper_arm = _median_span("L_SHOULDER", "L_ELBOW")
-        _len_forearm = _median_span("L_ELBOW", "L_WRIST")
-        _len_thigh = _median_span("R_HIP", "R_KNEE")
+        # 腕と大腿は左右で長さが違うので、テンソルも左右別に持つ。かつて左腕と右脚の
+        # 長さを左右共通で使っており、右腕の慣性が左腕の長さで決まっていた（計画メモ E-1d）。
+        _len_upper_arm_R = _median_span("R_SHOULDER", "R_ELBOW")
+        _len_upper_arm_L = _median_span("L_SHOULDER", "L_ELBOW")
+        _len_forearm_R = _median_span("R_ELBOW", "R_WRIST")
+        _len_forearm_L = _median_span("L_ELBOW", "L_WRIST")
+        _len_thigh_R = _median_span("R_HIP", "R_KNEE")
+        _len_thigh_L = _median_span("L_HIP", "L_KNEE")
         _len_shank = _median_span("R_KNEE", "R_ANKLE")
         # 胴体の半長 = |肩中点 − 腰中点| / 2
         _shoulders = _lead[:, slot_of("L_SHOULDER")] + _lead[:, slot_of("R_SHOULDER")]
         _hips = _lead[:, slot_of("L_HIP")] + _lead[:, slot_of("R_HIP")]
         len_half_body = 0.25 * float(np.nanmedian(np.linalg.norm(_shoulders - _hips, axis=1)))
 
-        I1 = calculate_inertia_tensor(3, w, _len_upper_arm)  # 上腕
-        I2 = calculate_inertia_tensor(4, w, _len_forearm)    # 前腕
-        I3 = calculate_inertia_tensor(1, w, len_half_body)   # 上胴体
-        I4 = calculate_inertia_tensor(0, w, len_half_body)   # 下胴体
-        I5 = calculate_inertia_tensor(6, w, _len_thigh)      # 太もも
-        I6 = calculate_inertia_tensor(7, w, _len_shank)      # 下腿
-        I7 = calculate_inertia_tensor(2, w, 0.25)            # 頭
+        I1R = calculate_inertia_tensor(3, w, _len_upper_arm_R)  # 上腕
+        I1L = calculate_inertia_tensor(3, w, _len_upper_arm_L)
+        I2R = calculate_inertia_tensor(4, w, _len_forearm_R)    # 前腕
+        I2L = calculate_inertia_tensor(4, w, _len_forearm_L)
+        I3 = calculate_inertia_tensor(1, w, len_half_body)      # 上胴体
+        I4 = calculate_inertia_tensor(0, w, len_half_body)      # 下胴体
+        I5R = calculate_inertia_tensor(6, w, _len_thigh_R)      # 太もも
+        I5L = calculate_inertia_tensor(6, w, _len_thigh_L)
+        I6 = calculate_inertia_tensor(7, w, _len_shank)         # 下腿
+        I7 = calculate_inertia_tensor(2, w, 0.25)               # 頭
         print(f"[INERTIA] リンク長を {INERTIA_LENGTH_FRAMES} フレームの中央値で確定: "
-              f"上腕={_len_upper_arm:.3f} 前腕={_len_forearm:.3f} "
-              f"胴体半長={len_half_body:.3f} 大腿={_len_thigh:.3f} "
+              f"上腕 R/L={_len_upper_arm_R:.3f}/{_len_upper_arm_L:.3f} "
+              f"前腕 R/L={_len_forearm_R:.3f}/{_len_forearm_L:.3f} "
+              f"胴体半長={len_half_body:.3f} 大腿 R/L={_len_thigh_R:.3f}/{_len_thigh_L:.3f} "
               f"下腿={_len_shank:.3f} [m]")
 
     # 計算とデータの格納をループで行う
@@ -3390,18 +3391,18 @@ while True:
         continue
     # トルクと力の計算（右/左）をループで簡潔に構築
     right_specs = [
-        (I1, m1, part_data["upper_arm_R"], {}),
-        (I2, m2, part_data["forearm_R"], {}),
+        (I1R, m1, part_data["upper_arm_R"], {}),
+        (I2R, m2, part_data["forearm_R"], {}),
         (I3, w, part_data["both_shoulder"], {"add_part_data": part_data["both_hip"], "condition": 1, "Imode": 3, "Info_I3": transformed_p3ds}),
         (I4, w, part_data["both_hip"], {"add_part_data": part_data["both_shoulder"], "Imode": 4}),
-        (I5, m4, part_data["upper_Leg_R"], {}),
+        (I5R, m4, part_data["upper_Leg_R"], {}),
     ]
     left_specs = [
-        (I1, m1, part_data["up_arm_l"], {}),
-        (I2, m2, part_data["forearm_L"], {}),
+        (I1L, m1, part_data["up_arm_l"], {}),
+        (I2L, m2, part_data["forearm_L"], {}),
         (I3, w, part_data["both_shoulder"], {"add_part_data": part_data["both_hip"], "condition": 0, "Imode": 3, "Info_I3": transformed_p3ds}),
         (I4, w, part_data["both_hip"], {"add_part_data": part_data["both_shoulder"], "Imode": 4}),
-        (I5, m4, part_data["upper_Leg_L"], {}),
+        (I5L, m4, part_data["upper_Leg_L"], {}),
     ]
     _dyn_should_run = ((not RT_DYN_ON_RISE_ONLY) or _dyn_active) and (not DEMO_MONO_GAUGE_ON)
     t_seg = time.perf_counter()
@@ -3477,22 +3478,30 @@ while True:
 
     t_seg = time.perf_counter()
     if _dyn_should_run:
+        # 各部位の関節位置。胴体（both_shoulder / both_hip）は左右のチェーンで部位データを
+        # 共有しており、storage の p1 はリンク始点の左肩・左腰になる。右チェーンの肩トルクが
+        # 左肩まわりで計算されていたので、チェーン側の肩・腰を使う（計画メモ E-1f）。
+        def _collect_p1s(parts: list[str], side: str) -> np.ndarray:
+            own = {
+                "both_shoulder": transformed_p3ds[slot_of(f"{side}_SHOULDER")],
+                "both_hip": transformed_p3ds[slot_of(f"{side}_HIP")],
+            }
+            p1s = []
+            for part in parts:
+                data_list = storage.get_data(part)
+                if part in own:
+                    p1s.append(own[part])
+                elif data_list:
+                    p1s.append(data_list[-1]['p1'])
+                else:
+                    p1s.append(np.zeros(3))
+            return np.array(p1s, dtype=np.float64)
+
+        p1sR = _collect_p1s(partsR, "R")
+        p1sL = _collect_p1s(partsL, "L")
         USE_NATIVE_DYNAMICS = os.getenv('USE_NATIVE_DYNAMICS', '1') in ('1','true','True')
         if USE_NATIVE_DYNAMICS:
             try:
-                # p1sは各部位の関節位置を並べたものが必要。storageから取得。
-                def _collect_p1s(parts: list[str]) -> np.ndarray:
-                    p1s = []
-                    for part in parts:
-                        data_list = storage.get_data(part)
-                        if data_list:
-                            p1s.append(data_list[-1]['p1'])
-                        else:
-                            p1s.append(np.zeros(3))
-                    return np.array(p1s, dtype=np.float64)
-
-                p1sR = _collect_p1s(partsR)
-                p1sL = _collect_p1s(partsL)
                 r_g_R_arr = np.array(r_g_R, dtype=np.float64)
                 r_g_L_arr = np.array(r_g_L, dtype=np.float64)
 
@@ -3519,11 +3528,11 @@ while True:
                 if os.getenv('POSE_DEBUG','0') in ('1','true','True'):
                     print(f"[Dyn] native tau fallback due to: {_nd_e}")
                 # フォールバック
-                torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage)
-                torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage)
+                torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage, p1s=p1sR)
+                torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage, p1s=p1sL)
         else:
-            torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage)
-            torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage)
+            torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage, p1s=p1sR)
+            torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage, p1s=p1sL)
     else:
         _zero = np.zeros(3, dtype=np.float64)
         torquesR = [(_zero.copy(), "wrist_R"), (_zero.copy(), "elbow_R"), (_zero.copy(), "shoulder_R")]
