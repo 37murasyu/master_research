@@ -40,6 +40,12 @@ class ExtendedKalman1D:
     """1D EKF with constant-acceleration process and configurable measurement."""
 
     def __init__(self, cfg: EKFConfig):
+        if (cfg.h_fn is None) != (cfg.h_jac_fn is None):
+            missing = "h_jac_fn" if cfg.h_jac_fn is None else "h_fn"
+            raise ValueError(
+                f"h_fn and h_jac_fn must be given together (missing {missing}); "
+                "otherwise the measurement model silently falls back to identity"
+            )
         self.cfg = cfg
         self.x = np.zeros(3, dtype=float)  # [x, v, a]
         self.P = np.eye(3, dtype=float)
@@ -91,7 +97,8 @@ class ExtendedKalman1D:
 
         z_pred, H = self._measure(self.x)
         y = float(z) - z_pred
-        S = float(H @ self.P @ H.T + self.cfg.r)
+        # H P H^T は (1,1) 配列。NumPy 2 は float() に 0 次元以外を渡すと TypeError にする
+        S = float((H @ self.P @ H.T)[0, 0] + self.cfg.r)
         if S <= 0:
             return float(self.x[0]), float(self.x[1]), float(self.x[2])
         if self.cfg.gate_std > 0 and abs(y) > self.cfg.gate_std * np.sqrt(S):
