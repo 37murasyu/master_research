@@ -14,6 +14,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
@@ -47,6 +48,8 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var poseAnalyzer: PoseAnalyzer? = null
+    // 検出器はネイティブモデルを抱えるので、押すたびに作らず 1 個を持ち回す。
+    private var barcodeScanner: BarcodeScanner? = null
     private var mode = Mode.IDLE
 
     private enum class Mode { IDLE, SCANNING, STREAMING }
@@ -85,6 +88,7 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         mainHandler.removeCallbacksAndMessages(null)
         client.disconnect()
         poseAnalyzer?.close()
+        barcodeScanner?.close()
         cameraSetup.stop()
         analysisExecutor.shutdown()
     }
@@ -103,7 +107,7 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         binding.statusText.text = "QR を読み取ってください"
         binding.detailText.text = "PC の画面に表示されている QR にカメラを向けてください"
 
-        val scanner = BarcodeScanning.getClient()
+        val scanner = barcodeScanner ?: BarcodeScanning.getClient().also { barcodeScanner = it }
         bindCamera(
             ImageAnalysis.Analyzer { image ->
                 processBarcode(image, scanner)
@@ -112,7 +116,7 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
     }
 
     @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
-    private fun processBarcode(proxy: ImageProxy, scanner: com.google.mlkit.vision.barcode.BarcodeScanner) {
+    private fun processBarcode(proxy: ImageProxy, scanner: BarcodeScanner) {
         val mediaImage = proxy.image
         if (mediaImage == null || mode != Mode.SCANNING) {
             proxy.close()
