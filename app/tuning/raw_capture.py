@@ -89,14 +89,20 @@ class RawCaptureWriter:
         self._meta.update(fields)
         self._write_sidecar()
 
-    def append(self, frame: int, t: float, points: np.ndarray) -> None:
+    def append(self, frame: int, t: float, points: np.ndarray, *, flush: bool = True) -> None:
+        """1 行を追記する。``flush=False`` なら書き出しは呼び出し側に任せる（``flush()`` を呼ぶ）。"""
         arr = np.asarray(points, dtype=float)
         expected = (len(self.landmark_ids), 3)
         if arr.shape != expected:
             raise ValueError(f"points の形は {expected} のはずが {arr.shape}")
         # repr は float を往復で失わない最短表記にする（NaN は "nan"）
         self._writer.writerow([int(frame), repr(float(t)), *map(repr, arr.reshape(-1).tolist())])
-        self._fh.flush()
+        if flush:
+            self._fh.flush()
+
+    def flush(self) -> None:
+        if not self._fh.closed:
+            self._fh.flush()
 
     def close(self) -> None:
         if not self._fh.closed:

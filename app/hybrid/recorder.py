@@ -7,18 +7,22 @@ from pathlib import Path
 import shutil
 import threading
 import time
+from typing import TYPE_CHECKING
+from config import slot_of
 from app.gauge.protocol import PART_NAMES
 from app.hybrid.calibration_io import FILES, write_json
 from app.hybrid.ekf import GRID_NS as _GRID_NS   # 同期バッファの格子（30 Hz）[ns]。生 3D の frame は格子の番号
 from app.hybrid.paths import measurement_root
 from app.tuning.raw_capture import RawCaptureWriter
 
+if TYPE_CHECKING:
+    from app.runners.network_measure import FrameResult
+
 
 def _cycle_columns(result, key):
     """cycle_work の W+・W−・W_1RM・スコア。無いものは空欄。"""
-    parts = getattr(result, "cycle_parts", None) or {}
-    w1rm = (getattr(result, "cycle_w1rm", None) or {}).get(key)
-    work = parts.get(key)
+    w1rm = result.cycle_w1rm.get(key)
+    work = result.cycle_parts.get(key)
     if work is None:
         return ["", "", "", ""]
     score = work.pos / w1rm if w1rm else ""
@@ -120,6 +124,7 @@ class Recorder:
         self.raw3d = None
         self._raw_ids = sorted(pose_keypoints)
         self._raw_next = 0
+        self._raw_blank = np.full((len(self._raw_ids), 3), np.nan)  # 抜けた格子を埋める NaN の行（append は書き換えない）
         if raw_provenance is not None:
             self.raw3d = RawCaptureWriter(self.directory / f"kpts3d_raw_{stamp}.csv", self._raw_ids,
                                           provenance=raw_provenance)
@@ -166,8 +171,6 @@ class Recorder:
 
     def _capture_wrist(self, result):
         """USB（``master_research_code.py`` の OFFLINE_WRIST_CAPTURE）と同じく、前腕が有限のフレームだけ積む。"""
-        from config import slot_of
-
         points = result.points_3d
         for side, (vectors, taus) in self._wrist.items():
             forearm = np.asarray(points[slot_of(f"{side}_WRIST")] - points[slot_of(f"{side}_ELBOW")], dtype=float)
@@ -194,37 +197,37 @@ class Recorder:
             self.raw3d.note(**fields)
 
     def _append_raw(self, result):
-        raw = getattr(result, "points_raw", None)
+        raw = result.points_raw
         if self.raw3d is None or raw is None:
             return
-        grid = int(getattr(result, "grid_index", self._raw_next))
-        blank = np.full((len(self._raw_ids), 3), np.nan)
+        grid = int(result.grid_index)
+        # flush は Recorder.flush（1 秒に 1 回）に任せる
         while self._raw_next < grid:
-            self.raw3d.append(self._raw_next, self._raw_next * _GRID_NS / 1e9, blank)
+            self.raw3d.append(self._raw_next, self._raw_next * _GRID_NS / 1e9, self._raw_blank, flush=False)
             self._raw_next += 1
         if grid < self._raw_next:
             return  # 格子が戻った（起こらないはず）。書かない
-        self.raw3d.append(grid, (result.t_ns - self._first_ns) / 1e9, raw)
+        self.raw3d.append(grid, (result.t_ns - self._first_ns) / 1e9, raw, flush=False)
         self._raw_next = grid + 1
 
-    def record(self, result):
+    def record(self, result: "FrameResult"):
         self._check()
         if self._first_ns is None:
             self._first_ns = result.t_ns
         self._append_raw(result)
         self.points.writerow([self.frames, *result.points_3d.ravel()])
-        arm_ok = getattr(result, "arm_ok", None) or {}
+        arm_ok = result.arm_ok
         self.times.writerow(
             [
                 self.frames,
                 result.t_ns,
                 (result.t_ns - self._first_ns) / 1e9,
                 int(result.cycle_detected),
-                getattr(result, "grid_index", ""),
-                getattr(result, "dt_s", ""),
-                int(bool(getattr(result, "dyn_active", False))),
-                getattr(result, "height_m", float("nan")),
-                getattr(result, "rep", ""),
+                result.grid_index,
+                result.dt_s,
+                int(bool(result.dyn_active)),
+                result.height_m,
+                result.rep,
                 int(arm_ok.get("L", True)),
                 int(arm_ok.get("R", True)),
             ]
@@ -237,9 +240,9 @@ class Recorder:
             [self.frames, result.t_ns, key, value, *_cycle_columns(result, key)]
             for key, value in result.cycle_work_j.items()
         )
-        gauge = getattr(result, "gauge_now", None) or {}
-        self.gauge.writerow([self.frames, result.t_ns, getattr(result, "rep", ""),
-                             int(bool(getattr(result, "dyn_active", False))),
+        gauge = result.gauge_now
+        self.gauge.writerow([self.frames, result.t_ns, result.rep,
+                             int(bool(result.dyn_active)),
                              *(gauge.get(part, "") for part in self._gauge_parts)])
         if self._wrist is not None and result.local_torques:
             self._capture_wrist(result)
@@ -250,7 +253,7 @@ class Recorder:
                                 for value in torques.get(part, (float("nan"),) * 3))])
         self.energy.writerows(
             [self.frames, result.t_ns, part, e["e_pos"], e["e_neg"], e["fc"], 1.0 / 30.0, e["n_u"]]
-            for part, e in (getattr(result, "cycle_energy", None) or {}).items()
+            for part, e in result.cycle_energy.items()
         )
         self.frames += 1
         self.flush()
@@ -260,6 +263,8 @@ class Recorder:
         if force or self.clock() - self._flushed >= 1:
             for stream in self._streams:
                 stream.flush()
+            if self.raw3d is not None:
+                self.raw3d.flush()
             self._flushed = self.clock()
 
     def close(self, **metadata):

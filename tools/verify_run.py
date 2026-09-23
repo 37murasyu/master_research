@@ -154,6 +154,15 @@ def _noise_params(provenance: Mapping[str, Any], dt: float, base_dir: Path | Non
     return "env", lambda lid, axis: scalar
 
 
+def _noise_lookup(provenance: Mapping[str, Any], dt: float, base_dir: Path | None) -> tuple[str, Any, str]:
+    """``_noise_params`` に、較正プロファイルが見つからないときの注記を添える。"""
+    origin, lookup = _noise_params(provenance, dt, base_dir)
+    note = ""
+    if lookup is None:
+        note = f"較正プロファイル {(provenance.get('ekf_noise') or {}).get('path')} が見つからないので棄却率は出さない"
+    return origin, lookup, note
+
+
 def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[str, Any]:
     """系列ごとの RMS（EKF の前と後の差）[mm] と、実行時の雑音パラメータで数えた棄却率（S9b の材料）。
 
@@ -164,11 +173,7 @@ def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[s
     kpts = pd.read_csv(kpts_path)
     n = min(capture.points.shape[0], len(kpts))
     dt = float(capture.provenance["dt"])
-    origin, lookup = _noise_params(capture.provenance, dt, base_dir)
-    note = ""
-    if lookup is None:
-        path = (capture.provenance.get("ekf_noise") or {}).get("path")
-        note = f"較正プロファイル {path} が見つからないので棄却率は出さない"
+    origin, lookup, note = _noise_lookup(capture.provenance, dt, base_dir)
     return _ekf_series(capture, capture.points[:n], kpts.iloc[:n].reset_index(drop=True), origin, lookup, note)
 
 
@@ -303,19 +308,19 @@ def _camera_centres(folder: Path) -> list[np.ndarray]:
 
 
 def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mapping[str, Any],
-                    stamp: str | None = None) -> dict[str, Any] | None:
+                    raw_capture=None) -> dict[str, Any] | None:
     """骨の長さ、肘での 2 本の視線のなす角、肘・手首が各カメラの画面内にある割合。
 
     三角測量の質を見るので、EKF の手前の 3D（``kpts3d_raw_<stamp>.csv``）があればそれを使う。新しい版の記録の
     ``kpts3d`` は EKF の後の点で、均されて骨の長さのばらつきが小さく出る（置き方の失敗を見逃す）。
+    ``raw_capture`` はその生 3D を読んだもの（無ければ None）。
     """
     if files["kpts3d"] is None:
         return None
     ids = [int(i) for i in meta["pose_keypoints"]]
     slot = {lid: i for i, lid in enumerate(ids)}
-    raw_path = _recorded_raw_path(folder, stamp)
-    if raw_path is not None:
-        points = read_raw_capture(raw_path).points
+    if raw_capture is not None:
+        points = raw_capture.points
     else:
         table = pd.read_csv(files["kpts3d"])
         points = table.drop(columns="frame").to_numpy(float).reshape(len(table), len(ids), 3)
@@ -396,16 +401,13 @@ def _hybrid_ekf_stats(capture, kpts_path: Path, frames: pd.DataFrame, base_dir: 
             index.setdefault(int(key), row)
     keys = np.rint(frames["t_s"].to_numpy(float)[:n] / dt)
     pairs = [(index[int(k)], j) for j, k in enumerate(keys) if np.isfinite(k) and int(k) in index]
-    note = ""
     try:
-        origin, lookup = _noise_params(provenance, dt, base_dir)
+        origin, lookup, note = _noise_lookup(provenance, dt, base_dir)
     except (KeyError, TypeError, ValueError):
         origin, lookup = (provenance.get("ekf_noise") or {}).get("origin") or "unknown", None
         note = "雑音のパラメータが記録に無いので棄却率は出さない"
     if not enabled:
         lookup, note = None, "EKF は無効（前後の差は 0 のはず）。棄却率は出さない"
-    elif lookup is None and not note:
-        note = f"較正プロファイル {(provenance.get('ekf_noise') or {}).get('path')} が見つからないので棄却率は出さない"
     raw_rows = capture.points[[raw for raw, _ in pairs]] if pairs else np.empty((0, *capture.points.shape[1:]))
     kpts_rows = kpts.iloc[[row for _, row in pairs]].reset_index(drop=True)
     result = _ekf_series(capture, raw_rows, kpts_rows, origin, lookup, note)
@@ -436,9 +438,12 @@ def _hybrid_gauge(work: pd.DataFrame, meta: Mapping[str, Any]) -> dict[str, Any]
     return stats
 
 
-def _hybrid_extended(folder: Path, stamp: str | None, files: Mapping[str, Path | None], frames, meta, report, add) -> None:
-    """新しい版の記録（``output_schema_version`` がある）の検査と値。古い記録では何もしない。"""
-    raw_path = _recorded_raw_path(folder, stamp)
+def _hybrid_extended(folder: Path, stamp: str | None, files: Mapping[str, Path | None], frames, meta, report, add,
+                     raw_path: Path | None, raw_capture) -> None:
+    """新しい版の記録（``output_schema_version`` がある）の検査と値。古い記録では何もしない。
+
+    ``raw_path`` は生 3D（``kpts3d_raw_<stamp>.csv``）の場所、``raw_capture`` はそれを読んだもの（kpts3d が無ければ None）。
+    """
     has_raw = raw_path is not None
     report["files"][HYBRID_RAW_PREFIX] = raw_path.name if has_raw else None
     for name in HYBRID_EXTRA_FILES:
@@ -452,7 +457,7 @@ def _hybrid_extended(folder: Path, stamp: str | None, files: Mapping[str, Path |
         report["ekf"]["note"] = (f"{HYBRID_RAW_PREFIX}_{stamp}.csv（とサイドカー）が無いので、EKF の前後の差と棄却率は出さない。"
                                  "記録が途中で止まったか、書き出しが漏れている")
     if has_raw and files["kpts3d"] is not None and frames is not None:
-        report["ekf"] = _hybrid_ekf_stats(read_raw_capture(raw_path), files["kpts3d"], frames, base_dir=folder)
+        report["ekf"] = _hybrid_ekf_stats(raw_capture, files["kpts3d"], frames, base_dir=folder)
         matched, rows = report["ekf"]["matched_rows"], report["ekf"]["kpts_rows"]
         add(f"行: kpts3d の各行に生 CSV の同じ格子がある（{MIN_GRID_MATCH:.0%} 以上）",
             rows > 0 and matched / rows >= MIN_GRID_MATCH, f"{matched} / {rows} 行")
@@ -534,8 +539,11 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
             "role_fps": role_fps, "role_frames": role_frames,
             "file_mode": False,
         }
-    _hybrid_extended(folder, stamp, files, frames, meta, report, add)
-    quality = _hybrid_quality(folder, files, meta, stamp)
+    # EKF の手前の生 3D は _hybrid_extended と _hybrid_quality の両方で使うので 1 回だけ読む（どちらも kpts3d が要る）
+    raw_path = _recorded_raw_path(folder, stamp)
+    raw_capture = read_raw_capture(raw_path) if raw_path is not None and files["kpts3d"] is not None else None
+    _hybrid_extended(folder, stamp, files, frames, meta, report, add, raw_path, raw_capture)
+    quality = _hybrid_quality(folder, files, meta, raw_capture)
     if quality is not None:
         report["quality"] = quality
         _quality_checks(quality, add)
