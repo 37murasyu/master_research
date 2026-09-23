@@ -246,8 +246,16 @@ class TestJointPower:
         使う。かつて部位の絶対角速度との内積 τ·ω を使っており、腕を振るだけで仕事が出ていた
         （計画メモ A-4 (2)、H-B）。当時は部位の並びが 1 つずれており、肘の値は wrist_R の名前で
         出ていた（KNOWN_ISSUES §5-7）。
+
+        EKF は切る（2026-09-24 に混成へ EKF を入れた）。この合成は全身を 1.2 Hz・奥行き 15 cm で揺らしており、
+        同梱の既定値の EKF が追える帯域（約 0.65 Hz）の外で、点ごとの遅れの違いが肘角の見かけの変化になる
+        （1 サイクル 0.1〜0.35 J）。ここで確かめたいのは仕事率の式（相対角速度）なので、三角測量の値をそのまま使う。
         """
-        measurement = _measurement()
+        from app.hybrid.ekf import EkfSettings
+
+        P0, P1 = _stereo_projections()
+        measurement = NetworkMeasurement(
+            P0, P1, POSE_KEYPOINTS, MeasurementConfig(body_mass_kg=60.0, ekf=EkfSettings(enabled=False)))
         for index in range(150):
             t = index / 30.0
             truth = _body_points_rotating_right_arm(t)
@@ -390,3 +398,45 @@ class TestGravity:
         with pytest.warns(RuntimeWarning, match="重力"):
             measurement._build_inertia(samples)
         np.testing.assert_allclose(measurement.gravity, default_gravity)
+
+
+class TestWorkUsesEachFramesDt:
+    """仕事はフレームごとの dt で積む（``network_measure.py:455`` の不具合、計画の T6）。
+
+    以前はサイクル確定のときに「サイクル全体の仕事率の和 × 確定したフレームの dt」で、組が抜けて
+    確定のフレームの dt が 2 倍なら仕事も 2 倍になった。仕事率を一定にし、組を 7 組おきに抜いて、
+    積んだ仕事が P × Σdt と一致することを確かめる。
+    """
+
+    POWER = 10.0
+
+    def _run(self, monkeypatch, frames=90):
+        from app.runners import network_measure as nm
+
+        monkeypatch.setattr(nm, "push_up_joint_powers",
+                            lambda torques, *a, **k: {joint: self.POWER for joint in torques})
+        measurement = _measurement()
+        truth = _body_points(0.0)
+        p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
+        for k in range(frames):
+            if k % 7 == 3:
+                continue   # 同期バッファが組を作らなかった
+            measurement.process(_pair_from_pixels(round(k * 1e9 / 30), p0, p1))
+        return measurement
+
+    def test_the_rep_work_is_power_times_the_sum_of_dt(self, monkeypatch):
+        measurement = self._run(monkeypatch)
+        counted = [r.dt_s for r in measurement.results if r.local_torques]
+        assert any(dt > 1.5 / 30 for dt in counted), "前提: 抜けの直後のフレームがある"
+        work = measurement.rep_work.work()["elbow_R"].net
+        assert work == pytest.approx(self.POWER * sum(counted), rel=1e-9)
+
+    def test_a_closed_rep_reports_the_same_work(self, monkeypatch):
+        measurement = self._run(monkeypatch)
+        expected = measurement.rep_work.work()["wrist_L"].net
+        result = measurement.results[-1]
+        measurement._close_rep(result)
+        assert result.cycle_detected
+        assert result.cycle_work_j["wrist_L"] == pytest.approx(expected)
+        assert measurement.cycle_work["wrist_L"] == [pytest.approx(expected)]
+        assert measurement.rep_work.work()["wrist_L"].net == 0.0, "確定したら 0 から積み直す"
