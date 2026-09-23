@@ -63,7 +63,9 @@ IMPORT_SAFE_MODULES = [
     "app.runners.hybrid_preview",
     "app.runners.hybrid_calibrate",
     "app.runners.hybrid_measure",
-
+    "app.gauge.protocol",
+    "app.gauge.model",
+    "app.gauge.scene",
 ]
 
 # Windows でしか存在しないモジュール。使うなら関数内 import か try で囲むこと。

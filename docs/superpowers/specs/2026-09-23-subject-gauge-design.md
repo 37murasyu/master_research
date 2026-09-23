@@ -113,6 +113,11 @@
 データ可視化規約 D4-03 は帯域の境界の定義を図の中で示すことを求める。オフは「被験者に数値を見せない」ための
 意図的な例外で、オンに戻せば境界の値はいつでも見える。
 
+**source=replay**: 行の `source`（§6.3）が `"replay"`（記録済み CSV の再生）のときは、局面（Pixel 接続待ち／
+計測中／終了、上表）とは別に見出しの右端に「▶ 再生」の状態（R17-05 のピル）を添える。局面の表示自体は
+局面ごとの表のとおりで、「▶ 再生」はそこに重ねる印だけ。`source="demo"`（合成データ）は表示には使わない
+（`app/gauge/demo.py` を動かすためだけの印で、画面の出し分けには関わらない）。
+
 ### 5.2 計測画面の変更（作業者用、`app/shell/page_measure.py`）
 
 骨格（左のナビ、`RunnerPage`）は変えない（D で変える）。変えるのは次だけ:
@@ -153,17 +158,24 @@
 |---|---|---|
 | `app/shell/theme.py` | 色の役割（上表）を名前付きの値として持つ。ゲージ用の暗い配色 | なし |
 | `app/shell/pictograms.py` | 人物ピクトグラムの SVG を返す（大きさ・色を引数で） | なし |
-| `app/gauge/model.py` | 純粋な計算: しきい値の読み込み、値→弧の割合、状態（不足／目標帯／過負荷）、表示用の文字列 | なし |
-| `app/gauge/protocol.py` | ゲージの 1 行の書式（書く・読む） | なし |
-| `app/gauge/tracker.py` | 計測側の集計: 今の回の正の仕事、前回、完了回数。排他ロック付きのスナップショット | なし |
-| `app/gauge/widget.py` | 描画だけ（QPainter＋QtSvg）。`set_frame()` と `set_show_joules()` | model, theme, pictograms |
+| `app/gauge/model.py` | 純粋な計算: フレーム→弧の割合、状態（不足／目標帯／過負荷）、表示用の文字列、見出しの局面（状態機械） | protocol |
+| `app/gauge/protocol.py` | ゲージの 1 行の書式（書く・読む）。§6.3 | なし |
+| `app/gauge/scene.py` | 状態→場面: 800×450 の設計座標で弧・線・文字・スピナーを Qt に依存しない値として組み立てる | model, protocol, theme |
+| `app/gauge/tracker.py`（**別セッションの持ち分**） | 計測側の集計: 今の回の正の仕事、前回、完了回数。排他ロック付きのスナップショット | protocol |
+| `app/gauge/thresholds.py`（**別セッションの持ち分**） | 論文 4.5.2 節から W_0.70・W_0.85 を計算し、部位ごとの `band` を作る | なし |
+| `app/gauge/widget.py` | 描画（QPainter＋QtSvg）。`set_frame()` と `set_show_joules()`。動かない層の QPixmap キャッシュ（§6.6） | scene, theme, pictograms |
 | `app/gauge/window.py` | ゲージ窓（第 2 モニタがあればそこに全画面、無ければ 1280×720 の窓） | widget |
 | `app/gauge/demo.py` | 合成データで動かすデモ（`python -m app.gauge.demo`） | widget, window |
-| `app/runners/network_measure.py`（変更） | 仕事率を積むところと周期の確定で `tracker` を呼ぶ。**既存の `cycle_work`・CSV は変えない** | tracker |
-| `app/runners/hybrid_measure.py`（変更） | メインループで約 10 Hz にゲージの行を標準出力へ | protocol, tracker |
+| `app/runners/network_measure.py`（変更・**別セッションの持ち分**） | 仕事率を積むところと周期の確定で `tracker` を呼ぶ。**既存の `cycle_work`・CSV は変えない** | tracker |
+| `app/runners/hybrid_measure.py`（変更・**別セッションの持ち分**） | メインループ（Mac のカメラの約 30 Hz、間引かない）ごとにゲージの行を標準出力へ | protocol, tracker |
 | `app/runners/worker.py`（変更） | 出力を行に分け、ゲージの行は `gauge_frame` シグナルへ、それ以外はログへ | protocol |
-| `app/shell/page_measure.py`（変更） | §5.2 | window, theme |
+| `app/shell/controls.py`（**別セッションの持ち分**） | `ToggleSwitch`・`Disclosure`・`CountBadge`・`StatusText`。§5.2 の部品 | theme |
+| `app/shell/page_measure.py`（変更） | §5.2 | window, controls, theme |
 | `app/core/settings.py`（変更） | `GAUGE_SHOW_JOULES`（真偽、既定オン）を追加。`BODY_MASS_KG` を表示に出す | なし |
+
+`tracker.py`・`thresholds.py`・`network_measure.py`（変更分）・`hybrid_measure.py`（変更分）は別セッションの持ち分で、
+この設計書のこのタスク（凍結の準備）では触らない。境界にあるのは `app/gauge/protocol.py` の行の書式（§6.3）で、
+両セッションはこれだけを合意して独立に作業している。
 
 ### 6.2 データの流れ
 
@@ -173,27 +185,39 @@
     NetworkMeasurement.process(pair)                         出力を行に分ける
       仕事率 P を求めるたび → tracker.add(part, P, dt)        ├ 普通の行 → ログ
       周期を確定したら     → tracker.close_rep()             └ 「@@GAUGE 」で始まる行 → decode → gauge_frame
-  メインスレッド（live.step のループ）                        MeasurePage
-    100 ms ごとに tracker.snapshot() を読み                   gauge_frame → GaugeWindow.set_frame
-    protocol.encode(...) を print（行単位で flush）          スイッチ → GaugeWindow.set_show_joules ＋ 設定に保存
-                                                             ワーカー終了 → 正常終了／異常終了の表示
+  メインスレッド（live.step のループ、Mac のカメラの約 30 Hz。間引かない）  MeasurePage
+    毎周 tracker.snapshot() と thresholds の band を合わせて              gauge_frame → GaugeWindow.set_frame
+    protocol.encode(...) を書く（sys.stdout.write の 1 回で flush）      スイッチ → GaugeWindow.set_show_joules ＋ 設定に保存
+                                                                        ワーカー終了 → 正常終了／異常終了の表示
 ```
 
 ゲージ窓は **GUI プロセス**に置く。子プロセスのメインスレッドは OpenCV の窓を回しており、そこに Qt の窓を
 混ぜずに済む。J のスイッチも同じプロセスの中で完結するので、プロセス間で切り替えを伝える仕組みは要らない。
 
-### 6.3 ゲージの行の書式
+### 6.3 ゲージの行の書式（v2）
 
-1 行 = 接頭辞 `@@GAUGE ` ＋ JSON（UTF-8、改行で終わる）。
+1 行 = 接頭辞 `@@GAUGE ` ＋ JSON（UTF-8、改行で終わる）。書式は `app/gauge/protocol.py` が正本で、
+子プロセス（別セッション）と GUI（このセッション）が合意した契約（constraints.md「行の形式 v2」）。
 
 ```json
-{"v": 1, "link": "waiting|connected", "rep": 6,
- "parts": {"elbow_L": {"now": 132.4, "prev": 118.0}, "elbow_R": {...}, "wrist_L": {...}, "wrist_R": {...}}}
+{"v":2,"link":"waiting|connected","rep":6,"source":"measure|demo|replay",
+ "parts":{"elbow_L":{"now":132.4,"prev":118.0,"band":[87.5,106.3],"w1rm":66.0},
+          "elbow_R":{...},"wrist_L":{...},"wrist_R":{...}}}
 ```
 
-- `rep` は完了した回数。`prev` は完了した回が無ければ `null`。`now` は今の回の正の仕事 [J]。
-- 読む側は、接頭辞が無い行・JSON として壊れた行・`v` が違う行をゲージの行として扱わない（ログに回す）。
-- しきい値は行に載せない。GUI 側が `gauge_layout.json` の `energy_thresholds` を読む（正本は 1 つ）。
+- `rep` は完了した回数（0 以上の整数）。`prev` は完了した回が無ければ `null`。`now` は今の回の正の仕事 [J]。
+- `band` は `[lo, hi]`（`lo < hi`）で、しきい値そのもの（§9）。子プロセス側で計算できない部位は `null`。
+- `w1rm` はその部位の理論 1RM 仕事（参考値。今のゲージの描画は使わないが、あとで J 表示の分母などに使える
+  余地として送ってもらっている）。
+- `now`・`prev`・`w1rm` は数か `null`（送り主側で NaN は `null` にする）。
+- `source` は誰が行を作ったかの印。`"measure"` は実計測、`"demo"` は合成データ（`app/gauge/demo.py`。表示には
+  使わない）、`"replay"` は記録済み CSV の再生（§5.1「source=replay」）。
+- 読む側（`app.gauge.protocol.decode`）は、接頭辞が無い行・JSON として壊れた行・`v` が 2 でない行を
+  ゲージの行として扱わない（`None` を返し、呼び出し側はログに回す）。知らない鍵・`parts` の知らない部位名は無視する
+  （版を上げずに送り主側だけ先に鍵を増やせるようにするため）。
+- `encode` は小数 1 桁に丸め、JSON の区切りを詰め、ASCII にし、1 行を 512 バイト未満（macOS の `PIPE_BUF`。
+  `QProcess` の `MergedChannels` で標準エラーと混ざらない）に収める。
+- しきい値そのもの（`gauge_layout.json` の固定値）は使わない。GUI は行に載ってきた `band` をそのまま使う（§9）。
 
 ### 6.4 値の定義
 
@@ -208,9 +232,29 @@
 `tracker` は受信スレッドが書き、メインスレッドが読む。`add` / `close_rep` / `snapshot` は同じロックで守り、
 `snapshot` は値のコピーを返す。
 
+### 6.6 描画の速さ
+
+ゲージの行は約 30 Hz で届く（§6.2）。GUI の描画がこれに追いつけないと、被験者が見る値が遅れて実際の動きと
+ずれる。`app/gauge/widget.py` の `GaugeWidget` は、`scene.py` が返す場面の要素を役割（`role`）で 2 つに分ける:
+
+- **動かない層**（地・見出し帯とアイコン・人物・溝・部位名・凡例・見出しのタイトル）: 窓の大きさが変わらない
+  限り見た目が変わらないので、窓の大きさと `devicePixelRatio` の組ごとに 1 度だけ `QPixmap` へ描いてキャッシュする
+  （`_ensure_static_pixmap`）。メモリを多く使ってでも、毎フレームの再構築を避けることを優先する。
+- **動く層**（目標帯の色・値の弧とその縁・前回の目盛り・中央の値と状態の文字・帯の両端の数字・見出しの右端・
+  Pixel 接続待ちのスピナー）だけを、キャッシュした `QPixmap` の上に毎フレーム重ねて描く。
+
+`tests/test_gauge_widget.py::TestGaugeWidgetPerformance` がこの方針を確かめる: `test_static_layer_is_cached` は
+同じ大きさでの再描画で静止層が作り直されないこと、`test_repaint_is_fast_enough` は 1920×1080 で 1 回の描画に
+上限（15 ms）を設けて確かめる。実測では平均約 2.5 ms で、30 Hz（1 周期 約 33 ms）に十分な余裕がある。
+
+行を読む側（`LineDemux`・`protocol.decode`）も 30 Hz で回るので、正規表現や大きなコピーを避けて軽く保つ
+（`app/gauge/protocol.py` の実装方針）。`GaugeWidget.set_frame()` は状態を更新するだけで、Qt の `update()` を
+呼んで再描画は Qt のイベントループにまとめて任せる（フレームを受け取るたびに強制的に repaint しない）。
+
 ## 7. エラーの扱い
 
-- しきい値が読めない・部位が欠けている: 起動時に理由付きで知らせ（ログ）、その部位の扇は溝だけにする。計測は止めない。
+- しきい値が計算できない（`band` が `null`。前腕長が人体の範囲外など、§9）: その部位は溝と部位名だけを描く
+  （`now` があっても弧・状態・目標帯の数字は出さない。constraints.md「描かないもの」）。計測は止めない。
 - ゲージの行が壊れている: ログに回す（上記）。ゲージは直前の表示を保つ。
 - 値が NaN・負: 0 として描く（正の仕事なので負にはならないが、防御として）。
 - 第 2 モニタが無い: 通常の窓で出す。
@@ -218,22 +262,33 @@
 
 ## 8. テスト（すべてテストを先に書く）
 
-- `model`: 値→割合（0、帯の下端・上端ちょうど、上端×1.25 超えで 1 に頭打ち）、状態の判定（境界は帯に含める）、
-  しきい値の読み込み（欠け・壊れ）
-- `protocol`: 書いて読むと元に戻る、接頭辞なし・壊れた JSON・版違いはゲージの行にならない
-- `tracker`: 負の仕事率を数えない、`close_rep` で今→前回に移り 0 に戻る、回数、別スレッドから書きながら読んでも壊れない
-- `network_measure`: 周期の確定で `tracker` が回を閉じる。**既存の `cycle_work_j` は変わらない**（回帰）
+- `model`: フレーム→割合（0、帯の下端・上端ちょうど、上端×1.25 超えで 1 に頭打ち）、状態の判定
+  （`now < lo` は不足＝文字なし、`lo ≤ now < hi` は「✓ 目標帯」、`now ≥ hi` は「✕ 過負荷」。下端は帯に含み
+  上端は含まない）、見出しの局面の状態機械（Pixel 接続待ち／計測中／終了）
+- `protocol`: 書いて読むと元に戻る（`band`・`w1rm`・`source` を含む）、接頭辞なし・壊れた JSON・版違い（`v` が
+  2 でない）はゲージの行にならない、知らない鍵・知らない部位は無視する
+- `scene`: 状態→場面が 800×450 の設計座標で組み立つ、`band` が `null` の部位は溝と部位名だけ、`source=replay`
+  で「▶ 再生」の要素が出る
+- `tracker`（別セッションの持ち分）: 負の仕事率を数えない、`close_rep` で今→前回に移り 0 に戻る、回数、
+  別スレッドから書きながら読んでも壊れない
+- `thresholds`（別セッションの持ち分）: W_0.70・W_0.85 の計算、前腕長が人体の範囲外なら `band` を出さない
+- `network_measure`（別セッションの持ち分）: 周期の確定で `tracker` が回を閉じる。**既存の `cycle_work_j` は
+  変わらない**（回帰）
 - `worker`: 塊で届いた出力を行に分け、ゲージの行はログに出ず `gauge_frame` に届く。行の途中で切れても次の塊とつなぐ
 - `theme`: 文字と地のコントラストが基準以上（本文 4.5:1、大きい文字と図形 3:1）
-- `widget`: offscreen で描画できる。状態ごとに期待する色の画素がある（過負荷で赤、帯の中で明るい青）
+- `widget`: offscreen で描画できる。状態ごとに期待する色の画素がある（過負荷で赤、帯の中で明るい青）。
+  動かない層が窓の大きさが同じなら作り直されない、1920×1080 の 1 回の描画が上限（15 ms）に収まる（§6.6）
+- `controls`（別セッションの持ち分）: `ToggleSwitch`・`Disclosure`・`CountBadge`・`StatusText` の見た目と操作
 - `page_measure`: 主ボタンが状態で入れ替わる、スイッチが混成のときだけ出る、スイッチで設定が変わる
 - 目視: デモ（`python -m app.gauge.demo`）の画面を撮って、人物に切れ目が無いこと・文字が重ならないことを確認する
 
 ## 9. 未確定事項と暫定の扱い（実装は止めない）
 
-- **しきい値**（研究上の判断が要る。暫定で今の値を使う）: `energy_thresholds`（肘 50〜200 J、手首 30〜150 J）は
-  USB 経路の値の定義に合わせて決めたもの。混成経路の「正の仕事」で同じ数字でよいかは研究として判断が要る。
-  値は `gauge_layout.json` で変えられる。
+- **しきい値**（解決済み）: `app/gauge/thresholds.py`（別セッションの持ち分）が論文 4.5.2 節の理論 1RM 仕事から
+  部位ごとに W_0.70・W_0.85 を計算し、`@@GAUGE` 行の `band` として毎フレーム送る（§6.3）。GUI（このセッション）は
+  `band` をそのまま使うだけで、`gauge_layout.json` の `energy_thresholds` の固定値は読まない
+  （それを読むのは USB 経路の旧ゲージだけ。§3「含まない」）。前腕長が人体の範囲外など計算できないときは
+  `band` が `null` になり、GUI はその部位を溝と部位名だけで描く（§7）。
 - **計測画面の見た目**（返事なしのため設計どおり）: 今の骨格のまま中身だけ変え、見出し帯とタブは D で入れる。
 
 **コードで決まったこと**: 体重の既定。GUI は `Settings.as_env` で全設定をワーカーへ明示して渡すので、GUI から計測するとき
