@@ -38,6 +38,7 @@ IMPORT_SAFE_MODULES = [
     "app.tuning.ekf_likelihood",
     "app.tuning.ekf_estimate",
     "app.tuning.ekf_profile",
+    "app.hybrid.replay",
     "app.hybrid.link",
     "app.hybrid.mac_camera",
     "app.hybrid.pose_detector",
