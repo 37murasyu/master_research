@@ -18,6 +18,7 @@ import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.murayama.wheelchairsensor.camera.CameraPurpose
 import com.murayama.wheelchairsensor.camera.CameraSetup
 import com.murayama.wheelchairsensor.databinding.ActivityMainBinding
 import com.murayama.wheelchairsensor.net.ConnectionTarget
@@ -109,6 +110,7 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
 
         val scanner = barcodeScanner ?: BarcodeScanning.getClient().also { barcodeScanner = it }
         bindCamera(
+            CameraPurpose.SCAN_QR,
             ImageAnalysis.Analyzer { image ->
                 processBarcode(image, scanner)
             }
@@ -164,7 +166,7 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
             )
         }
         poseAnalyzer = analyzer
-        bindCamera(analyzer)
+        bindCamera(CameraPurpose.MEASURE, analyzer)
         scheduleResync()
     }
 
@@ -189,11 +191,11 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         }, TimeSync.RESYNC_INTERVAL_MS)
     }
 
-    private fun bindCamera(analyzer: ImageAnalysis.Analyzer) {
+    private fun bindCamera(purpose: CameraPurpose, analyzer: ImageAnalysis.Analyzer) {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
-                cameraSetup.start(future.get(), analyzer) { info ->
+                cameraSetup.start(future.get(), purpose, analyzer) { info ->
                     runOnUiThread { binding.detailText.text = info }
                 }
             } catch (e: Exception) {

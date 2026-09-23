@@ -34,6 +34,7 @@ class CameraSetup(
 
     fun start(
         provider: ProcessCameraProvider,
+        purpose: CameraPurpose,
         analyzer: ImageAnalysis.Analyzer,
         onReady: (String) -> Unit,
     ) {
@@ -56,13 +57,13 @@ class CameraSetup(
             // 溜まったフレームを処理しても意味がない。PC 側は時刻でペアを組むので、
             // 遅れて届いたフレームは使われない。常に最新だけを見る。
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setOutputImageFormat(purpose.outputImageFormat)
             // CameraX 側で正立させる。Java 側で回すと 1280x720 の Bitmap を
             // 毎フレーム 2 枚確保して 1 枚捨てることになり、30fps で約 210MB/s の
             // アロケーションになる。
             .setOutputImageRotationEnabled(true)
 
-        applyFixedOptics(analysisBuilder)
+        if (purpose.fixOptics) applyFixedOptics(analysisBuilder)
 
         val analysis = analysisBuilder.build().also {
             it.setAnalyzer(analysisExecutor, analyzer)
@@ -75,7 +76,8 @@ class CameraSetup(
             analysis,
         )
 
-        onReady("解像度 ${TARGET_RESOLUTION.width}x${TARGET_RESOLUTION.height} / AF・AE・AWB 固定")
+        val optics = if (purpose.fixOptics) "AF・AE・AWB 固定" else "オートフォーカス"
+        onReady("解像度 ${TARGET_RESOLUTION.width}x${TARGET_RESOLUTION.height} / $optics")
     }
 
     /**
