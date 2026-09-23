@@ -8,6 +8,7 @@
 
 import argparse
 from contextlib import ExitStack
+import csv
 import os
 from pathlib import Path
 import sys
@@ -30,17 +31,8 @@ from energy_pipeline import EnergyFilterConfig
 from app.hybrid.gravity import candidate_axes
 from app.runners.network_measure import MeasurementConfig
 
-_TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"0", "false", "no", "off"}
-
-
-def _flag(name: str, default: bool) -> bool:
-    """``config.env_flag`` と同じ読み方（大文字小文字と前後の空白は問わない）。"""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    return True if value in _TRUE else False if value in _FALSE else default
+# 真偽の設定は USB と同じ読み方（大文字小文字と前後の空白は問わない）
+_flag = config.env_flag
 
 
 def one_rm_from_env() -> tuple[str | None, dict | None, str | None]:
@@ -55,7 +47,8 @@ def one_rm_from_env() -> tuple[str | None, dict | None, str | None]:
     path = Path((os.environ.get("ONE_RM_CSV") or "").strip() or Path(config.folder_path) / "m_max_all_merged.csv")
     try:
         one_rm = load_one_rm(path, subject)
-    except OSError as exc:
+    except (OSError, ValueError, csv.Error) as exc:
+        # 無い・読めない（OSError）だけでなく、文字コード違い（UnicodeDecodeError）や壊れた CSV でも計測は止めない
         return raw, None, f"1RM の表を読めない（{path}: {exc}）"
     missing = [part for part in PARTS if one_rm.get(part) is None]
     reason = f"1RM の表 {path} に被験者 {subject} の {', '.join(missing)} が無い" if missing else None
@@ -140,12 +133,13 @@ def main(argv=None):
             stack.callback(camera.close)
             detector = PoseDetector()
             stack.callback(detector.close)
-            config = measurement_config(args.body_mass, args.gravity_mode)
-            tracker = GaugeTracker(source="demo" if config.demo is not None else "measure")
+            # 名前を config にすると、main の中ではモジュールの config が隠れる（Python は関数全体で局所とみなす）
+            measure_config = measurement_config(args.body_mass, args.gravity_mode)
+            tracker = GaugeTracker(source="demo" if measure_config.demo is not None else "measure")
             ticker = GaugeTicker(tracker)
             measurement = MeasurementSession(
                 calibration,
-                config=config,
+                config=measure_config,
                 metadata={
                     "cam0_offset_ms": args.cam0_offset_ms,
                     "preview_hz": args.preview_hz,

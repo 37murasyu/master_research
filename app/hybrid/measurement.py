@@ -21,7 +21,18 @@ class MeasurementSession:
         self.config = config or MeasurementConfig()
         # ゲージの状態（app.gauge.tracker.GaugeTracker）。受信スレッドが積み、メインスレッドが行を書く
         self.tracker = tracker
-        self.measurement = None
+        # 計算器は作った側のスレッド（計測の子ではメインスレッド）で先に作る。EKF の較正プロファイル
+        # （HYBRID_EKF_PROFILE）の読み込みを受信スレッドで走らせず、壊れていれば起動の時点で止める
+        # （Pixel の最初の点で落ちると、記録器ができる前なので meta.json に理由が残らない）
+        self.measurement = NetworkMeasurement(
+            *calibration.projections,
+            pose_keypoints,
+            self.config,
+            lens=dict(zip(("cam0", "cam1"), calibration.intrinsics)),
+            tracker=tracker,
+            # 校正の最後に盤を立てた向き（無ければ None で、重力は体幹から決める）
+            board_up=read_board_up(calibration.meta),
+        )
         self.recorder = None
         self.failed = threading.Event()
         self.exit_code = 0
@@ -65,15 +76,6 @@ class MeasurementSession:
 
     def _ensure(self):
         if self.recorder is None:
-            measurement = NetworkMeasurement(
-                *self.calibration.projections,
-                pose_keypoints,
-                self.config,
-                lens=dict(zip(("cam0", "cam1"), self.calibration.intrinsics)),
-                tracker=self.tracker,
-                # 校正の最後に盤を立てた向き（無ければ None で、重力は体幹から決める）
-                board_up=read_board_up(self.calibration.meta),
-            )
             self.recorder = Recorder(
                 self.calibration,
                 pose_keypoints,
@@ -86,10 +88,9 @@ class MeasurementSession:
                     one_rm_kg=None if self.config.one_rm is None else dict(self.config.one_rm),
                     dyn_gate=self.config.dyn_gate,
                 ),
-                raw_provenance=self._raw_provenance(measurement),
+                raw_provenance=self._raw_provenance(self.measurement),
                 offline_wrist=self.config.offline_wrist_capture,
             )
-            self.measurement = measurement
             self.recorder.meta["ekf"] = self.measurement.ekf_provenance()
             if self.tracker is not None:
                 # 記録を始めた＝Pixel の点が届いた
@@ -167,9 +168,8 @@ class MeasurementSession:
         if self.recorder is None:
             return  # Pixel の点が一度も届かなかった。残すものは無い
         try:
-            summary = self.measurement.summary() if self.measurement is not None else {}
             self.recorder.close(
-                **summary,
+                **self.measurement.summary(),
                 status="failed" if self.exit_code else "complete",
                 exit_code=self.exit_code,
                 error=self.error,

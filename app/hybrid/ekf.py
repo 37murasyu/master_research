@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -95,18 +95,24 @@ def hybrid_noise(settings: EkfSettings, landmark_ids: Sequence[int], *, dt: floa
                  bpf_enabled: bool = False) -> RuntimeNoise:
     """混成の EKF の雑音と出どころ。プロファイルが無ければ同梱の既定値（``resolve_profile(None, dt=)`` 相当）。
 
-    同梱の既定値には推定した門の広さが無いので、門だけ ``EKF_GATE_STD`` を使う。
+    同梱の既定値には推定した門の広さが無いので、門だけ ``EKF_GATE_STD`` を使う。プロファイルを指定しても
+    dt が合わない・BPF が有効で同梱の既定値に落ちたときも同じ（プロファイルが無いときと門を揃える）。
     """
-    scalar = EKFConfig(gate_std=settings.gate_std)
     if settings.profile:
-        return runtime_noise(settings.profile, dt=dt, bpf_enabled=bpf_enabled,
-                             landmark_ids=landmark_ids, scalar=scalar)
+        noise = runtime_noise(settings.profile, dt=dt, bpf_enabled=bpf_enabled,
+                              landmark_ids=landmark_ids, scalar=EKFConfig(gate_std=settings.gate_std))
+        if noise.origin == "profile":
+            return noise
+        return replace(noise, cfg=_with_gate(noise.cfg, settings.gate_std))
     ids = tuple(sorted(int(lid) for lid in landmark_ids))
     resolution = resolve_profile(None, dt=dt, bpf_enabled=bpf_enabled)
-    noise = resolution.series_noise(ids)
-    noise = SeriesNoise(q_acc=noise.q_acc, r=noise.r, gate_std=np.full_like(noise.gate_std, settings.gate_std))
-    return RuntimeNoise(cfg=noise, origin="builtin", resolution=resolution,
-                        sources={"builtin": len(ids) * len(AXES)}, landmark_ids=ids)
+    return RuntimeNoise(cfg=_with_gate(resolution.series_noise(ids), settings.gate_std), origin="builtin",
+                        resolution=resolution, sources={"builtin": len(ids) * len(AXES)}, landmark_ids=ids)
+
+
+def _with_gate(noise: SeriesNoise, gate_std: float) -> SeriesNoise:
+    """系列ごとの雑音の門だけを ``gate_std`` にそろえる。"""
+    return SeriesNoise(q_acc=noise.q_acc, r=noise.r, gate_std=np.full_like(noise.gate_std, gate_std))
 
 
 class GridEkf:
@@ -181,6 +187,10 @@ class GridEkf:
             # 数値の破綻だけを拾い、観測をそのまま使う（USB 経路と同じ。形の不整合などは握りつぶさない）
             self.failures += 1
             return raw.copy(), np.full(raw.shape, np.nan)
+        if self._ekf.bandpass_enabled:
+            # 前処理の BPF（EKF_BPF_*）が効くと、EKF が追うのは帯域を通した観測で、位置の直流分が抜ける。
+            # 生の観測との差はいつも大きいので、見張りに掛けると全点を 3 フレームごとに初期化し直してしまう
+            return pos, vel
         with np.errstate(invalid="ignore"):
             far = np.linalg.norm(pos - raw, axis=1) > DIVERGE_M   # 観測が NaN の点は数えない
         self._drift = np.where(far, self._drift + 1, 0)

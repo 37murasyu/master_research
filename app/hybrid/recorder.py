@@ -7,12 +7,11 @@ from pathlib import Path
 import shutil
 import threading
 import time
+from app.gauge.protocol import PART_NAMES
 from app.hybrid.calibration_io import FILES, write_json
+from app.hybrid.ekf import GRID_NS as _GRID_NS   # 同期バッファの格子（30 Hz）[ns]。生 3D の frame は格子の番号
 from app.hybrid.paths import measurement_root
 from app.tuning.raw_capture import RawCaptureWriter
-
-# 同期バッファの格子（30 Hz）[ns]。生 3D の frame は格子の番号
-_GRID_NS = 33_333_333
 
 
 def _cycle_columns(result, key):
@@ -109,7 +108,7 @@ class Recorder:
         # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）
         self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score"])
         # ゲージに出した値（今の回の W+ [J]）。毎フレーム 1 行。帯と定義は閉じるときに .json へ
-        self._gauge_parts = ("elbow_L", "elbow_R", "wrist_L", "wrist_R")
+        self._gauge_parts = PART_NAMES
         self._gauge_path = self.directory / f"gauge_energy_{stamp}.csv"
         self.gauge = writer("gauge_energy", ["frame", "t_ns", "rep", "dyn_active", *self._gauge_parts])
         # 肘の濾波 E±（USB の cycle_energy_debug_* と同じ量。回の確定ごとに肘の左右で 1 行ずつ）

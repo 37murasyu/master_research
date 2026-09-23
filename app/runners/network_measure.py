@@ -59,7 +59,6 @@ from body_part_storage_module import BodyPartDataStorage
 # 部位キーと重力の大きさは config.py が持っている。utils 経由で既に読み込まれているので
 # 追加コストなしで再利用できる。
 from config import G_SCALAR, INERTIA_LENGTH_FRAMES, SEGMENT_MASS_FRACTIONS
-from config import g as _CONFIG_GRAVITY
 from config import part_calculations
 from config import part_keys as _PART_KEYS
 from config import slot_of
@@ -79,6 +78,7 @@ from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transfor
 
 from energy_pipeline import AdaptiveCutoff, EnergyFilterConfig, angle_between, compute_cycle_energy_filtered
 
+from app.gauge.protocol import PART_NAMES
 from app.gauge.thresholds import PartBand, part_bands
 from app.hybrid.demo_gauge import DemoConfig, DemoGauge
 from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
@@ -114,9 +114,6 @@ class ImplausibleBodyScale(ValueError):
     そのまま逆動力学に入れるとトルクが桁違いになるので計測を止める。
     """
 
-# 体幹から重力を決められないときの既定（三角測量の変換で z が上になる。カメラが水平という前提）
-DEFAULT_GRAVITY = np.asarray(_CONFIG_GRAVITY, dtype=np.float64)
-
 
 # 腕の長さの安全策で、長さがずれたフレームの後に積まないフレーム数を含めた幅（そのフレーム＋差分で速度・
 # 加速度にそれを使う後の 2 フレーム）
@@ -132,8 +129,8 @@ PART_LINKS: dict[str, tuple[int, int]] = {
 
 # 部位キーは config.py が持っている（順序も一致）。
 PART_KEYS = tuple(_PART_KEYS)
-# ゲージに出す部位（肩は出さない。app.gauge.protocol.PART_NAMES と同じ）
-GAUGE_PARTS = ("elbow_L", "elbow_R", "wrist_L", "wrist_R")
+# ゲージに出す部位（肩は出さない）。ゲージの行の書式が正本
+GAUGE_PARTS = PART_NAMES
 
 
 @dataclass
@@ -311,8 +308,9 @@ class NetworkMeasurement:
         self.cycles: list[dict] = []
         # 押し上げでなかった回（最小の持ち上げに届かず捨てた）の数
         self.discarded_reps = 0
-        # 今の回の仕事。フレームごとの dt で積む（かつては確定したフレームの dt を全体に掛けていた）
-        self.rep_work = RepAccumulator(PART_KEYS)
+        # 今の回の仕事。フレームごとの dt で積む（かつては確定したフレームの dt を全体に掛けていた）。
+        # 関所が開く前の輪の長さは回の区切りの設定（RepConfig.lookback_frames）に従う
+        self.rep_work = RepAccumulator(PART_KEYS, lookahead=self.config.rep.lookback_frames)
 
         self.results: list[FrameResult] = []
 
@@ -623,10 +621,6 @@ class NetworkMeasurement:
                           RuntimeWarning, stacklevel=2)
         self.gravity_choice = choice
         self.gravity = np.asarray(choice.vector, dtype=np.float64).copy()
-
-    def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:
-        dynamics = self._dynamics(points)
-        return None if dynamics is None else dynamics[0]
 
     def _dynamics(self, points: np.ndarray):
         """局所トルク・仕事率・肘角 θ・肘の τ_y。部位データが揃わなければ None。"""

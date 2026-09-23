@@ -267,6 +267,14 @@ def _hybrid_files(folder: Path) -> tuple[str | None, dict[str, Path | None]]:
     return stamp, {name: (path if path is not None and path.is_file() else None) for name, path in files.items()}
 
 
+def _recorded_raw_path(folder: Path, stamp: str | None) -> Path | None:
+    """記録器が書いた EKF の手前の 3D（``kpts3d_raw_<stamp>.csv`` とサイドカー）。古い版の記録には無い（None）。"""
+    if not stamp:
+        return None
+    path = folder / f"{HYBRID_RAW_PREFIX}_{stamp}.csv"
+    return path if path.is_file() and sidecar_path(path).is_file() else None
+
+
 def _intervals(t_s) -> np.ndarray:
     steps = np.diff(np.asarray(t_s, dtype=float))
     return steps[np.isfinite(steps) & (steps > 0)]
@@ -294,14 +302,23 @@ def _camera_centres(folder: Path) -> list[np.ndarray]:
     return centres
 
 
-def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mapping[str, Any]) -> dict[str, Any] | None:
-    """骨の長さ、肘での 2 本の視線のなす角、肘・手首が各カメラの画面内にある割合。"""
+def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mapping[str, Any],
+                    stamp: str | None = None) -> dict[str, Any] | None:
+    """骨の長さ、肘での 2 本の視線のなす角、肘・手首が各カメラの画面内にある割合。
+
+    三角測量の質を見るので、EKF の手前の 3D（``kpts3d_raw_<stamp>.csv``）があればそれを使う。新しい版の記録の
+    ``kpts3d`` は EKF の後の点で、均されて骨の長さのばらつきが小さく出る（置き方の失敗を見逃す）。
+    """
     if files["kpts3d"] is None:
         return None
     ids = [int(i) for i in meta["pose_keypoints"]]
     slot = {lid: i for i, lid in enumerate(ids)}
-    table = pd.read_csv(files["kpts3d"])
-    points = table.drop(columns="frame").to_numpy(float).reshape(len(table), len(ids), 3)
+    raw_path = _recorded_raw_path(folder, stamp)
+    if raw_path is not None:
+        points = read_raw_capture(raw_path).points
+    else:
+        table = pd.read_csv(files["kpts3d"])
+        points = table.drop(columns="frame").to_numpy(float).reshape(len(table), len(ids), 3)
     segments = {}
     for name, (a, b, low, high) in SEGMENTS.items():
         length = np.linalg.norm(points[:, slot[a]] - points[:, slot[b]], axis=1)
@@ -421,8 +438,8 @@ def _hybrid_gauge(work: pd.DataFrame, meta: Mapping[str, Any]) -> dict[str, Any]
 
 def _hybrid_extended(folder: Path, stamp: str | None, files: Mapping[str, Path | None], frames, meta, report, add) -> None:
     """新しい版の記録（``output_schema_version`` がある）の検査と値。古い記録では何もしない。"""
-    raw_path = folder / f"{HYBRID_RAW_PREFIX}_{stamp}.csv" if stamp else None
-    has_raw = raw_path is not None and raw_path.is_file() and sidecar_path(raw_path).is_file()
+    raw_path = _recorded_raw_path(folder, stamp)
+    has_raw = raw_path is not None
     report["files"][HYBRID_RAW_PREFIX] = raw_path.name if has_raw else None
     for name in HYBRID_EXTRA_FILES:
         found = _one(folder, f"{name}_{stamp}*.csv") if stamp else None
@@ -518,7 +535,7 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
             "file_mode": False,
         }
     _hybrid_extended(folder, stamp, files, frames, meta, report, add)
-    quality = _hybrid_quality(folder, files, meta)
+    quality = _hybrid_quality(folder, files, meta, stamp)
     if quality is not None:
         report["quality"] = quality
         _quality_checks(quality, add)
@@ -541,7 +558,8 @@ def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: 
 
     - 既定は、遅い方のカメラ（実機では Pixel、10〜15 Hz）の実際の撮影時刻で記録の 2D から三角測量し直した 3D
       （``app.hybrid.retriangulate``）。計測中の 3D は 30 Hz の格子へ線形補間した点で、補間の区間が直線になり
-      雑音の推定が狂う。``grid=True`` なら記録された格子の 3D をそのまま使う（比べる用）
+      雑音の推定が狂う。``grid=True`` なら記録された格子の 3D をそのまま使う（比べる用）。新しい版の記録は
+      ``kpts3d`` が EKF の後なので、EKF の手前の ``kpts3d_raw_<stamp>.csv`` を使う（古い版の記録は ``kpts3d``）
     - 混成の経路には間引きの設定が無いので、4 Hz 間引きに当たる 2 設定目は間引いて作る。``hz`` を与えると、
       実際の速さから間引き幅（``stride``）を決める（12 Hz で ``hz=4`` なら 3 組おき）
     - 間隔は揺れ、推定は dt 一定を前提にするので、dt は間隔の中央値とし、揺れの幅（5〜95%）も残す
@@ -554,7 +572,15 @@ def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: 
     meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
     stamp, files = _hybrid_files(folder)
     ids = [int(i) for i in meta["pose_keypoints"]]
-    if grid:
+    recorded_raw = _recorded_raw_path(folder, stamp) if grid else None
+    if recorded_raw is not None:
+        # 新しい版の記録は kpts3d が EKF の後の点なので、EKF の手前の格子（kpts3d_raw_<stamp>.csv、抜けは NaN の行）を使う。
+        # EKF で均した点から雑音を推定すると r が小さく出て、その較正を実行時が選んでしまう（dt が 1/30 s で一致する）
+        capture = read_raw_capture(recorded_raw)
+        points, t, frame_no = capture.points, capture.t, capture.frame
+        times, skipped = "grid", 0
+    elif grid:
+        # 古い版の記録（EKF の手前の CSV が無い）は kpts3d がそのまま三角測量の点
         kpts_path, frames_path = files["kpts3d"], files["frames"]
         if kpts_path is None or frames_path is None:
             raise ValueError(f"kpts3d・frames の CSV が無い: {folder}")
