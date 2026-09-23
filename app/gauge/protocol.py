@@ -257,13 +257,17 @@ class LineDemux:
         log_parts: list[str] = []
         frames: list[GaugeFrame] = []
 
+        # 行ごとに残りを切り直すと塊が大きいとき O(k²) になるので、
+        # 開始位置だけ進めて、最後に1回だけ切り詰める。
+        pending = self._pending
+        start = 0
         while True:
-            newline_at = self._pending.find("\n")
+            newline_at = pending.find("\n", start)
             if newline_at == -1:
                 break
-            line = self._pending[: newline_at + 1]
-            self._pending = self._pending[newline_at + 1 :]
-            self._consume_line(line, log_parts, frames)
+            self._consume_line(pending[start : newline_at + 1], log_parts, frames)
+            start = newline_at + 1
+        self._pending = pending[start:]
 
         # 残り（改行なしの途中の行）。ゲージの行になりうる途中だけをため、
         # それ以外はここで確定させてすぐログへ流す（\r の進捗表示を止めないため）。

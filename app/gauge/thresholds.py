@@ -23,9 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from app.gauge.protocol import PART_NAMES
 from compute_cycle_energy_elbow_wrist import ONE_RM_COLUMNS, theoretical_1rm_work
 
-PARTS = ("elbow_L", "elbow_R", "wrist_L", "wrist_R")
+# 部位の並びはゲージの行（protocol）と同じものを使う。``app/runners/hybrid_measure.py``
+# などが ``thresholds.PARTS`` として import しているので名前は残す。
+PARTS = PART_NAMES
 LOAD_LO = 0.70
 LOAD_HI = 0.85
 # 前腕長（肘→手首）の人体の範囲 [m]。外なら 3D が壊れているとみなし帯を出さない

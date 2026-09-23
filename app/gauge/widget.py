@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 from app.core.qt import QtCore, QtGui, QtSvg, QtWidgets
@@ -117,62 +118,57 @@ def _font_family_candidates() -> tuple[str, ...]:
     return _FONT_FAMILIES
 
 
-def _run_font(run: sc.Run) -> QtGui.QFont:
-    """``Run`` から ``QFont`` を作る。大きさは ``setPixelSize``（task-7-brief.md）。"""
+@functools.lru_cache(maxsize=64)
+def _font(pixel_size: int, weight: int) -> QtGui.QFont:
+    """大きさ・太さの組ごとに ``QFont`` を 1 度だけ作って使い回す。
+
+    毎フレーム同じ組の字体を作り直すのは無駄なため。QFont は
+    QGuiApplication が要るので、import 時ではなく最初に呼ばれたときに作る。
+    返した ``QFont`` は共有なので、呼び出し側で書き換えないこと。
+    """
     font = QtGui.QFont()
     font.setFamilies(list(_font_family_candidates()))
-    font.setPixelSize(max(1, round(run.size)))
-    font.setWeight(QtGui.QFont.Weight(run.weight))
+    font.setPixelSize(pixel_size)
+    font.setWeight(QtGui.QFont.Weight(weight))
     return font
 
 
+def _run_font(run: sc.Run) -> QtGui.QFont:
+    """``Run`` から ``QFont`` を作る。大きさは ``setPixelSize``（task-7-brief.md）。"""
+    return _font(max(1, round(run.size)), run.weight)
+
+
+@functools.lru_cache(maxsize=1024)
+def _text_advance(text: str, pixel_size: int, weight: int) -> float:
+    """文字列の幅（``QFontMetricsF.horizontalAdvance``）。同じ組は測り直さない。"""
+    return QtGui.QFontMetricsF(_font(pixel_size, weight)).horizontalAdvance(text)
+
+
 # ---------------------------------------------------------------------------
-# 人物・見出しアイコンの QSvgRenderer（色の組ごとにキャッシュ）
+# 人物・見出しアイコンの QSvgRenderer（1 度だけ作ってキャッシュ）
 # ---------------------------------------------------------------------------
 
-
-class _RendererCache:
-    """``pictograms`` の SVG から作った ``QSvgRenderer`` を色の組ごとに持つ。
-
-    被験者ゲージの色は ``app/shell/theme.py`` の定数で固定なので、実際には
-    1 通りしか使わないが、呼び出し側が色を変えて呼んでも壊れないようにしておく。
-    """
-
-    def __init__(self) -> None:
-        self._figures: dict[tuple[str, ...], QtSvg.QSvgRenderer] = {}
-        self._icons: dict[tuple[str, ...], QtSvg.QSvgRenderer] = {}
-
-    def figure(
-        self,
-        *,
-        figure: str = theme.TEXT,
-        chair: str = theme.CHAIR,
-        plate: str = theme.PLATE,
-        plate_dark: str = theme.PLATE_DARK,
-        sleeve: str = theme.SLEEVE,
-        background: str = theme.FIELD,
-    ) -> QtSvg.QSvgRenderer:
-        key = (figure, chair, plate, plate_dark, sleeve, background)
-        renderer = self._figures.get(key)
-        if renderer is None:
-            svg = pictograms.figure_svg(
-                figure=figure, chair=chair, plate=plate, plate_dark=plate_dark, sleeve=sleeve, background=background
-            )
-            renderer = QtSvg.QSvgRenderer(svg.encode("utf-8"))
-            self._figures[key] = renderer
-        return renderer
-
-    def icon(self, *, figure: str = theme.TEXT, plate: str = theme.PLATE) -> QtSvg.QSvgRenderer:
-        key = (figure, plate)
-        renderer = self._icons.get(key)
-        if renderer is None:
-            svg = pictograms.header_icon_svg(figure=figure, plate=plate)
-            renderer = QtSvg.QSvgRenderer(svg.encode("utf-8"))
-            self._icons[key] = renderer
-        return renderer
+# 被験者ゲージの色は ``app/shell/theme.py`` の定数で固定なので、色の組は
+# 1 通りしか無い。QSvgRenderer は QGuiApplication が要るので、最初に
+# 呼ばれたときに作る。
 
 
-_RENDERERS = _RendererCache()
+@functools.cache
+def _figure_renderer() -> QtSvg.QSvgRenderer:
+    svg = pictograms.figure_svg(
+        figure=theme.TEXT,
+        chair=theme.CHAIR,
+        plate=theme.PLATE,
+        plate_dark=theme.PLATE_DARK,
+        sleeve=theme.SLEEVE,
+        background=theme.FIELD,
+    )
+    return QtSvg.QSvgRenderer(svg.encode("utf-8"))
+
+
+@functools.cache
+def _icon_renderer() -> QtSvg.QSvgRenderer:
+    return QtSvg.QSvgRenderer(pictograms.header_icon_svg(figure=theme.TEXT, plate=theme.PLATE).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +205,9 @@ def _draw_line(painter: QtGui.QPainter, line: sc.Line) -> None:
 
 def _draw_label(painter: QtGui.QPainter, label: sc.Label) -> None:
     """``Run`` を左から順に並べる。大きさ違いの幅は ``QFontMetricsF`` で測る。"""
-    fonts = [_run_font(run) for run in label.runs]
-    widths = [QtGui.QFontMetricsF(font).horizontalAdvance(run.text) for run, font in zip(label.runs, fonts)]
+    keys = [(max(1, round(run.size)), run.weight) for run in label.runs]
+    fonts = [_font(*key) for key in keys]
+    widths = [_text_advance(run.text, *key) for run, key in zip(label.runs, keys)]
     total_width = sum(widths)
 
     if label.align == "left":
@@ -333,7 +330,7 @@ def render_image(state: gm.GaugeState, w: int, h: int) -> QtGui.QImage:
     image.fill(QtGui.QColor(theme.FIELD))
     painter = QtGui.QPainter(image)
     try:
-        paint_scene(painter, scene, w, h, _RENDERERS.figure(), _RENDERERS.icon())
+        paint_scene(painter, scene, w, h, _figure_renderer(), _icon_renderer())
     finally:
         painter.end()
     return image
@@ -385,7 +382,13 @@ class GaugeWidget(QtWidgets.QWidget):
         return self._state
 
     def set_frame(self, frame: GaugeFrame) -> None:
-        self._apply_state(gm.apply_frame(self._state, frame))
+        state = gm.apply_frame(self._state, frame)
+        # 同じフレームが続けて届いた（状態が値として変わらない）ときは、
+        # 場面の組み直しと描き直しを省く。局面の遷移は状態の差として
+        # 必ず現れるので、ここで取りこぼすことは無い。
+        if state == self._state:
+            return
+        self._apply_state(state)
 
     def set_show_joules(self, show_joules: bool) -> None:
         self._apply_state(gm.with_joules(self._state, show_joules))
@@ -460,7 +463,7 @@ class GaugeWidget(QtWidgets.QWidget):
                 painter.save()
                 painter.translate(ox, oy)
                 painter.scale(s, s)
-                _draw_backdrop(painter, self._scene, _RENDERERS.figure(), _RENDERERS.icon())
+                _draw_backdrop(painter, self._scene, _figure_renderer(), _icon_renderer())
                 _draw_scene_elements(painter, self._scene, _is_static_role)
                 painter.restore()
         finally:

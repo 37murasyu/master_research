@@ -10,7 +10,6 @@ GUI 本体の計測ページを通さずに、本番と同じ道筋（子プロ�
 from __future__ import annotations
 
 import argparse
-import codecs
 import os
 import sys
 from pathlib import Path
@@ -31,7 +30,7 @@ def main(argv=None) -> int:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
     from app.core.qt import QtCore, QtWidgets
-    from app.gauge.protocol import PREFIX, decode
+    from app.gauge.protocol import LineDemux
     from app.gauge.window import GaugeWindow
 
     out = Path(args.out).expanduser()
@@ -48,18 +47,19 @@ def main(argv=None) -> int:
                   "--speed", str(args.speed), "--from", str(args.start_s)]
     if args.end_s is not None:
         child_args += ["--to", str(args.end_s)]
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    state = {"buffer": "", "shots": 0, "frames": 0, "last": None}
+    # 本番（app/runners/worker.py）と同じ LineDemux で、ゲージの行とログを解く。
+    demux = LineDemux()
+    state = {"shots": 0, "frames": 0, "last": None}
+
+    def print_log(text: str) -> None:
+        for line in text.splitlines():
+            if line.strip():
+                print(f"[子] {line}")
 
     def read_stdout() -> None:
-        state["buffer"] += decoder.decode(bytes(process.readAllStandardOutput()))
-        *lines, state["buffer"] = state["buffer"].split("\n")
-        for line in lines:
-            frame = decode(line) if line.startswith(PREFIX) else None
-            if frame is None:
-                if line.strip():
-                    print(f"[子] {line}")
-                continue
+        log_text, frames = demux.feed(bytes(process.readAllStandardOutput()))
+        print_log(log_text)
+        for frame in frames:
             window.set_frame(frame)
             state["frames"] += 1
             state["last"] = frame
@@ -81,6 +81,7 @@ def main(argv=None) -> int:
 
     def finished(code: int, _status=None) -> None:
         read_stdout()
+        print_log(demux.flush())
         window.finish(int(code))
         QtCore.QTimer.singleShot(300, lambda: (shoot(), app.quit()))
         print(f"[終了] 子の終了コード {code}、受け取った行 {state['frames']}")

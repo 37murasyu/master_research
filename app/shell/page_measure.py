@@ -57,6 +57,26 @@ def calibration_time_text() -> str:
     return taken.strftime("%Y-%m-%d %H:%M")
 
 
+def _link_label(text: str, slot) -> QtWidgets.QLabel:
+    """押せるリンクの文字（``<a>`` 1 つ）。押されたら ``slot(href)`` を呼ぶ。"""
+    label = QtWidgets.QLabel(f'<a href="#">{text}</a>')
+    label.setTextFormat(QtCore.Qt.RichText)
+    label.setTextInteractionFlags(QtCore.Qt.LinksAccessibleByMouse | QtCore.Qt.LinksAccessibleByKeyboard)
+    label.linkActivated.connect(slot)
+    return label
+
+
+def _hrow(*widgets: QtWidgets.QWidget) -> QtWidgets.QWidget:
+    """``widgets`` を左詰めで横に並べた行（余白なし、右は伸び縮みで埋める）。"""
+    row = QtWidgets.QWidget()
+    layout = QtWidgets.QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    for widget in widgets:
+        layout.addWidget(widget)
+    layout.addStretch(1)
+    return row
+
+
 class MeasurePage(RunnerPage):
     TITLE = "リアルタイム計測"
     LOG_LABEL = "計測ログ"
@@ -120,12 +140,7 @@ class MeasurePage(RunnerPage):
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setWidget(inner)
 
-        self._output_link = QtWidgets.QLabel('<a href="#">出力フォルダ</a>')
-        self._output_link.setTextFormat(QtCore.Qt.RichText)
-        self._output_link.setTextInteractionFlags(
-            QtCore.Qt.LinksAccessibleByMouse | QtCore.Qt.LinksAccessibleByKeyboard
-        )
-        self._output_link.linkActivated.connect(self._open_output_folder)
+        self._output_link = _link_label("出力フォルダ", self._open_output_folder)
         self._output_link.setVisible(False)  # 終わった後に出す
 
         panel = QtWidgets.QWidget()
@@ -148,12 +163,7 @@ class MeasurePage(RunnerPage):
             self._input_group.addButton(button, button_id)
         self._input_group.button(_INPUT_ROLES.index(self._runner.role)).setChecked(True)
         self._input_group.idToggled.connect(self._on_input_toggled)
-        inputs = QtWidgets.QWidget()
-        inputs_layout = QtWidgets.QHBoxLayout(inputs)
-        inputs_layout.setContentsMargins(0, 0, 0, 0)
-        inputs_layout.addWidget(self._input_usb)
-        inputs_layout.addWidget(self._input_hybrid)
-        inputs_layout.addStretch(1)
+        inputs = _hrow(self._input_usb, self._input_hybrid)
 
         self._subject_edit = QtWidgets.QLineEdit(str(self._settings.get("SUBJECT_ID") or ""))
         self._subject_edit.textChanged.connect(lambda text: self._settings.set("SUBJECT_ID", text))
@@ -163,27 +173,12 @@ class MeasurePage(RunnerPage):
         self._body_mass.setRange(20.0, 200.0)
         self._body_mass.setValue(float(self._settings.get("BODY_MASS_KG")))
         self._body_mass.valueChanged.connect(lambda value: self._settings.set("BODY_MASS_KG", value))
-        mass = QtWidgets.QWidget()
-        mass_layout = QtWidgets.QHBoxLayout(mass)
-        mass_layout.setContentsMargins(0, 0, 0, 0)
-        mass_layout.addWidget(self._body_mass)
-        mass_layout.addWidget(QtWidgets.QLabel("kg"))  # 単位は欄の直後（R9-08）
-        mass_layout.addStretch(1)
+        mass = _hrow(self._body_mass, QtWidgets.QLabel("kg"))  # 単位は欄の直後（R9-08）
 
         # 使う校正の日時（R13-05）と「変更」リンク（R16-10）。混成の校正なので混成のときだけ出す
         self._calibration_time = QtWidgets.QLabel(calibration_time_text())
-        self._calibration_link = QtWidgets.QLabel('<a href="#">変更</a>')
-        self._calibration_link.setTextFormat(QtCore.Qt.RichText)
-        self._calibration_link.setTextInteractionFlags(
-            QtCore.Qt.LinksAccessibleByMouse | QtCore.Qt.LinksAccessibleByKeyboard
-        )
-        self._calibration_link.linkActivated.connect(lambda _href: self.calibration_requested.emit())
-        self._calibration_row = QtWidgets.QWidget()
-        calibration_layout = QtWidgets.QHBoxLayout(self._calibration_row)
-        calibration_layout.setContentsMargins(0, 0, 0, 0)
-        calibration_layout.addWidget(self._calibration_time)
-        calibration_layout.addWidget(self._calibration_link)
-        calibration_layout.addStretch(1)
+        self._calibration_link = _link_label("変更", lambda _href: self.calibration_requested.emit())
+        self._calibration_row = _hrow(self._calibration_time, self._calibration_link)
 
         self._editors = QtWidgets.QWidget()
         self._rows = QtWidgets.QFormLayout(self._editors)
