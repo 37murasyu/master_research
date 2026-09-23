@@ -75,7 +75,9 @@ class Recorder:
                 for axis in "xyz"
             ],
         )
-        self.times = writer("frames", ["frame", "t_ns", "t_s", "cycle_detected"])
+        # 既存の列の後ろに: 同期バッファの格子の番号・前の組からの dt・関所・高さ・回の番号・腕の長さの安全策
+        self.times = writer("frames", ["frame", "t_ns", "t_s", "cycle_detected", "grid_index", "dt_s",
+                                       "dyn_active", "height_m", "rep", "arm_ok_L", "arm_ok_R"])
         self.raw = writer(
             "landmarks2d",
             [
@@ -124,12 +126,20 @@ class Recorder:
         if self._first_ns is None:
             self._first_ns = result.t_ns
         self.points.writerow([self.frames, *result.points_3d.ravel()])
+        arm_ok = getattr(result, "arm_ok", None) or {}
         self.times.writerow(
             [
                 self.frames,
                 result.t_ns,
                 (result.t_ns - self._first_ns) / 1e9,
                 int(result.cycle_detected),
+                getattr(result, "grid_index", ""),
+                getattr(result, "dt_s", ""),
+                int(bool(getattr(result, "dyn_active", False))),
+                getattr(result, "height_m", float("nan")),
+                getattr(result, "rep", ""),
+                int(arm_ok.get("L", True)),
+                int(arm_ok.get("R", True)),
             ]
         )
         self.torques.writerows(

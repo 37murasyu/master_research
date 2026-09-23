@@ -130,7 +130,9 @@ class MeasurementSession:
         if self.recorder is None:
             return  # Pixel の点が一度も届かなかった。残すものは無い
         try:
+            summary = self.measurement.summary() if self.measurement is not None else {}
             self.recorder.close(
+                **summary,
                 status="failed" if self.exit_code else "complete",
                 exit_code=self.exit_code,
                 error=self.error,

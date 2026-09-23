@@ -72,3 +72,35 @@ class TestCycleWork:
         assert elbow.score == pytest.approx(elbow.work_pos_j / w1rm, rel=1e-6)
         shoulder = table[table.joint == "shoulder_R"].iloc[0]
         assert np.isnan(shoulder.w1rm_j) and np.isnan(shoulder.score), "帯が無ければ空"
+
+
+class TestFrames:
+    def test_the_columns_are_appended(self, tmp_path):
+        session, _ = _session(tmp_path, drop={50, 51, 52, 53})
+        table = pd.read_csv(_file(session, "frames"))
+        assert list(table.columns) == ["frame", "t_ns", "t_s", "cycle_detected", "grid_index", "dt_s", "dyn_active",
+                                       "height_m", "rep", "arm_ok_L", "arm_ok_R"]
+        assert 50 not in set(table.grid_index) and 54 in set(table.grid_index)
+        assert table.loc[table.grid_index == 54, "dt_s"].item() == pytest.approx(5 / 30, rel=1e-6)
+        assert table.dyn_active.sum() > 20 and table.rep.iloc[-1] == 1
+        assert table.arm_ok_L.all() and table.arm_ok_R.all()
+
+
+class TestMeta:
+    def test_the_keys(self, tmp_path):
+        session, _ = _session(tmp_path)
+        meta = json.loads((session.directory / "meta.json").read_text(encoding="utf-8"))
+        assert meta["subject_id"] == "00"
+        assert meta["one_rm_kg"] == ONE_RM
+        assert meta["body_mass_kg"] == 65.0
+        assert meta["dyn_gate"] is True
+        assert meta["ekf"]["enabled"] is True and meta["ekf"]["origin"] == "builtin"
+        assert meta["arm_length_guard"] == {"tolerance": 0.25, "rejected_frames": {"L": 0, "R": 0}}
+        assert meta["forearm_len_m"]["R"] == pytest.approx(0.25, abs=0.01)
+        bands = session.measurement.bands
+        assert meta["w1rm_j"]["elbow_R"] == pytest.approx(bands["elbow_R"].w1rm)
+        assert meta["gauge_bands_j"]["elbow_R"] == pytest.approx(list(bands["elbow_R"].band))
+        assert meta["gravity"]["label"] == "Z-" and meta["gravity"]["source"] == "trunk"
+        assert meta["gravity"]["vector"] == pytest.approx([0.0, 0.0, -9.81])
+        assert meta["output_schema_version"] == 2
+        assert meta["reps"] == 1

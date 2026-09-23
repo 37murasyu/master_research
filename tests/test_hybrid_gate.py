@@ -158,3 +158,63 @@ class TestCloseRep:
         assert closing.cycle_work_j["elbow_R"] == pytest.approx(elbow.pos + elbow.neg)
         assert closing.cycle_w1rm["elbow_R"] == pytest.approx(measurement.bands["elbow_R"].w1rm)
         assert closing.cycle_w1rm["shoulder_R"] is None, "肩には 1RM 相当の理論仕事が無い"
+
+
+class TestArmLengthGuard:
+    """腕の長さの安全策（2026-09-24 06:31 の追加）。
+
+    2026-09-23 の実機の記録（置き方が悪い）の 20〜90 s を再生すると、EKF ありでも右腕の |τy| が 95% で 9,000 N·m、
+    最大 24 万 N·m に跳ねた。三角測量の誤りが続けて起きると EKF では吸収しきれず、ゲージが偽の過負荷を出す。
+    先頭の窓で決めた上腕長・前腕長から ±25% を超えてずれた腕は、そのフレーム（と、差分で速度・加速度にその
+    フレームを使う後の 2 フレーム）の仕事率を回の仕事とゲージに積まない。トルクは今どおり記録する。
+    """
+
+    JUMP = range(75, 78)   # 上げの途中（関所が開いた後）の 3 フレーム
+
+    def _run(self, jump: bool, tolerance: float = 0.25):
+        from hybrid_pushup import SLOT, pushup_pairs
+
+        tracker = GaugeTracker()
+        P0, P1 = _stereo_projections()
+        config = MeasurementConfig(body_mass_kg=65.0, ekf=EkfSettings(enabled=False),
+                                   arm_length_tolerance=tolerance)
+        measurement = NetworkMeasurement(P0, P1, pose_keypoints, config, tracker=tracker)
+        original = measurement.points_3d
+
+        def jumped(pair):
+            points = original(pair).copy()
+            points[SLOT[14], 0] += 3.0   # 右肘を 3 m 飛ばす
+            return points
+
+        results, peaks = [], []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for k, pair in enumerate(pushup_pairs(measurement, PushUp(reps=1))):
+                measurement.points_3d = jumped if (jump and k in self.JUMP) else original
+                results.append(measurement.process(pair))
+                peaks.append(tracker.values()["elbow_R"])
+        return measurement, results, max(peaks)
+
+    def test_a_jumping_arm_adds_no_work(self):
+        clean, _, clean_peak = self._run(jump=False)
+        guarded, results, peak = self._run(jump=True)
+        right, right_clean = guarded.cycles[0]["parts"]["elbow_R"], clean.cycles[0]["parts"]["elbow_R"]
+        assert right.pos <= right_clean.pos + 1e-9, "飛んだ腕の仕事が増えた"
+        assert right.pos > 0.7 * right_clean.pos, "落とすのは飛んだ前後の数フレームだけ"
+        assert peak <= clean_peak + 1e-9, "ゲージの now が飛びで増えた"
+        left, left_clean = guarded.cycles[0]["parts"]["elbow_L"], clean.cycles[0]["parts"]["elbow_L"]
+        assert left.pos == pytest.approx(left_clean.pos, rel=1e-9), "もう片方の腕は影響を受けない"
+        flagged = [r.grid_index for r in results if not r.arm_ok["R"]]
+        assert flagged == [75, 76, 77, 78, 79], "飛んだフレームと、差分にそれを使う後の 2 フレーム"
+        assert all(r.arm_ok["L"] for r in results)
+        assert all(results[k].local_torques for k in self.JUMP), "トルクは記録する"
+        assert guarded.arm_guard_rejected == {"L": 0, "R": 5}
+
+    def test_without_the_guard_the_jump_inflates_the_work(self):
+        """安全策を切る（許容 0）と、同じ飛びで右肘の仕事が大きく振れる（このテストの前提の確認。この合成では
+        W− が −25 J から −140 J 前後に振り切れる。飛びの向きしだいで W+ 側にも出る）。"""
+        clean, _, _ = self._run(jump=False)
+        unguarded, results, _ = self._run(jump=True, tolerance=0.0)
+        work, work_clean = unguarded.cycles[0]["parts"]["elbow_R"], clean.cycles[0]["parts"]["elbow_R"]
+        assert abs(work.pos - work_clean.pos) + abs(work.neg - work_clean.neg) > 2 * work_clean.pos
+        assert all(r.arm_ok["R"] for r in results)

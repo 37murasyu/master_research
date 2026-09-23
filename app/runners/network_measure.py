@@ -116,6 +116,10 @@ class ImplausibleBodyScale(ValueError):
 DEFAULT_GRAVITY = np.asarray(_CONFIG_GRAVITY, dtype=np.float64)
 
 
+# 腕の長さの安全策で、長さがずれたフレームの後に積まないフレーム数を含めた幅（そのフレーム＋差分で速度・
+# 加速度にそれを使う後の 2 フレーム）
+_ARM_HISTORY = 3
+
 # リンク定義は config.part_calculations が正本（USB 経路と共通）。
 # ここでは (start, end) のタプル形式に落として使う。
 PART_LINKS: dict[str, tuple[int, int]] = {
@@ -155,6 +159,10 @@ class MeasurementConfig:
     rep: RepConfig = field(default_factory=RepConfig)
     # 力学の関所（HYBRID_DYN_GATE）。偽なら常に開いた扱い（回の区切りは RepDetector のまま）
     dyn_gate: bool = True
+    # 腕の長さの安全策: 先頭の窓の上腕長・前腕長（中央値）から、この比を超えてずれた腕の仕事率を回とゲージに
+    # 積まない（トルクは記録する）。0 で無効。三角測量の誤りが続くと EKF でも吸収しきれず、2026-09-23 の実機の
+    # 記録の再生で右腕の |τy| が最大 24 万 N·m になった
+    arm_length_tolerance: float = 0.25
 
     # EKF（app.hybrid.ekf）。既定は有効・同梱の既定値の雑音。計測の子は EkfSettings.from_env() を渡す
     ekf: EkfSettings = field(default_factory=EkfSettings)
@@ -194,6 +202,8 @@ class FrameResult:
     height_m: float = float("nan")
     # このフレームが属する回の番号（0 始まり＝それまでに確定した回の数）
     rep: int = 0
+    # 腕の長さの安全策（L・R）。偽ならその腕の仕事率を回とゲージに積まなかった
+    arm_ok: dict[str, bool] = field(default_factory=lambda: {"L": True, "R": True})
     # 回を確定したフレームだけ: 部位ごとの W+・W−（app.hybrid.rep_work.PartWork）と W_1RM [J]（帯が無い部位は None）
     cycle_parts: dict[str, PartWork] = field(default_factory=dict)
     cycle_w1rm: dict[str, float | None] = field(default_factory=dict)
@@ -261,6 +271,10 @@ class NetworkMeasurement:
         self.up: np.ndarray | None = None
         self.baseline_height_m: float | None = None
         self.forearm_m: dict[str, float | None] = {}
+        self.upper_arm_m: dict[str, float | None] = {}
+        # 腕の長さの安全策: 最後に長さがずれてからのフレーム数と、積まなかったフレーム数
+        self._arm_clean = {"L": _ARM_HISTORY, "R": _ARM_HISTORY}
+        self.arm_guard_rejected = {"L": 0, "R": 0}
         self.bands: dict[str, PartBand] = {}
         self.rep_detector: RepDetector | None = None
         # ゲージの状態（app.gauge.tracker.GaugeTracker）。None なら積まない
@@ -325,9 +339,11 @@ class NetworkMeasurement:
         if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
             dynamics = self._dynamics(points)
             sample = None
+            result.arm_ok = self._arm_ok(points)
             if dynamics is not None:
                 result.local_torques, result.powers, theta, tau_y = dynamics
-                sample = WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y)
+                sample = self._guarded_sample(
+                    WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y), result.arm_ok)
             self._gate(points, velocity, dt, sample, result)
 
         self.frame_index += 1
@@ -402,6 +418,33 @@ class NetworkMeasurement:
             self._t0_ns = t_ns
         return round((t_ns - self._t0_ns) / GRID_NS)
 
+    def summary(self) -> dict:
+        """計測を閉じるときに meta.json へ残す値（被験者の帯・重力・EKF・関所・腕の長さの安全策）。"""
+        from config import OUTPUT_SCHEMA_VERSION
+
+        choice = self.gravity_choice
+        bands = self.bands
+        return {
+            "output_schema_version": OUTPUT_SCHEMA_VERSION,
+            "forearm_len_m": dict(self.forearm_m) or None,
+            "upper_arm_len_m": dict(self.upper_arm_m) or None,
+            "w1rm_j": {part: band.w1rm for part, band in bands.items()} or None,
+            "gauge_bands_j": {part: (None if band.band is None else list(band.band)) for part, band in bands.items()} or None,
+            "gauge_band_reasons": {part: band.reason for part, band in bands.items() if band.reason} or None,
+            "gravity": None if choice is None else {
+                "source": choice.source, "label": choice.label, "vector": np.asarray(choice.vector).tolist(),
+                "up_label": choice.up_label, "detail": choice.detail,
+            },
+            "ekf": self.ekf_provenance(),
+            "dyn_gate": self.config.dyn_gate,
+            "baseline_height_m": self.baseline_height_m,
+            "reps": self.cycle_count,
+            "discarded_reps": self.discarded_reps,
+            "dynamics_restarts": self.dynamics_restarts,
+            "arm_length_guard": {"tolerance": self.config.arm_length_tolerance,
+                                 "rejected_frames": dict(self.arm_guard_rejected)},
+        }
+
     def ekf_provenance(self) -> dict:
         """EKF の出どころ（meta.json・サイドカー用）。"""
         return {"enabled": False} if self.ekf is None else self.ekf.provenance()
@@ -473,6 +516,7 @@ class NetworkMeasurement:
             return float(np.median(lengths)) if lengths.size else None
 
         self.forearm_m = {side: median_length(f"{side}_ELBOW", f"{side}_WRIST") for side in ("L", "R")}
+        self.upper_arm_m = {side: median_length(f"{side}_SHOULDER", f"{side}_ELBOW") for side in ("L", "R")}
         self.bands = part_bands(self.config.body_mass_kg, self.forearm_m, self.config.one_rm or {})
         if self.tracker is not None:
             self.tracker.set_bands(self.bands)
@@ -573,6 +617,46 @@ class NetworkMeasurement:
             theta[f"elbow_{side}"] = angle_between(elbow - shoulder, wrist - elbow)
             tau_y[f"elbow_{side}"] = float(local[f"elbow_{side}"][1])
         return {key: local[key] for key in PART_KEYS}, powers_by_key, theta, tau_y
+
+    def _arm_ok(self, points: np.ndarray) -> dict[str, bool]:
+        """腕の長さの安全策。上腕長か前腕長が先頭の窓の中央値から許容の比を超えてずれた腕は偽。
+
+        速度・加速度は直近のフレームとの差分なので、ずれたフレームの後の 2 フレームも偽にする。
+        """
+        tolerance = self.config.arm_length_tolerance
+        if tolerance <= 0 or not self.window_closed:
+            return {"L": True, "R": True}
+        ok = {}
+        for side in ("L", "R"):
+            good = True
+            for (a, b), reference in (((f"{side}_SHOULDER", f"{side}_ELBOW"), self.upper_arm_m.get(side)),
+                                      ((f"{side}_ELBOW", f"{side}_WRIST"), self.forearm_m.get(side))):
+                if reference is None or not math.isfinite(reference) or reference <= 0:
+                    continue   # 窓で長さを決められなかった腕は検査しない
+                length = float(np.linalg.norm(points[slot_of(a)] - points[slot_of(b)]))
+                if not (math.isfinite(length) and abs(length / reference - 1.0) <= tolerance):
+                    good = False
+            self._arm_clean[side] = self._arm_clean[side] + 1 if good else 0
+            ok[side] = self._arm_clean[side] >= _ARM_HISTORY
+        return ok
+
+    def _guarded_sample(self, sample: WorkSample, arm_ok: dict[str, bool]) -> WorkSample:
+        """長さがずれた腕の部位（手首・肘・肩）を仕事率・肘角・τ_y から外す。"""
+        bad = [side for side, good in arm_ok.items() if not good]
+        if not bad:
+            return sample
+        for side in bad:
+            self.arm_guard_rejected[side] += 1
+
+        def keep(key: str) -> bool:
+            return not any(key.endswith(f"_{side}") for side in bad)
+
+        return WorkSample(
+            dt=sample.dt,
+            powers={k: v for k, v in sample.powers.items() if keep(k)},
+            theta={k: v for k, v in sample.theta.items() if keep(k)},
+            tau_y={k: v for k, v in sample.tau_y.items() if keep(k)},
+        )
 
     def _height(self, vectors: np.ndarray | None) -> float:
         """肩の中点の上向き成分（位置なら高さ [m]、速度なら上向きの速さ [m/s]）。"""
