@@ -29,14 +29,23 @@ from pathlib import Path
 from app import entry
 from app.core.qt import QtCore
 from app.core.settings import Settings
+from app.gauge.protocol import LineDemux
 
 __all__ = ["WorkerRunner"]
 
 
 class WorkerRunner(QtCore.QObject):
-    """ワーカー（計測 / キャリブレーション）の起動・停止と、出力の中継。"""
+    """ワーカー（計測 / キャリブレーション）の起動・停止と、出力の中継。
+
+    子（計測・demo・script いずれも）が標準出力に書く行は、``@@GAUGE `` で始まる
+    ゲージの行（app.gauge.protocol）と、従来どおりの普通のログ行が混ざる。
+    ``LineDemux`` で両者を解き、ゲージの行は ``gauge_frame`` シグナルへ、
+    残りは ``output`` シグナルへ流す。GUI 側のログ表示（行数に上限がある）へ
+    30Hz のフレームをそのまま混ぜると、あっという間に埋まってしまうため。
+    """
 
     output = QtCore.Signal(str)
+    gauge_frame = QtCore.Signal(object)  # app.gauge.protocol.GaugeFrame
     state_changed = QtCore.Signal(str)  # "starting" / "running" / "stopped"
     finished = QtCore.Signal(int)  # 終了コード
 
@@ -54,6 +63,9 @@ class WorkerRunner(QtCore.QObject):
         self._process.errorOccurred.connect(self._on_error)
         # 停止要求のファイルを置くディレクトリ。実行ごとに作り直すので前回の残りを考えなくてよい
         self._stop_dir: str | None = None
+        # 子の標準出力から、ゲージの行と普通のログ行を解く。start のたびにリセットする
+        # （前回の実行の、改行が来ないまま終わった断片を次の実行に持ち越さないため）。
+        self._demux = LineDemux()
 
     # -- 操作 --------------------------------------------------------------
     @property
@@ -76,6 +88,8 @@ class WorkerRunner(QtCore.QObject):
         if self.is_running:
             self.output.emit("[警告] 既に動いています。\n")
             return False
+
+        self._demux.reset()
 
         command = entry.worker_command(self.role, passthrough, module=module)
         # 穏やかな停止に対応するワーカーへ停止ファイルを渡す。
@@ -146,13 +160,34 @@ class WorkerRunner(QtCore.QObject):
 
     def _drain_output(self) -> None:
         data = self._process.readAllStandardOutput()
-        text = bytes(data).decode("utf-8", errors="replace")
-        if text:
-            self.output.emit(text)
+        self._handle_bytes(bytes(data))
 
-    def _on_finished(self, exit_code: int, _status) -> None:
+    def _handle_bytes(self, data: bytes) -> None:
+        """子の出力の塊を ``LineDemux`` で解き、ログとゲージの行に振り分ける。
+
+        試験から直接呼べるよう、実プロセスの読み取り（``_drain_output``）から
+        切り出してある。
+        """
+        log_text, frames = self._demux.feed(data)
+        if log_text:
+            self.output.emit(log_text)
+        for frame in frames:
+            self.gauge_frame.emit(frame)
+
+    def _on_finished(self, exit_code: int, exit_status) -> None:
         self._drain_output()
+        # 改行が来ないまま終わった行の断片（あれば）も、最後にログへ出す。
+        tail = self._demux.flush()
+        if tail:
+            self.output.emit(tail)
         self._remove_stop_dir()
+
+        # QProcess の exitStatus が CrashExit（異常終了）なら、終了コードを
+        # 0（正常終了）のまま扱わない。子は途中で落ちても運が良ければ 0 を残す
+        # ことがあるため（例: シグナルで死ぬ前に終了コードの初期値が 0 のまま）。
+        if exit_status == QtCore.QProcess.CrashExit and exit_code == 0:
+            exit_code = 1
+
         self.output.emit(f"[終了] 終了コード {exit_code}\n")
         self.state_changed.emit("stopped")
         self.finished.emit(exit_code)
