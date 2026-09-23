@@ -12,8 +12,10 @@
 - 計測側がクラッシュしても GUI が生き残る
 - OpenCV や matplotlib のウィンドウ管理が GUI と干渉しない
 
-代償は、ゲージと映像が子プロセス側のウィンドウとして出ること。
-将来 GUI 側に取り込むなら、子が標準出力に JSON Lines を吐く経路を足す。
+代償は、ゲージと映像が子プロセス側のウィンドウとして出ること。混成の経路
+（``hybrid_measure``）では、子が標準出力に ``@@GAUGE`` の行（``app.gauge.protocol``）を
+書き、ここで ``LineDemux`` がログの行と分けて ``gauge_frame`` に出す。被験者ゲージは
+GUI 側の窓（``app.gauge.window``）で描く。
 
 キャリブレーションも同じ仕組みで動かす。calib.py の撮影フェーズは対話式の
 ``cv.imshow`` + ``waitKey`` で、macOS では GUI 操作がメインスレッド必須のため、
