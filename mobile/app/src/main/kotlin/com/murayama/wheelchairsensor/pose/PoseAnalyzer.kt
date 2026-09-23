@@ -1,6 +1,7 @@
 package com.murayama.wheelchairsensor.pose
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
@@ -20,9 +21,14 @@ import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
  *
  * 映像そのものは送らない。33 点のランドマークだけなら 1 フレーム約 600 バイトで、
  * 30fps でも 18 KB/s に収まる。PC 側は映像のデコードが不要になる。
+ *
+ * 例外は撮影要求（校正とライブ表示）。[captureSink] には、推論に渡す直前のフレームを
+ * **人が写っているかに関係なく**毎フレーム渡す（チェッカーボードだけを写す場面があるため）。
+ * 渡された側は、応えるべき要求があるときだけ手元に写しを取る。
  */
 class PoseAnalyzer(
     context: Context,
+    private val captureSink: ((bitmap: Bitmap, captureDeviceNanos: Long) -> Unit)? = null,
     private val onResult: (Detection) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
@@ -96,6 +102,15 @@ class PoseAnalyzer(
             // ここに届く時点で既に正立している。
             val bitmap = image.toBitmap()
             val timestampMs = captureNanos / 1_000_000
+
+            // 推論と同じフレームで撮影要求に応える。失敗しても推論は続ける
+            captureSink?.let { sink ->
+                try {
+                    sink(bitmap, captureNanos)
+                } catch (e: Exception) {
+                    Log.w(TAG, "撮影要求を処理できませんでした", e)
+                }
+            }
 
             synchronized(pendingFrames) {
                 pendingFrames[timestampMs] =

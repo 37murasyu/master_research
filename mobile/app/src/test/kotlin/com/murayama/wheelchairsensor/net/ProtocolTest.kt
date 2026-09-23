@@ -106,4 +106,77 @@ class ProtocolTest {
         assertTrue(!Protocol.isValidRole("cam9"))
         assertTrue(!Protocol.isValidRole(null))
     }
+
+    // -- 端末 ID ------------------------------------------------------------
+    @Test
+    fun `hello に端末 ID を載せられる`() {
+        val json = JSONObject(Protocol.hello("cam1", "Pixel 7a", "abc123", deviceId = "0f3a9c"))
+        assertEquals("0f3a9c", json.getString("device_id"))
+    }
+
+    @Test
+    fun `端末 ID が無ければ項目ごと送らない`() {
+        // PC 側は device_id を「省略可能な文字列」として読む。null を送ると型違いで弾かれる。
+        assertTrue(!JSONObject(Protocol.hello("cam1", "Pixel 7a", "abc123")).has("device_id"))
+    }
+
+    // -- 撮影要求 -----------------------------------------------------------
+    @Test
+    fun `電文の種類を取り出せる`() {
+        assertEquals("capture_req", Protocol.messageType("""{"type":"capture_req","id":1}"""))
+        assertEquals(null, Protocol.messageType("これはJSONではない"))
+        assertEquals(null, Protocol.messageType("{}"))
+    }
+
+    @Test
+    fun `撮影要求を読み取れる`() {
+        val raw = """{"type":"capture_req","id":9,"at_ns":1725699123456789000,"max_width":640,"quality":70}"""
+        val request = Protocol.parseCaptureRequest(raw)!!
+        assertEquals(9L, request.id)
+        assertEquals(1_725_699_123_456_789_000L, request.atNanosPcClock)
+        assertEquals(640, request.maxWidth)
+        assertEquals(70, request.quality)
+    }
+
+    @Test
+    fun `撮影要求の省略可能な項目は null になる`() {
+        val request = Protocol.parseCaptureRequest("""{"type":"capture_req","id":8}""")!!
+        assertEquals(8L, request.id)
+        assertEquals(null, request.atNanosPcClock)
+        assertEquals(null, request.maxWidth)
+        assertEquals(null, request.quality)
+    }
+
+    @Test
+    fun `不正な撮影要求は null を返して落ちない`() {
+        assertEquals(null, Protocol.parseCaptureRequest("""{"type":"capture_req"}"""))
+        assertEquals(null, Protocol.parseCaptureRequest("""{"type":"capture_req","id":1,"max_width":0}"""))
+        assertEquals(null, Protocol.parseCaptureRequest("""{"type":"capture_req","id":1,"quality":101}"""))
+        assertEquals(null, Protocol.parseCaptureRequest("""{"type":"sync_res","t1":1,"t2":2,"t3":3}"""))
+        assertEquals(null, Protocol.parseCaptureRequest("これはJSONではない"))
+    }
+
+    // -- 校正用の画像 -------------------------------------------------------
+    @Test
+    fun `校正用の画像の電文が PC 側の想定する形になっている`() {
+        val jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte())
+        val json = JSONObject(
+            Protocol.calibrationFrame(
+                role = "cam1",
+                id = 9L,
+                captureNanosPcClock = 1_725_699_123_456_789_000L,
+                width = 640,
+                height = 360,
+                jpeg = jpeg,
+            )
+        )
+        assertEquals("calib_frame", json.getString("type"))
+        assertEquals("cam1", json.getString("role"))
+        assertEquals(9L, json.getLong("id"))
+        assertEquals(1_725_699_123_456_789_000L, json.getLong("t_capture_ns"))
+        assertEquals(640, json.getInt("w"))
+        assertEquals(360, json.getInt("h"))
+        // PC 側は base64.b64decode(validate=True) で読む。改行や URL 用の文字を混ぜない
+        assertEquals("/9j/2Q==", json.getString("jpeg"))
+    }
 }

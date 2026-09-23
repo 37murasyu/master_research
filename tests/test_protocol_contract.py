@@ -47,6 +47,22 @@ def test_hello_carries_role_and_session():
     assert decoded.session
 
 
+def test_hello_can_carry_the_device_id():
+    """校正時の端末と照合するための ID。Kotlin 側が省略可能な項目として送れること。"""
+    hellos = [p.decode(m) for m in _messages() if json.loads(m).get("type") == "hello"]
+    assert any(h.device_id for h in hellos), "device_id 付きの hello が見本に無い"
+    assert any(h.device_id is None for h in hellos), "古い形（device_id 無し）も読めること"
+
+
+def test_calibration_frame_from_the_phone_decodes():
+    """撮影要求への応答。base64 の字母と JPEG の先頭（FF D8）の検査を通ること。"""
+    raw = next(m for m in _messages() if json.loads(m).get("type") == "calib_frame")
+    frame = p.decode(raw)
+    assert isinstance(frame, p.CalibrationFrame)
+    assert frame.jpeg.startswith(b"\xff\xd8")
+    assert (frame.width, frame.height) == (640, 360)
+
+
 def test_sync_request_timestamp_is_an_integer():
     """浮動小数になっていると 2^53 を超えた時点でナノ秒の精度が落ちる。"""
     raw = next(m for m in _messages() if json.loads(m).get("type") == "sync_req")

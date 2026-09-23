@@ -107,6 +107,12 @@ class CameraSetup(
                     CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                     CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
                 )
+                // 光学式の手ブレ補正はレンズや撮像素子を動かし、光学中心（K の cx, cy）が
+                // フレームごとにずれる。電子式だけ切っても残るので、こちらも切る。
+                .setCaptureRequestOption(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF,
+                )
         } catch (e: Exception) {
             Log.w(TAG, "光学系の固定に一部失敗しました。精度が落ちる可能性があります。", e)
         }

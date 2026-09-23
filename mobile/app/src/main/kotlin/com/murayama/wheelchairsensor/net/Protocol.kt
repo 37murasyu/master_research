@@ -1,5 +1,6 @@
 package com.murayama.wheelchairsensor.net
 
+import okio.ByteString.Companion.toByteString
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -28,14 +29,21 @@ object Protocol {
 
     fun isValidRole(role: String?): Boolean = role in ROLES
 
-    /** 接続時の名乗り。 */
-    fun hello(role: String, device: String, session: String): String =
+    /**
+     * 接続時の名乗り。
+     *
+     * @param deviceId 端末ごとに変わらない識別子。同じ機種を 2 台使うと [device] はどちらも
+     *   "Google Pixel 7a" になり、PC 側は校正時の端末と照合できない。null なら項目ごと送らない
+     *   （PC 側は「省略可能な文字列」として読むので、null を送ると型違いで弾かれる）。
+     */
+    fun hello(role: String, device: String, session: String, deviceId: String? = null): String =
         JSONObject().apply {
             put("type", "hello")
             put("v", VERSION)
             put("role", role)
             put("device", device)
             put("session", session)
+            if (deviceId != null) put("device_id", deviceId)
         }.toString()
 
     /** 時刻同期の要求。t1 は端末の単調時計。 */
@@ -90,6 +98,80 @@ object Protocol {
 
     private fun round5(value: Float): Double =
         Math.round(value.toDouble() * 100_000.0) / 100_000.0
+
+    /**
+     * 撮影要求への応答。姿勢推定に使っているのと同じフレームを JPEG にしたもの。
+     *
+     * base64 は標準の字母・パディングあり・改行なし。PC 側は `base64.b64decode(validate=True)`
+     * で読むので、URL 用の字母や改行を混ぜると弾かれる。android.util.Base64 は JVM の
+     * ユニットテストで動かず、java.util.Base64 は API 26 からなので、OkHttp が持つ okio を使う。
+     *
+     * @param captureNanosPcClock **PC 時計に補正済み**の撮影時刻。
+     * @param width JPEG の幅（縮小した場合は縮小後の寸法）。
+     */
+    fun calibrationFrame(
+        role: String,
+        id: Long,
+        captureNanosPcClock: Long,
+        width: Int,
+        height: Int,
+        jpeg: ByteArray,
+    ): String =
+        JSONObject().apply {
+            put("type", "calib_frame")
+            put("role", role)
+            put("id", id)
+            put("t_capture_ns", captureNanosPcClock)
+            put("w", width)
+            put("h", height)
+            put("jpeg", jpeg.toByteString().base64())
+        }.toString()
+
+    /** 受信した電文の種類。JSON として読めなければ null。 */
+    fun messageType(raw: String): String? =
+        try {
+            JSONObject(raw).optString("type").ifEmpty { null }
+        } catch (_: Exception) {
+            null
+        }
+
+    /**
+     * PC からの撮影要求。想定外・不正なら null（1 通で計測を止めない）。
+     *
+     * 値の範囲は PC 側 `protocol.py` の検査と同じにしてある。
+     */
+    fun parseCaptureRequest(raw: String): CaptureRequest? {
+        return try {
+            val json = JSONObject(raw)
+            if (json.optString("type") != "capture_req" || !json.has("id")) return null
+            val maxWidth = if (json.has("max_width")) json.getInt("max_width") else null
+            val quality = if (json.has("quality")) json.getInt("quality") else null
+            if (maxWidth != null && maxWidth <= 0) return null
+            if (quality != null && quality !in 1..100) return null
+            CaptureRequest(
+                id = json.getLong("id"),
+                atNanosPcClock = if (json.has("at_ns")) json.getLong("at_ns") else null,
+                maxWidth = maxWidth,
+                quality = quality,
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * PC → 端末の撮影要求。
+     *
+     * @param atNanosPcClock PC 時計での目標撮影時刻。null なら次のフレーム。
+     * @param maxWidth これより幅が大きければ縮めて返す（ライブ表示用）。null なら全解像度。
+     * @param quality JPEG の画質。null なら端末の既定（校正用）。
+     */
+    data class CaptureRequest(
+        val id: Long,
+        val atNanosPcClock: Long?,
+        val maxWidth: Int?,
+        val quality: Int?,
+    )
 
     /** PC からの応答。想定外の電文なら null。 */
     fun parseSyncResponse(raw: String): SyncResponse? {
