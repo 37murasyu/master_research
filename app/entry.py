@@ -25,7 +25,7 @@ from pathlib import Path
 
 from app.core import resources, workspace
 from app.core.platform_compat import user_output_dir
-from app.core.settings import APP_NAME, Settings
+from app.core.settings import APP_NAME, OUTPUT_DIR_ENV, Settings, measurement_output_dir
 from app.core.stop_request import STOP_FILE_ENV
 
 __all__ = [
@@ -148,10 +148,13 @@ def worker_environment(
 
     ``stop_file`` は停止要求のファイルのパス（``app.core.stop_request``）。親の環境に
     残った古い値を引き継がないよう、渡さないときは消す。
+
+    計測の CSV は、GUI が「出力先」と表示している場所に書かせる（``OUTPUT_DIR``、config.save_dir が読む）。
     """
     env = dict(os.environ)
     env.update(settings.as_env())
     env["APP_ROLE"] = role
+    env[OUTPUT_DIR_ENV] = str(measurement_output_dir())
     env.pop(STOP_FILE_ENV, None)
     if stop_file:
         env[STOP_FILE_ENV] = str(stop_file)
@@ -197,4 +200,3 @@ def run_worker(
         return 0
     finally:
         sys.argv = argv_backup
-

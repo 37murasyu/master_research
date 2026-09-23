@@ -21,11 +21,23 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from app.core.platform_compat import user_config_dir
+from app.core.platform_compat import user_config_dir, user_output_dir
 
-__all__ = ["Setting", "Settings", "SCHEMA", "APP_NAME"]
+__all__ = ["Setting", "Settings", "SCHEMA", "APP_NAME", "OUTPUT_DIR_ENV", "measurement_output_dir"]
 
 APP_NAME = "WheelchairTorque"
+
+# 計測の CSV の置き場を GUI からワーカーへ伝える環境変数（config.save_dir が読む）。設定画面の項目ではない
+OUTPUT_DIR_ENV = "OUTPUT_DIR"
+
+
+def measurement_output_dir() -> Path:
+    """計測（master_research_code.py）の CSV の置き場。GUI の表示・解析の既定の入力フォルダ・ワーカーへの
+    受け渡しは、すべてここから取る（かつて表示と実際が食い違っていた。tests/test_output_dir.py）。
+
+    凍結アプリのワークスペース（同じ ``user_output_dir``）の ``output_data`` と同じ場所。
+    """
+    return user_output_dir(APP_NAME) / "output_data"
 
 _SCHEMA_FILE = Path(__file__).with_name("settings_schema.json")
 

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from app.core.platform_compat import user_output_dir
 from app.core.qt import QtWidgets
-from app.core.settings import APP_NAME, Settings
+from app.core.settings import Settings, measurement_output_dir
 from app.hybrid import paths as hybrid_paths
 from app.shell.widgets import RunnerPage, SettingsForm
 
@@ -76,7 +75,7 @@ class MeasurePage(RunnerPage):
 
     def _refresh_output_label(self) -> None:
         destination = (hybrid_paths.measurement_root()
-                       if self._runner.role == "hybrid_measure" else user_output_dir(APP_NAME))
+                       if self._runner.role == "hybrid_measure" else measurement_output_dir())
         text = f"出力先: {destination}"
         changed = self._settings.overrides
         if changed:

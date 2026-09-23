@@ -185,8 +185,11 @@ if _ts_override:
         timestamp = datetime.now().strftime("%m%d_%H%M%S")
 else:
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
-# 保存フォルダ（必要に応じて変更）
-save_dir = "output_data"
+# 保存フォルダ。GUI は「出力先」と表示している場所（app.core.settings.measurement_output_dir）を環境変数
+# OUTPUT_DIR で渡す。GUI を通さずに起動したときは、従来どおり作業フォルダの output_data。
+# 名前を定数に入れるのは、設定画面の項目（tools/extract_env_schema.py が拾う）にしないため
+_OUTPUT_DIR_ENV = "OUTPUT_DIR"
+save_dir = os.environ.get(_OUTPUT_DIR_ENV, "").strip() or "output_data"
 os.makedirs(save_dir, exist_ok=True)
 # ウィンドウ名
 win_main = "MainMonitor"

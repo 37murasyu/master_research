@@ -14,9 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.core.platform_compat import user_output_dir
 from app.core.qt import QtWidgets
-from app.core.settings import APP_NAME, Settings
+from app.core.settings import Settings, measurement_output_dir
 from app.shell.widgets import RunnerPage
 
 __all__ = ["AnalyzePage"]
@@ -151,7 +150,7 @@ class AnalyzePage(RunnerPage):
         layout.addLayout(run_row)
 
         note = QtWidgets.QLabel(
-            f"出力先: {user_output_dir(APP_NAME)}\n"
+            f"計測の出力先（入力の既定の場所）: {measurement_output_dir()}\n"
             "※ 解析の計算内容は既存スクリプトのままです。"
         )
         note.setWordWrap(True)
@@ -171,7 +170,7 @@ class AnalyzePage(RunnerPage):
 
     def _browse(self) -> None:
         task = self._current_task
-        start = self._input_edit.text() or str(user_output_dir(APP_NAME))
+        start = self._input_edit.text() or str(measurement_output_dir())
         if task.input_kind == "file":
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "入力ファイルを選択", start)
         else:
