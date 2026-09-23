@@ -161,3 +161,15 @@ def test_a_missing_one_rm_table_gives_no_band(fakes, capsys, monkeypatch, tmp_pa
     last = protocol.decode(_gauge_lines(captured.out)[-1])
     assert all(reading.band is None for reading in last.parts.values())
     assert "1RM" in captured.err
+
+
+def test_the_demo_moves_the_gauge_without_torque(fakes, capsys, monkeypatch):
+    """``DEMO_MONO_GAUGE_ON=1``（GUI の既定は 0）なら、3D の肩の上昇と肘角の変化で針を動かし、行の source を demo にする。"""
+    monkeypatch.setenv("DEMO_MONO_GAUGE_ON", "1")
+    assert hybrid_measure.main(["--calibration", str(fakes.directory)]) == 0
+    captured = capsys.readouterr()
+    frames = [protocol.decode(line) for line in _gauge_lines(captured.out)]
+    assert all(frame.source == "demo" for frame in frames)
+    assert max(f.parts["elbow_R"].now or 0.0 for f in frames) > 1.0
+    folder = next(line.split("保存: ", 1)[1] for line in captured.out.splitlines() if line.startswith("保存: "))
+    assert json.loads((Path(folder) / "meta.json").read_text(encoding="utf-8"))["demo"] is True

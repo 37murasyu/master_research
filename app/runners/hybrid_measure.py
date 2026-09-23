@@ -24,6 +24,7 @@ from app.hybrid.mac_camera import MacCamera, default_camera_index
 from app.hybrid.measurement import MeasurementSession
 from app.hybrid.pose_detector import PoseDetector
 from app.runners.hybrid_preview import poll_window
+from app.hybrid.demo_gauge import DemoConfig
 from app.hybrid.ekf import EkfSettings
 from energy_pipeline import EnergyFilterConfig
 from app.hybrid.gravity import candidate_axes
@@ -81,6 +82,7 @@ def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementCon
         dyn_gate=_flag("HYBRID_DYN_GATE", True),
         ekf=EkfSettings.from_env(),
         energy_filter=EnergyFilterConfig.from_env(),
+        demo=DemoConfig.from_env() if _flag("DEMO_MONO_GAUGE_ON", False) else None,
     )
 
 
@@ -129,11 +131,12 @@ def main(argv=None):
             stack.callback(camera.close)
             detector = PoseDetector()
             stack.callback(detector.close)
-            tracker = GaugeTracker(source="measure")
+            config = measurement_config(args.body_mass, args.gravity_mode)
+            tracker = GaugeTracker(source="demo" if config.demo is not None else "measure")
             ticker = GaugeTicker(tracker)
             measurement = MeasurementSession(
                 calibration,
-                config=measurement_config(args.body_mass, args.gravity_mode),
+                config=config,
                 metadata={
                     "cam0_offset_ms": args.cam0_offset_ms,
                     "preview_hz": args.preview_hz,

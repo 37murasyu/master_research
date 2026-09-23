@@ -81,6 +81,7 @@ from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transfor
 from energy_pipeline import AdaptiveCutoff, EnergyFilterConfig, angle_between, compute_cycle_energy_filtered
 
 from app.gauge.thresholds import PartBand, part_bands
+from app.hybrid.demo_gauge import DemoConfig, DemoGauge
 from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
 from app.hybrid.gravity import GravityChoice, choose_gravity
 from app.hybrid.rep_detector import RepConfig, RepDetector, RepEvent
@@ -165,6 +166,9 @@ class MeasurementConfig:
     rep: RepConfig = field(default_factory=RepConfig)
     # 力学の関所（HYBRID_DYN_GATE）。偽なら常に開いた扱い（回の区切りは RepDetector のまま）
     dyn_gate: bool = True
+    # デモ（DEMO_MONO_GAUGE_ON=1）。None でなければ、ゲージの now をトルクではなく 3D の肩の上昇と肘角の変化で
+    # 動かす（app.hybrid.demo_gauge）。回の区切り・トルク・記録は今までどおり
+    demo: DemoConfig | None = None
     # 肘の濾波 E± の前処理（energy_pipeline、USB の E_*）。計測の子は EnergyFilterConfig.from_env() を渡す
     energy_filter: EnergyFilterConfig = field(default_factory=EnergyFilterConfig)
     # 腕の長さの安全策: 先頭の窓の上腕長・前腕長（中央値）から、この比を超えてずれた腕の仕事率を回とゲージに
@@ -271,6 +275,7 @@ class NetworkMeasurement:
         self._duration_max = 0.0
         self._timed = 0
 
+        self._demo = None if self.config.demo is None else DemoGauge(self.config.demo)
         # 肘の濾波 E± の適応カットオフ（E_FC_ADAPTIVE_ON=1 のときだけ動く）。毎フレーム左右の肘角の平均を渡す
         self._cutoff = AdaptiveCutoff(self.config.energy_filter, fps=30.0)
 
@@ -388,6 +393,8 @@ class NetworkMeasurement:
                     WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y), result.arm_ok)
             self._gate(points, velocity, dt, sample, result)
 
+        if self._demo is not None and self.tracker is not None and self.window_closed:
+            self.tracker.set_now(self._demo.update(points, self.up, self.bands))
         result.gauge_now = self._gauge_now()
         self.frame_index += 1
         self._append_result(result)
@@ -480,6 +487,7 @@ class NetworkMeasurement:
             },
             "ekf": self.ekf_provenance(),
             "dyn_gate": self.config.dyn_gate,
+            "demo": self._demo is not None,
             "baseline_height_m": self.baseline_height_m,
             "reps": self.cycle_count,
             "discarded_reps": self.discarded_reps,
@@ -761,7 +769,7 @@ class NetworkMeasurement:
         return {part: work[part].pos for part in GAUGE_PARTS}
 
     def _feed_tracker(self, sample: WorkSample) -> None:
-        if self.tracker is None:
+        if self.tracker is None or self._demo is not None:
             return
         for part in self.tracker.parts:
             power = sample.powers.get(part)
