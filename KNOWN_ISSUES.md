@@ -763,3 +763,22 @@ R-1〜R-4・R-6 は表示に効く。USB 経路（`master_research_code.py`）�
 説明がつく。図を作ったスクリプトはリポジトリに見つからない。
 
 あわせて: `config.EFFECTIVE_MASS_COEFFS` の「上肢」（0.276 + 0.19）は、実際には体幹（上胴体＋下胴体）の値。
+
+## 混成ステレオ経路の申し送り（2026-09-23）
+
+- `app.hybrid` と `app.runners.hybrid_*` は Mac 内蔵カメラ＋Pixel 1 台用。T は cm、3D 出力は m。
+  `calib.py` の m 出力とは混ぜない。USB 経路の単位修正・歪み補正は別作業。
+- Android の時刻は analyze 開始、Mac は grab 直後であり、センサ露光時刻ではない。
+  `--cam0-offset-ms` と生 2D の記録は実装済み。センサ timestamp / AVFoundation PTS の採用、
+  エピポーラ誤差を使った ±100 ms の遅延走査は未実装。
+- axis 重力では Mac カメラが水平である前提。天板を鉛直に固定する。
+  床上の盤や Pixel 加速度による重力基準の決定は未実装。
+- Android の自動再接続は未実装。校正→計測のたびに新しい QR を読む。
+  横向きの切断ボタン欠け、QR 案内文が解像度表示で上書きされる点は残る。
+- 混成 3D の EKF・LPF、Qt 内への映像埋め込み、Mac の露出固定、配布・CI は対象外。
+- phone-path の workdir/events/control と StopRequest の統合は別作業。
+- release 鍵、`mobile/local.properties`、`keystore.properties`、`keystore/` は Git 管理外。
+  同じ release 鍵を保ち、別 worktree では設定をコピーする。鍵のバックアップが必要。
+- 実機の校正精度、表示負荷、計測精度はまだ未検証。実施手順と閾値は `mobile/README.md` を参照。
+- 切断で受信統計がゼロに戻る既存不具合を修正。WebSocket 終了待ちは 0.5 秒に制限し、
+  混成の writer はサーバ停止→drain→計算→close を同じ受信スレッドで実行する。

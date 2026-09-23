@@ -8,6 +8,41 @@
 
 ---
 
+## 2026-09-23 Codex 実装状況
+
+以下の原計画に対し、段階 3 の MainActivity 配線、段階 2・4・5・6・7 のコードと自動テストを追加した。
+作業場所は `master_research-hybrid` / `murayama/hybrid-stereo`。コミット・push は行っていない。
+
+- Android: ID ハッシュ、capture_req 受信から JPEG 応答までの配線、画像送信数表示。release APK ビルド成功。
+- PC: VIDEO 推定・左右表示・QR、校正関数と収集ランナー、内部パラメータキャッシュ、cm 単位の保存。
+- 計測: 歪み補正、ID 照合、解像度の破棄・終了、逐次 CSV、停止時の drain/close。
+- GUI: 混成入力の選択、停止ファイル経由の終了。操作手順は `mobile/README.md`。
+- 最終検証: Python `pytest tests -q` は **572 passed, 1 skipped**（既存の protobuf 非推奨警告 2 件）。
+  Kotlin は **35 tests, 0 failures**。`:app:assembleRelease` 成功。
+  実際の MediaPipe VIDEO モデル起動と空画像推論、3 CLI の `--help`、ruff の未定義名検査、`git diff --check` も成功。
+- 追加で修正: 切断時の受信統計消失、古い撮影モードの遅延 JPEG が校正へ混入する競合。
+- 残作業: Pixel を接続して release 版をインストールし、原計画の実機完了条件を確認する。
+  このセッションでは `adb devices` に端末がなく、インストール・実機の向き合わせ・盤撮影・精度評価は未実施。
+
+### 2026-09-23 レビュー（Claude Code）で直したこと
+
+Codex の実装をレビューし、次を直してからコミットした（Python 582 件成功・1 件スキップ、Kotlin 35 件成功）。
+
+- 校正ランナー: 壊れた JPEG・Pixel の寸法変化・推定の失敗で例外になり、集めた盤が消えていた → 盤集めをやり直す。
+  `LiveSession.step` は復号できた画像だけを返し、ランナーと収集器は復号・盤検出の結果を使い回す（二重検出もなくした）
+- 内部パラメータのキャッシュ: カメラ番号は Camo などで入れ替わるのに、合わないキャッシュでも警告だけで保存していた
+  → 今回の画像への再投影誤差が 1.5 px を超えたら捨てて求め直す（`CACHE_TOLERANCE_PX`）
+- 歪み補正: 画像の端の内側の点が補正で負の座標になり、OpenCV 側の三角測量（macOS では常にこちら）で消えていた
+  → 補正後の座標と射影行列を同じだけ平行移動。画像の外は 10% の余白まで補正する
+- 計測: Pixel が一度も繋がらなくても計測フォルダ（中身の無い「完了」）ができていた → Pixel の点が届いてから記録する
+- `CAM0` に動画のパスなどが入っていると起動時に落ちていた（`BODY_MASS_KG` も同様）→ 数でなければ既定値
+- 出力先の重複を `app/hybrid/paths.py` にまとめた。`close_timeout=0.5` はサーバ全体ではなく `PhoneLink` だけに
+- Android: `ANDROID_ID` が取れないと接続の瞬間に落ちた → ID を付けずに名乗る
+
+以下は引き継ぎ原文（「未コミット」「残り」は作成当時の状態）。
+
+---
+
 ## 0. 背景と決まっていること
 
 - 計測の構成は **Pixel 7a 1 台＋MacBook Air M1 の内蔵カメラ（FaceTime HD 720p）**。
