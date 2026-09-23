@@ -32,6 +32,8 @@ class MeasurePage(RunnerPage):
         # 選択ではなくこちらで決める。
         self._run_role: str | None = None
         super().__init__(settings, "realtime", parent)
+        # 見せるかどうかは、ページに入ってから決める（親の無いうちに見せると独立の窓になる）。
+        self._joules_switch.setVisible(self._runner.role == _HYBRID_ROLE)
 
         self._runner.gauge_frame.connect(self._gauge_window.set_frame)
         self._runner.finished.connect(self._on_finished)
@@ -41,7 +43,6 @@ class MeasurePage(RunnerPage):
         self._joules_switch = ToggleSwitch("J の数値")
         self._joules_switch.setChecked(bool(self._settings.get("GAUGE_SHOW_JOULES")))
         self._joules_switch.toggled.connect(self._on_joules_toggled)
-        self._joules_switch.setVisible(self._runner.role == _HYBRID_ROLE)
 
         self._main_button = QtWidgets.QPushButton("計測を開始")
         self._main_button.clicked.connect(self._on_main_button)
