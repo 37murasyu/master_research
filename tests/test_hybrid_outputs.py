@@ -104,3 +104,42 @@ class TestMeta:
         assert meta["gravity"]["vector"] == pytest.approx([0.0, 0.0, -9.81])
         assert meta["output_schema_version"] == 2
         assert meta["reps"] == 1
+
+
+class TestRawCapture:
+    """EKF の較正（``tune_ekf``）にそのまま使える生 3D。名前は USB と同じ ``kpts3d_raw_<stamp>.csv``。"""
+
+    DROP = {50, 51, 52, 53}
+
+    def test_the_raw_capture_is_on_the_grid_with_nan_rows(self, tmp_path):
+        session, _ = _session(tmp_path, drop=self.DROP)
+        capture = read_raw_capture(_file(session, "kpts3d_raw"))
+        assert capture.landmark_ids == tuple(IDS)
+        n = int(round(PushUp(reps=1).duration_s * 30))
+        np.testing.assert_array_equal(capture.frame, np.arange(n)), "抜けた格子も行がある"
+        np.testing.assert_allclose(np.diff(capture.t), 1 / 30, rtol=1e-6)
+        for k in self.DROP:
+            assert np.isnan(capture.points[k]).all()
+        assert np.isfinite(capture.points[49]).all() and np.isfinite(capture.points[54]).all()
+
+    def test_the_sidecar_names_the_source_and_the_ekf(self, tmp_path):
+        session, _ = _session(tmp_path)
+        meta = read_raw_capture(_file(session, "kpts3d_raw")).provenance
+        assert (meta["source"], meta["times"], meta["unit"], meta["frame"]) == ("hybrid", "grid", "m", "runtime")
+        assert meta["dt"] == pytest.approx(1 / 30)
+        assert meta["ekf_noise"]["origin"] == "builtin"
+        assert meta["EKF_ENABLE"] is True and meta["EKF_ROBUST_GATE"] is True
+        assert meta["HYBRID_EKF_PROFILE"] is None
+        # 先頭の窓が閉じたときに書き足す
+        assert meta["ekf_run_length_m"] == pytest.approx(0.28, abs=0.01)
+        assert meta["gravity_label"] == "Z-"
+        assert meta["gravity"] == pytest.approx([0.0, 0.0, -9.81])
+
+    def test_the_raw_values_are_before_the_ekf(self, tmp_path):
+        session, _ = _session(tmp_path)
+        capture = read_raw_capture(_file(session, "kpts3d_raw"))
+        kpts = pd.read_csv(_file(session, "kpts3d")).drop(columns="frame").to_numpy(float)
+        raw = capture.points.reshape(len(capture.points), -1)
+        assert raw.shape == kpts.shape
+        assert not np.allclose(raw, kpts, atol=1e-9), "EKF の後の値と同じになっている"
+        assert np.nanmax(np.abs(raw - kpts)) < 0.05

@@ -1,6 +1,7 @@
 """Incremental measurement writer. Construct and call only on the receiver loop thread."""
 
 import csv
+import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
@@ -8,6 +9,10 @@ import threading
 import time
 from app.hybrid.calibration_io import FILES, write_json
 from app.hybrid.paths import measurement_root
+from app.tuning.raw_capture import RawCaptureWriter
+
+# 同期バッファの格子（30 Hz）[ns]。生 3D の frame は格子の番号
+_GRID_NS = 33_333_333
 
 
 def _cycle_columns(result, key):
@@ -30,6 +35,7 @@ class Recorder:
         root=None,
         metadata=None,
         clock=time.monotonic,
+        raw_provenance=None,
     ):
         self._owner = threading.get_ident()
         self.clock = clock
@@ -96,6 +102,14 @@ class Recorder:
         self.torques = writer("local_torque", ["frame", "t_ns", "joint", "x", "y", "z"])
         # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）
         self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score"])
+        # EKF の手前の生 3D（EKF の較正 tune_ekf の入力）。1/30 s の格子で、抜けた格子は NaN の行で埋める
+        # （行を詰めると dt 一定の前提が崩れる）。raw_provenance が無ければ書かない（EKF を通さない記録）
+        self.raw3d = None
+        self._raw_ids = sorted(pose_keypoints)
+        self._raw_next = 0
+        if raw_provenance is not None:
+            self.raw3d = RawCaptureWriter(self.directory / f"kpts3d_raw_{stamp}.csv", self._raw_ids,
+                                          provenance=raw_provenance)
         write_json(self.directory / "meta.json", self.meta)
         self.flush(force=True)
 
@@ -121,10 +135,31 @@ class Recorder:
         )
         self.flush()
 
+    def note_raw(self, **fields):
+        """生 3D のサイドカーに、先頭の窓で決まった値（体格の比・重力など）を書き足す。"""
+        self._check()
+        if self.raw3d is not None:
+            self.raw3d.note(**fields)
+
+    def _append_raw(self, result):
+        raw = getattr(result, "points_raw", None)
+        if self.raw3d is None or raw is None:
+            return
+        grid = int(getattr(result, "grid_index", self._raw_next))
+        blank = np.full((len(self._raw_ids), 3), np.nan)
+        while self._raw_next < grid:
+            self.raw3d.append(self._raw_next, self._raw_next * _GRID_NS / 1e9, blank)
+            self._raw_next += 1
+        if grid < self._raw_next:
+            return  # 格子が戻った（起こらないはず）。書かない
+        self.raw3d.append(grid, (result.t_ns - self._first_ns) / 1e9, raw)
+        self._raw_next = grid + 1
+
     def record(self, result):
         self._check()
         if self._first_ns is None:
             self._first_ns = result.t_ns
+        self._append_raw(result)
         self.points.writerow([self.frames, *result.points_3d.ravel()])
         arm_ok = getattr(result, "arm_ok", None) or {}
         self.times.writerow(
@@ -167,6 +202,8 @@ class Recorder:
         self.flush(force=True)
         for stream in self._streams:
             stream.close()
+        if self.raw3d is not None:
+            self.raw3d.close()
         self.meta.update(
             status="complete",
             ended_at=datetime.now(timezone.utc).isoformat(),
