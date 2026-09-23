@@ -369,6 +369,13 @@ def build_scene(state: gm.GaugeState, *, spinner_phase: float = 0.0) -> Scene:
             labels.append(_band_label(cx, cy, fl, lo_text, part))
             labels.append(_band_label(cx, cy, fh, hi_text, part))
 
+        # DONE は今回値に関係なく前回の目盛りだけ残す（最後のフレームで now が
+        # null の部位でも、前回の回は完了している）。
+        if ep is gm.Phase.DONE:
+            if prev is not None:
+                lines.append(_prev_line(cx, cy, band, prev, part))
+            continue
+
         if now is None:
             continue
 
@@ -385,9 +392,6 @@ def build_scene(state: gm.GaugeState, *, spinner_phase: float = 0.0) -> Scene:
             if state_text:
                 labels.append(_state_label(cx, cy, st, state_text, show_joules, part))
 
-            if prev is not None:
-                lines.append(_prev_line(cx, cy, band, prev, part))
-        elif ep is gm.Phase.DONE:
             if prev is not None:
                 lines.append(_prev_line(cx, cy, band, prev, part))
         # WAITING: 溝・帯（・帯の数字）だけで、これ以上は何も描かない。
