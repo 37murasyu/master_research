@@ -138,9 +138,13 @@ class MeasurementSession:
             for pair in pairs:
                 result = self.measurement.process(pair)
                 if result is not None:
-                    self.recorder.record(result)
                     if result.window_closed:
+                        # 先頭の窓で重力が決まった。窓を閉じたこのフレームから横長のトルクを書く
                         self.recorder.note_raw(**self.measurement.window)
+                        label = self.measurement.window.get("gravity_label")
+                        if label:
+                            self.recorder.open_torque_vectors(label)
+                    self.recorder.record(result)
         except ImplausibleBodyScale as exc:
             # 座標の単位か校正が壊れている。トルクが桁違いになるので止める（終了コード 3、理由は meta.json の error）
             self.error = str(exc)

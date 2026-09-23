@@ -63,14 +63,19 @@ class Recorder:
         self._streams = []
         self.closed = False
 
-        def writer(prefix, header):
-            stream = (self.directory / f"{prefix}_{stamp}.csv").open(
+        def writer(prefix, header, suffix=""):
+            stream = (self.directory / f"{prefix}_{stamp}{suffix}.csv").open(
                 "w", newline="", encoding="utf-8"
             )
             self._streams.append(stream)
             result = csv.writer(stream)
             result.writerow(header)
             return result
+
+        self._writer = writer
+        self._stamp = stamp
+        # 局所トルクの横長（USB の aim_torque_vec と同じ形）。重力が決まってから開く（open_torque_vectors）
+        self.torque_vectors = None
 
         self.points = writer(
             "kpts3d",
@@ -141,6 +146,22 @@ class Recorder:
         )
         self.flush()
 
+    # USB の aim_torque_vec の部位の並び
+    TORQUE_VECTOR_PARTS = ("wrist_R", "elbow_R", "shoulder_R", "wrist_L", "elbow_L", "shoulder_L")
+
+    def open_torque_vectors(self, gravity_label):
+        """``aim_torque_vec_<stamp>_s<版>_g<重力>.csv`` を開く（先頭の窓で重力が決まったとき）。"""
+        self._check()
+        if self.torque_vectors is not None:
+            return
+        from config import OUTPUT_SCHEMA_VERSION
+
+        self.torque_vectors = self._writer(
+            "aim_torque_vec",
+            ["frame"] + [f"{part}_{axis}" for part in self.TORQUE_VECTOR_PARTS for axis in "xyz"],
+            suffix=f"_s{OUTPUT_SCHEMA_VERSION}_g{gravity_label}",
+        )
+
     def note_raw(self, **fields):
         """生 3D のサイドカーに、先頭の窓で決まった値（体格の比・重力など）を書き足す。"""
         self._check()
@@ -195,6 +216,11 @@ class Recorder:
         self.gauge.writerow([self.frames, result.t_ns, getattr(result, "rep", ""),
                              int(bool(getattr(result, "dyn_active", False))),
                              *(gauge.get(part, "") for part in self._gauge_parts)])
+        if self.torque_vectors is not None and result.local_torques:
+            torques = result.local_torques
+            self.torque_vectors.writerow(
+                [self.frames, *(value for part in self.TORQUE_VECTOR_PARTS
+                                for value in torques.get(part, (float("nan"),) * 3))])
         self.energy.writerows(
             [self.frames, result.t_ns, part, e["e_pos"], e["e_neg"], e["fc"], 1.0 / 30.0, e["n_u"]]
             for part, e in (getattr(result, "cycle_energy", None) or {}).items()

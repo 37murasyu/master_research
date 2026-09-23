@@ -224,3 +224,21 @@ class TestGaugeEnergy:
         assert meta["one_rm_kg"] == ONE_RM and meta["body_mass_kg"] == 65.0
         assert meta["forearm_len_m"]["L"] == pytest.approx(0.25, abs=0.01)
         assert meta["reps"] == 1
+
+
+class TestTorqueVectors:
+    """USB と同じ形の局所トルク（``aim_torque_vec_<stamp>_s2_g<重力>.csv``）。オフラインの解析の道具がそのまま読める。"""
+
+    PARTS = ["wrist_R", "elbow_R", "shoulder_R", "wrist_L", "elbow_L", "shoulder_L"]
+
+    def test_the_wide_table_matches_the_local_torques(self, tmp_path):
+        session, _ = _session(tmp_path)
+        stamp = _file(session, "frames").stem[len("frames_"):]
+        path = session.directory / f"aim_torque_vec_{stamp}_s2_gZ-.csv"
+        wide = pd.read_csv(path)
+        assert list(wide.columns) == ["frame"] + [f"{p}_{a}" for p in self.PARTS for a in "xyz"]
+        long = pd.read_csv(_file(session, "local_torque"))
+        elbow = long[long.joint == "elbow_R"].set_index("frame")
+        assert set(wide.frame) == set(elbow.index), "frame は kpts3d・local_torque と同じ番号"
+        row = wide.iloc[10]
+        assert row.elbow_R_y == pytest.approx(elbow.loc[int(row.frame), "y"])
