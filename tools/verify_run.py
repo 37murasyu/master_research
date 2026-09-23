@@ -417,9 +417,14 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
     return report
 
 
+# hybrid-raw の出力名の印。計測は EKF の手前の 3D を kpts3d_raw_<stamp>.csv に書くので、道具の出力は
+# kpts3d_raw_<stamp>_retri[_grid][_sN].csv にして分ける
+RETRI_SUFFIX = "_retri"
+
+
 def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: str | Path | None = None, *,
                        grid: bool = False, hz: float | None = None) -> Path:
-    """混成の 3D（EKF なし）を生 CSV（``kpts3d_raw_*``、``app.tuning.raw_capture`` の形）に直す。
+    """混成の 3D（EKF なし）を生 CSV（``kpts3d_raw_<stamp>_retri*``、``app.tuning.raw_capture`` の形）に直す。
 
     S6 の雑音の推定（``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf``）がそのまま使える。
 
@@ -481,7 +486,8 @@ def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: 
     }
     target = Path(out_dir) if out_dir else folder
     target.mkdir(parents=True, exist_ok=True)
-    name = f"kpts3d_raw_{stamp}" + ("_grid" if grid else "") + ("" if stride == 1 else f"_s{stride}") + ".csv"
+    # 計測中の記録（kpts3d_raw_<stamp>.csv、EKF の手前）を上書きしないよう、道具の出力には _retri を付ける
+    name = f"kpts3d_raw_{stamp}{RETRI_SUFFIX}" + ("_grid" if grid else "") + ("" if stride == 1 else f"_s{stride}") + ".csv"
     path = target / name
     writer = RawCaptureWriter(path, ids, provenance)
     try:
