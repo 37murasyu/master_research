@@ -23,7 +23,8 @@ pyyaml
 # ソース開示義務が生じない。PyQt5 は GPL v3 のため、配布物には入れないこと。
 # バックエンドを確定させたい場合は PYQTGRAPH_QT_LIB=PySide6 を設定する。
 pyqtgraph
-PySide6
+# 計測画面が QFormLayout.setRowVisible（Qt 6.4 から）を使う
+PySide6>=6.4
 
 ### スマホ接続用の QR 表示（PC が接続先を端末に渡す手段）
 segno
