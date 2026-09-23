@@ -98,6 +98,8 @@ def _install(monkeypatch, tmp_path, *, collector_errors=0):
     monkeypatch.setattr(runner, "BoardCollector", Collector)
     monkeypatch.setattr(runner, "poll_window", lambda: 32)
     monkeypatch.setattr(runner, "mac_identity", lambda index: "mac-test")
+    # 本物の設定フォルダへ session を書かない
+    monkeypatch.setattr(runner, "stable_session", lambda renew=False: "0a1b2c3d")
     monkeypatch.setattr(calibration_io, "calibration_root", lambda: tmp_path)
     monkeypatch.setattr(cv, "imshow", lambda *args: None)
     monkeypatch.setattr(cv, "waitKey", lambda *args: None)

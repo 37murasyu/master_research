@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.core.platform_compat import user_output_dir
+from app.core.platform_compat import user_config_dir, user_output_dir
 from app.core.settings import APP_NAME
 
 
@@ -24,3 +24,8 @@ def calibration_root() -> Path:
 
 def measurement_root() -> Path:
     return hybrid_root() / "measure"
+
+
+def session_file() -> Path:
+    """Pixel が覚えておく接続先の session（``app.hybrid.session``）。利用者は見ない設定側に置く。"""
+    return user_config_dir(APP_NAME) / "hybrid_session.txt"

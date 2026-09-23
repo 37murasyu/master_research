@@ -25,6 +25,7 @@ from app.hybrid.checkerboard import (
 from app.hybrid.collector import BoardCollector
 from app.hybrid.display import compose
 from app.hybrid.live import LiveSession
+from app.hybrid.session import stable_session
 from app.hybrid.link import PhoneLink, PREVIEW, CALIBRATION, OFF
 from app.hybrid.mac_camera import MacCamera, default_camera_index
 from app.hybrid.pose_detector import PoseDetector
@@ -56,6 +57,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="混成ステレオ校正（盤寸法は cm）")
     parser.add_argument("--camera", type=int, default=None, help="Mac のカメラ番号（既定は CAM0）")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--advertise-host", help="QR に載せる PC のアドレス。既定は自動判定（VPN 接続中は誤ることがある）")
+    parser.add_argument("--new-session", action="store_true", help="session を作り直す（前に QR を読んだ端末は自動でつながらなくなる）")
     parser.add_argument("--rows", type=int, default=defaults["rows"])
     parser.add_argument("--cols", type=int, default=defaults["cols"])
     parser.add_argument("--square-cm", type=float, default=defaults["square_cm"])
@@ -71,7 +74,10 @@ def main(argv=None):
         stack.callback(camera.close)
         detector = PoseDetector()
         stack.callback(detector.close)
-        link = PhoneLink(port=args.port, capture_mode=PREVIEW)
+        link = PhoneLink(
+            port=args.port, advertise_host=args.advertise_host,
+            session=stable_session(renew=args.new_session), capture_mode=PREVIEW
+        )
         link.start()
         stack.callback(link.stop)
         stack.callback(cv.destroyAllWindows)

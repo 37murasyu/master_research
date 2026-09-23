@@ -7,6 +7,7 @@ import sys
 import cv2 as cv
 from app.core.stop_request import StopRequest
 from app.hybrid.calibration_io import load_calibration
+from app.hybrid.session import stable_session
 from app.hybrid.link import PhoneLink, CaptureMode
 from app.hybrid.live import LiveSession
 from app.hybrid.mac_camera import MacCamera, default_camera_index
@@ -39,6 +40,8 @@ def main(argv=None):
     parser.add_argument("--preview-hz", type=float, default=2.0)
     parser.add_argument("--cam0-offset-ms", type=float, default=0.0)
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--advertise-host", help="QR に載せる PC のアドレス。既定は自動判定（VPN 接続中は誤ることがある）")
+    parser.add_argument("--new-session", action="store_true", help="session を作り直す（前に QR を読んだ端末は自動でつながらなくなる）")
     args = parser.parse_args(argv)
     if args.camera is None:
         args.camera = default_camera_index()
@@ -71,6 +74,8 @@ def main(argv=None):
             )
             link = PhoneLink(
                 port=args.port,
+                advertise_host=args.advertise_host,
+            session=stable_session(renew=args.new_session),
                 capture_mode=CaptureMode(args.preview_hz, 640, 70),
                 on_pairs=measurement.on_pairs,
                 on_landmarks=measurement.on_landmarks,

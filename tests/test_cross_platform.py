@@ -49,6 +49,7 @@ IMPORT_SAFE_MODULES = [
     "app.hybrid.recorder",
     "app.hybrid.measurement",
     "app.hybrid.paths",
+    "app.hybrid.session",
     "app.runners.hybrid_preview",
     "app.runners.hybrid_calibrate",
     "app.runners.hybrid_measure",

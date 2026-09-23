@@ -175,12 +175,32 @@ Android は release 版で更新する。debug 版は署名鍵と端末 ID が�
 cd ../master_research-hybrid/mobile
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ./install.sh --build
 cd ..
-../master_research/.venv/bin/python -m app.runners.hybrid_preview --camera 0
+../master_research/.venv/bin/python -m app.runners.hybrid_preview --camera 1
 ```
 
-左右パネルの右側にある cam1 の QR を Pixel アプリで読む。Mac カメラが別の番号なら `--camera 1` などを指定する。
-macOS に受信接続の確認が出たら許可する。左に Mac、右に Pixel の画像と同じ時刻の骨格が表示される。
-終了は q / Esc / ウィンドウを閉じる / Ctrl-C。起動のたびに新しい QR を読み直す。
+**Mac のカメラ番号**: Camo などの仮想カメラが入っていると番号が入れ替わる。2026-09-23 の MacBook Air では
+0 番が Camo、**1 番が内蔵の FaceTime HD** だった。違う映像が出たら番号を変える。
+
+**手順（QR を読むのは最初の 1 回だけ）**
+
+1. Pixel を手に持ち、アプリの「PCのQRコードを読み取る」で、ウィンドウ右側の cam1 の QR を 20〜40 cm 離して読む。
+   ぼけたら画面の QR をタップするとピントが合う。macOS に受信接続の確認が出たら許可する
+2. 「送信中」になったら、Pixel を机などに置き、**1.5〜2 m 離れて肩から手までが写るように**向ける。
+   点は人が写っている間だけ送る。アプリの表示が「送信中（人を検出中）」なら写っている
+3. 左に Mac、右に Pixel の画像と骨格が並ぶ
+
+アプリは送信まで進んだ接続先を覚え、切れたら 3 秒ごとにつなぎ直す。アプリを開き直したときも自動でつなぐ。
+PC 側は session をこの Mac に保存して使い回すので、ライブ表示・校正・計測を起動し直しても QR は読み直さない。
+別の PC に切り替えるときや、古い端末を締め出したいとき（`--new-session`）だけ読み直す。
+PC に断られたとき（役割違い・別の session・校正と違う端末）と「切断」を押したときは、つなぎ直さない。
+
+**QR の接続先が違うとき**: VPN に接続していると、QR に Wi-Fi 以外のアドレス（例 10.x.x.x）が載ることがある。
+`--advertise-host 192.168.1.17`（Mac の Wi-Fi のアドレス。`ipconfig getifaddr en0` で分かる）で指定する。
+
+Pixel の解析解像度は **1280×960（4:3）**（CameraX が 4:3 を選ぶ。目標の 1280×720 ではない）。
+アプリの計測中の表示に実際の解像度が出る。校正も同じ解像度で撮れば三角測量は合う。
+
+終了は q / Esc / ウィンドウを閉じる / Ctrl-C。
 
 ### 校正
 
@@ -222,6 +242,9 @@ GUI では校正・計測画面の「入力」を「Mac＋Pixel（混成）」�
 混成経路では USB 用の動画入力・EKF・LPF などの設定は使わない。
 
 ### 実機で残る確認
+
+2026-09-23 のライブ表示（MacBook Air M1＋Pixel 7a、同じ Wi-Fi）: Mac 30 fps、Pixel 17 fps、ペア 26/秒、
+平均位相差 15.6 ms（最大 49.9 ms）。Pixel の fps が目安の 20 に届いていない。
 
 - Mac ≥ 25 fps、Pixel ≥ 20 fps、ペア ≥ 20/秒、平均位相差 < 20 ms。
 - Pixel 表示 ≥ 3 Hz、表示 0 Hz と 4 Hz でランドマーク fps の低下 ≤ 10%。

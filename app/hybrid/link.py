@@ -190,7 +190,10 @@ class PhoneLink:
         accept_frame: Callable[[p.LandmarkFrame], bool] | None = None,
         on_tick: Callable[[], None] | None = None,
         on_stop: Callable[[], None] | None = None,
+        session: str | None = None,
     ):
+        """``session`` を省略すると起動ごとに作る。ランナーは ``stable_session()`` を渡し、
+        Pixel が覚えた接続先へ自動でつなぎ直せるようにする。"""
         self.remote_role = remote_role
         self._user_on_tick = on_tick
         self._user_on_stop = on_stop
@@ -205,6 +208,7 @@ class PhoneLink:
             host=host,
             port=port,
             buffer=SyncBuffer(target_hz=target_hz, window_sec=window_sec, max_gap_ms=max_gap_ms),
+            session=session,
             on_pairs=self._deliver_pairs,
             on_landmarks=self._handle_landmarks,
             on_calibration_frame=self._handle_capture,

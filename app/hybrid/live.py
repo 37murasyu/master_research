@@ -9,6 +9,11 @@ from app.net.protocol import LandmarkFrame
 from app.hybrid.checkerboard import detect_board
 from app.hybrid.display import compose
 
+# Pixel の画像に重ねる骨格を探す時刻の許容幅。MediaPipe は処理が追いつかないフレームを
+# 飛ばすので、画像にしたフレームそのものの点が無いことが多い（実機で 6 割）。そのときは
+# 隣のフレーム（30 fps で約 33 ms 先）の点を重ねる。向き合わせの確認にはこれで足りる。
+REMOTE_OVERLAY_TOLERANCE_NS = 50_000_000
+
 
 def decode_capture(capture):
     image = cv.imdecode(np.frombuffer(capture.jpeg, np.uint8), cv.IMREAD_COLOR)
@@ -75,7 +80,7 @@ class LiveSession:
         if self.board is not None:
             right_corners = self.remote_corners
         remote = (
-            self.link.nearest_remote(self.remote_capture.t_capture_ns, 20_000_000)
+            self.link.nearest_remote(self.remote_capture.t_capture_ns, REMOTE_OVERLAY_TOLERANCE_NS)
             if self.remote_capture
             else None
         )
