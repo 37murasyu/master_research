@@ -84,11 +84,24 @@ Clock = Callable[[], int]
 class SessionHandler:
     """1 接続ぶんのメッセージ処理。トランスポートに依存しない。"""
 
-    def __init__(self, buffer: SyncBuffer, clock: Clock = time.monotonic_ns):
+    def __init__(
+        self,
+        buffer: SyncBuffer,
+        clock: Clock = time.monotonic_ns,
+        on_calibration_frame: Callable[[p.CalibrationFrame], None] | None = None,
+        on_hello: Callable[[p.Hello], str | None] | None = None,
+    ):
         self._buffer = buffer
         self._clock = clock
+        self._on_calibration_frame = on_calibration_frame
+        # 名乗りを受け入れるかの判定。断る理由を返してもらう（None なら受け入れ）。
+        self._on_hello = on_hello
         self.role: str | None = None
         self.device: str | None = None
+        self.device_id: str | None = None
+        self.hello: p.Hello | None = None
+        # 断った理由。接続を閉じる側が、利用者に見せる文言として使う。
+        self.rejection: str | None = None
         self.frames_received = 0
         self.errors = 0
 
@@ -116,8 +129,21 @@ class SessionHandler:
             return None  # 毎フレーム返信すると無駄な往復が増える
 
         if isinstance(message, p.Hello):
+            reason = self._on_hello(message) if self._on_hello is not None else None
+            if reason is not None:
+                # 役割として数えない。数えると「2 台つながった」と見えてしまう。
+                self.rejection = reason
+                return None
             self.role = message.role
             self.device = message.device
+            self.device_id = message.device_id
+            self.hello = message
+            return None
+
+        if isinstance(message, p.CalibrationFrame):
+            self.role = self.role or message.role
+            if self._on_calibration_frame is not None:
+                self._on_calibration_frame(message)
             return None
 
         return None
@@ -134,6 +160,8 @@ class LandmarkServer:
         on_pairs: Callable[[Iterable[PairedSample]], None] | None = None,
         clock: Clock = time.monotonic_ns,
         session: str | None = None,
+        on_calibration_frame: Callable[[p.CalibrationFrame], None] | None = None,
+        on_hello: Callable[[p.Hello], str | None] | None = None,
     ):
         self.host = host
         self._requested_port = port
@@ -141,9 +169,13 @@ class LandmarkServer:
         self._on_pairs = on_pairs
         self._clock = clock
         self.session = session or secrets.token_hex(4)
+        self._on_calibration_frame = on_calibration_frame
+        self._on_hello = on_hello
 
         self._server: Server | None = None
         self._handlers: dict[int, SessionHandler] = {}
+        # 撮影指示を送るため、接続そのものも持つ。
+        self._connections: dict[int, ServerConnection] = {}
 
     # -- 起動・停止 --------------------------------------------------------
     async def start(self) -> None:
@@ -156,7 +188,15 @@ class LandmarkServer:
                 f"ポート {self._requested_port} は既に使われています（{conflict}）。\n"
                 f"  --port で別の番号を指定するか、そのプロセスを止めてください。"
             )
-        self._server = await serve(self._on_connection, self.host, self._requested_port)
+        # 既定の上限は 1MiB。校正用の JPEG（720p を base64 にしたもの）が
+        # 超えることがあり、超えると接続ごと切れる。プロトコル側の上限
+        # （p.MAX_CALIBRATION_BYTES）で弾き、切断では終わらせない。
+        self._server = await serve(
+            self._on_connection,
+            self.host,
+            self._requested_port,
+            max_size=p.MAX_CALIBRATION_BYTES * 2,
+        )
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -176,18 +216,30 @@ class LandmarkServer:
 
     # -- 接続の受け口 ------------------------------------------------------
     async def _on_connection(self, connection: ServerConnection) -> None:
-        handler = SessionHandler(self.buffer, clock=self._clock)
+        handler = SessionHandler(
+            self.buffer,
+            clock=self._clock,
+            on_calibration_frame=self._on_calibration_frame,
+            on_hello=self._on_hello,
+        )
         self._handlers[id(connection)] = handler
+        self._connections[id(connection)] = connection
         try:
             async for raw in connection:
                 reply = handler.handle(raw)
                 if reply is not None:
                     await connection.send(reply)
+                if handler.rejection is not None:
+                    # 受け入れられない端末は、理由を伝えて閉じる。つないだ人が
+                    # 「QR を読み直す」「正しい端末を使う」と判断できるように。
+                    await connection.close(code=1008, reason=handler.rejection[:120])
+                    break
                 self._flush_pairs()
         except websockets.exceptions.ConnectionClosed:
             pass  # 端末が離脱しただけ。計測は続行する
         finally:
             self._handlers.pop(id(connection), None)
+            self._connections.pop(id(connection), None)
 
     def _flush_pairs(self) -> None:
         pairs = self.buffer.drain()
@@ -207,6 +259,30 @@ class LandmarkServer:
     @property
     def connected_roles(self) -> list[str]:
         return sorted({h.role for h in self._handlers.values() if h.role})
+
+    @property
+    def devices(self) -> dict[str, p.Hello]:
+        """役割 → 名乗り。どの端末がどちらで繋がったかの照合に使う。"""
+        return {h.role: h.hello for h in self._handlers.values() if h.role and h.hello}
+
+    async def request_capture(self, capture_id: int, at_ns: int | None = None) -> int:
+        """繋がっている端末に、校正用の撮影を指示する。送った台数を返す。
+
+        両端末へ**同じ目標時刻**を渡す。端末は PC 時計に同期しているので、
+        ネットワークの遅延差があっても、ほぼ同じ瞬間のフレームが揃う。
+        """
+        message = p.encode(p.CaptureRequest(id=capture_id, at_ns=at_ns))
+        sent = 0
+        for key, connection in list(self._connections.items()):
+            handler = self._handlers.get(key)
+            if handler is None or not handler.role:
+                continue  # まだ名乗っていない接続には送らない
+            try:
+                await connection.send(message)
+                sent += 1
+            except websockets.exceptions.ConnectionClosed:
+                continue  # 離脱した端末。撮影指示は次の周回で届く
+        return sent
 
     @property
     def stats(self) -> dict[str, object]:

@@ -81,6 +81,8 @@ __pycache__/
 
 # golden_messages.json は Kotlin のテストが生成し、Python のテストが読む。
 !mobile/contract/golden_messages.json
+# pc_messages.json は逆向き。Python のテストが生成し、Kotlin のテストが読む。
+!mobile/contract/pc_messages.json
 
 # 同梱資産の置き場。ここは配布物に入れるファイルしか置かないので
 # ディレクトリごと戻してよい（Python も build 出力も無い）。

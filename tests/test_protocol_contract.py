@@ -12,6 +12,7 @@ Kotlin 側のテスト（ContractSampleTest）が組み立てた**生の JSON**�
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -127,3 +128,49 @@ def test_frames_flow_through_the_sync_buffer():
     pairs = buffer.drain()
     assert pairs, "実電文からペアが組めていない"
     assert all(set(pair.frames) == {"cam0", "cam1"} for pair in pairs)
+
+
+PC_MESSAGES = Path(__file__).resolve().parent.parent / "mobile" / "contract" / "pc_messages.json"
+
+
+def _pc_samples() -> list[str]:
+    """PC が端末へ送る電文の見本。Kotlin 側のテストが同じファイルを読む。"""
+    return [
+        p.encode(p.SyncResponse(t1=1_000_000_000, t2=1_000_500_000, t3=1_000_600_000)),
+        p.encode(p.CaptureRequest(id=7, at_ns=1_725_699_123_456_789_000)),
+        p.encode(p.CaptureRequest(id=8)),
+    ]
+
+
+class TestPcToDevice:
+    """PC → 端末の向きも契約で守る。
+
+    これまで契約テストは端末 → PC の一方向だけだった。撮影指示は逆向きなので、
+    こちらが変わっても実機を繋ぐまで気づけない。
+
+    このテストはファイルを**比較するだけ**にしてある。毎回書き出すと、
+    テストがリポジトリを書き換えてしまう（Windows では改行も変わる）。
+    更新するときは UPDATE_CONTRACT=1 を付けて実行する。
+    """
+
+    def test_samples_match_the_file_the_android_tests_read(self):
+        samples = _pc_samples()
+
+        if os.getenv("UPDATE_CONTRACT") == "1":
+            PC_MESSAGES.parent.mkdir(parents=True, exist_ok=True)
+            PC_MESSAGES.write_text(
+                json.dumps(samples, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+        assert PC_MESSAGES.is_file(), (
+            f"PC 側の契約サンプルがありません。UPDATE_CONTRACT=1 で再生成してください: {PC_MESSAGES}"
+        )
+        assert json.loads(PC_MESSAGES.read_text(encoding="utf-8")) == samples
+
+    def test_capture_request_carries_the_target_time(self):
+        """端末が「いつのフレームを返すか」を決められること。"""
+        decoded = p.decode(json.loads(PC_MESSAGES.read_text(encoding="utf-8"))[1])
+        assert isinstance(decoded, p.CaptureRequest)
+        assert decoded.at_ns is not None
