@@ -10,7 +10,7 @@
 
 再利用しているもの:
     push_up_model（座位プッシュアップのモデル。USB・オフライン経路と共有）
-        estimate_gravity / joint_axes / push_up_torques / segment_from_storage
+        joint_axes / push_up_torques / segment_from_storage（重力は app.hybrid.gravity 経由で estimate_gravity）
     utils.compute_local_torque / compute_joint_power
     utils_dynamic.calculate_inertia_tensor
     link_vector_calculator_module.LinkVectorCalculator
@@ -67,7 +67,6 @@ from link_vector_calculator_module import LinkVectorCalculator
 from push_up_model import (
     ARM_PARTS,
     arm_axes,
-    estimate_gravity,
     hand_mass,
     push_up_joint_powers,
     push_up_torques,
@@ -169,6 +168,8 @@ class MeasurementConfig:
     # デモ（DEMO_MONO_GAUGE_ON=1）。None でなければ、ゲージの now をトルクではなく 3D の肩の上昇と肘角の変化で
     # 動かす（app.hybrid.demo_gauge）。回の区切り・トルク・記録は今までどおり
     demo: DemoConfig | None = None
+    # OFFLINE_WRIST_CAPTURE: 終了時に前腕（肘→手首）と手首の局所 τ_y を npy に残す（USB と同じ形）
+    offline_wrist_capture: bool = False
     # 肘の濾波 E± の前処理（energy_pipeline、USB の E_*）。計測の子は EnergyFilterConfig.from_env() を渡す
     energy_filter: EnergyFilterConfig = field(default_factory=EnergyFilterConfig)
     # 腕の長さの安全策: 先頭の窓の上腕長・前腕長（中央値）から、この比を超えてずれた腕の仕事率を回とゲージに

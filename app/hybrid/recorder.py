@@ -36,6 +36,7 @@ class Recorder:
         metadata=None,
         clock=time.monotonic,
         raw_provenance=None,
+        offline_wrist=False,
     ):
         self._owner = threading.get_ident()
         self.clock = clock
@@ -113,6 +114,8 @@ class Recorder:
         self.gauge = writer("gauge_energy", ["frame", "t_ns", "rep", "dyn_active", *self._gauge_parts])
         # 肘の濾波 E±（USB の cycle_energy_debug_* と同じ量。回の確定ごとに肘の左右で 1 行ずつ）
         self.energy = writer("cycle_energy", ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u"])
+        # OFFLINE_WRIST_CAPTURE: 前腕（肘→手首）(N,3) と手首の局所 τ_y (N,)。閉じるときに npy へ（USB と同じ名前）
+        self._wrist = {"R": ([], []), "L": ([], [])} if offline_wrist else None
         # EKF の手前の生 3D（EKF の較正 tune_ekf の入力）。1/30 s の格子で、抜けた格子は NaN の行で埋める
         # （行を詰めると dt 一定の前提が崩れる）。raw_provenance が無ければ書かない（EKF を通さない記録）
         self.raw3d = None
@@ -161,6 +164,29 @@ class Recorder:
             ["frame"] + [f"{part}_{axis}" for part in self.TORQUE_VECTOR_PARTS for axis in "xyz"],
             suffix=f"_s{OUTPUT_SCHEMA_VERSION}_g{gravity_label}",
         )
+
+    def _capture_wrist(self, result):
+        """USB（``master_research_code.py`` の OFFLINE_WRIST_CAPTURE）と同じく、前腕が有限のフレームだけ積む。"""
+        from config import slot_of
+
+        points = result.points_3d
+        for side, (vectors, taus) in self._wrist.items():
+            forearm = np.asarray(points[slot_of(f"{side}_WRIST")] - points[slot_of(f"{side}_ELBOW")], dtype=float)
+            if not np.all(np.isfinite(forearm)):
+                continue
+            tau = result.local_torques.get(f"wrist_{side}")
+            vectors.append(forearm)
+            taus.append(float(tau[1]) if tau is not None and np.all(np.isfinite(tau)) else 0.0)
+
+    def _save_wrist(self):
+        from config import OUTPUT_SCHEMA_VERSION
+
+        for side, (vectors, taus) in (self._wrist or {}).items():
+            if not vectors:
+                continue
+            suffix = f"{side}_{self._stamp}_s{OUTPUT_SCHEMA_VERSION}.npy"
+            np.save(self.directory / f"forearm_{suffix}", np.asarray(vectors, dtype=float))
+            np.save(self.directory / f"tau_wrist_{suffix}", np.asarray(taus, dtype=float))
 
     def note_raw(self, **fields):
         """生 3D のサイドカーに、先頭の窓で決まった値（体格の比・重力など）を書き足す。"""
@@ -216,6 +242,8 @@ class Recorder:
         self.gauge.writerow([self.frames, result.t_ns, getattr(result, "rep", ""),
                              int(bool(getattr(result, "dyn_active", False))),
                              *(gauge.get(part, "") for part in self._gauge_parts)])
+        if self._wrist is not None and result.local_torques:
+            self._capture_wrist(result)
         if self.torque_vectors is not None and result.local_torques:
             torques = result.local_torques
             self.torque_vectors.writerow(
@@ -244,6 +272,7 @@ class Recorder:
             stream.close()
         if self.raw3d is not None:
             self.raw3d.close()
+        self._save_wrist()
         self.meta.update(
             status="complete",
             ended_at=datetime.now(timezone.utc).isoformat(),

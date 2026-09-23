@@ -83,6 +83,7 @@ def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementCon
         ekf=EkfSettings.from_env(),
         energy_filter=EnergyFilterConfig.from_env(),
         demo=DemoConfig.from_env() if _flag("DEMO_MONO_GAUGE_ON", False) else None,
+        offline_wrist_capture=_flag("OFFLINE_WRIST_CAPTURE", False),
     )
 
 
@@ -99,6 +100,14 @@ def _default_body_mass(fallback: float = 60.0) -> float:
 
 
 def main(argv=None):
+    from app.hybrid.replay import REPLAY_ENV
+
+    if os.environ.get(REPLAY_ENV):
+        # 記録の再生（GUI からは HYBRID_REPLAY を付けて起動する）。GUI は引数を渡さないので、計測フォルダなどは
+        # 環境変数 HYBRID_REPLAY* から読む。Mac のカメラも Pixel も開かない
+        from app.runners.hybrid_replay import main as replay_main
+
+        return replay_main([])
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Mac + Pixel 計測")
