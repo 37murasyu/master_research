@@ -21,7 +21,7 @@ UI 側の計画と台帳: `docs/superpowers/plans/2026-09-24-subject-gauge.md`�
 | # | 中身 | コミット |
 |---|---|---|
 | 1 | `origin/murayama/gauge-measure-page`（`murayama/subject-gauge` を含む。UI の Task 13〜15 と Task 16 の wip）を merge。衝突は `app/shell/page_measure.py` だけで UI 側の版を取った（こちらの最小の配線 36841ac は置き換わる）。その試験 `tests/test_page_measure_gauge.py` は、同じ振る舞いを `tests/test_gauge_measure_page.py` が確かめるので消した。UI 側の版にもゲージ窓を開いて `gauge_frame` をつなぐ処理があることを確かめた | d71d238 |
-| 2 | Task 16 の残り: 計算を壊す設定（`app_default` を持つ 4 つ）の件数バッジを外と入れ子の開示の見出しに（R20-03）、ログの「未実行」（R19-01）、「J の数値」スイッチの即時保存（`settings_edited` → `MainWindow._save_settings`）。校正の日時と「変更」リンクは wip に入っていた | 8ff1070 |
+| 2 | Task 16 の残り: 計算を壊す設定（`app_default` を持つ 4 つ）の件数バッジを外と入れ子の開示の見出しに（R20-03）、ログの「未実行」（R19-01）、「J の数値」スイッチの即時保存（`settings_edited` → `MainWindow._save_settings`）。校正の日時と「変更」リンクは wip に入っていた UI 側のセッションも同じ 3 つを並行して `subject-gauge` に入れていた（0dd99ef）ので後から取り込み、実装と試験はそちら（`broken_flag_count`、戻す・起動時・他の設定の試験が厚い）に揃えた | 8ff1070・0dd99ef を merge |
 | 3 | `/code-review --fix`（`36841ac..HEAD` の `app/shell`・`app/gauge`・`worker.py`）: 不具合なし。指摘の危険 1 件（`QFormLayout.setRowVisible` は Qt 6.4 から）に対して `PySide6>=6.4` に固定 | cd457df |
 | 4 | `/simplify`（下の表） | b884cdf・f284908・d05cdcb・f290c6d・8854e02・8d37c2c |
 | 5 | 文書: `docs/hybrid_field_run.md` §0 の手順 1 を新しい計測画面に合わせる、`KNOWN_ISSUES.md` の一覧の §6-8〜6-10 の行、この報告書 | このコミット |

@@ -570,71 +570,84 @@ class TestCalibrationTime:
 
 
 # ---------------------------------------------------------------------------
-# 計算を壊す設定の件数バッジ・ログの「未実行」・スイッチの即時保存
+# 計算を壊す設定の件数・ログの「未実行」・スイッチの即時保存
 # ---------------------------------------------------------------------------
 
 
-class TestBrokenFlagBadge:
-    def test_badge_counts_enabled_broken_flags(self, qt_app):
+def _flag_checkbox(page, name: str):
+    """入れ子の設定フォームで、設定 ``name`` の行のチェックボックス。"""
+    from app.core.qt import QtWidgets
+
+    for box in page._form.findChildren(QtWidgets.QGroupBox):
+        rows = box.layout()
+        for i in range(rows.rowCount()):
+            label = rows.itemAt(i, QtWidgets.QFormLayout.LabelRole)
+            if label is not None and label.widget().text() == name:
+                return rows.itemAt(i, QtWidgets.QFormLayout.FieldRole).widget()
+    raise AssertionError(f"{name} の行が無い")
+
+
+class TestBrokenFlagsAndLog:
+    BROKEN = ("DEMO_MONO_GAUGE_ON", "DEMO_MONO_CAM0_ONLY", "RT_POSE_FIXED_HZ_ON", "E_LPF_NATIVE_ON")
+
+    def test_badge_counts_enabled_broken_flags(self, page):
+        assert page._advanced._badge.isHidden(), "既定のままなら件数は出さない"
+        _flag_checkbox(page, "DEMO_MONO_GAUGE_ON").setChecked(True)
+        _flag_checkbox(page, "E_LPF_NATIVE_ON").setChecked(True)
+        assert not page._advanced._badge.isHidden()
+        assert page._advanced._badge.text() == "✕ 2"
+        assert page._dev._badge.text() == "✕ 2", "設定のある入れ子の見出しにも出す"
+        _flag_checkbox(page, "DEMO_MONO_GAUGE_ON").setChecked(False)
+        assert page._advanced._badge.text() == "✕ 1"
+        _flag_checkbox(page, "E_LPF_NATIVE_ON").setChecked(False)
+        assert page._advanced._badge.isHidden()
+
+    def test_badge_reflects_saved_settings_at_startup(self, qt_app):
         from app.shell.page_measure import MeasurePage
 
         settings = Settings()
-        settings.set("DEMO_MONO_GAUGE_ON", True)
+        for name in self.BROKEN:
+            settings.set(name, True)
         page = MeasurePage(settings)
         try:
-            assert page._advanced._badge.text() == "✕ 1"
-            assert not page._advanced._badge.isHidden()
-            settings.set("E_LPF_NATIVE_ON", True)
-            page._form.changed.emit()
-            assert page._advanced._badge.text() == "✕ 2"
-            assert page._dev._badge.text() == "✕ 2", "中の開示にも、どこを見ればよいかを出す"
+            assert page._advanced._badge.text() == "✕ 4"
         finally:
             page.shutdown()
 
-    def test_badge_is_hidden_when_every_flag_is_at_its_default(self, page):
-        assert page._advanced._badge.isHidden()
-        assert page._dev._badge.isHidden()
-
-    def test_badge_follows_the_nested_form(self, page):
-        from app.core.qt import QtWidgets
-
-        # 行の見出しは設定名。DEMO_MONO_CAM0_ONLY のチェックボックスを押す
-        for form in page._form.findChildren(QtWidgets.QFormLayout):
-            for row in range(form.rowCount()):
-                label = form.itemAt(row, QtWidgets.QFormLayout.LabelRole)
-                if label is not None and label.widget().text() == "DEMO_MONO_CAM0_ONLY":
-                    form.itemAt(row, QtWidgets.QFormLayout.FieldRole).widget().click()
-        assert page._settings.get("DEMO_MONO_CAM0_ONLY") is True
+    def test_badge_ignores_other_settings(self, page):
+        page._subject_edit.setText("07")
+        page._body_mass.setValue(70.0)
+        _flag_checkbox(page, "DEMO_MONO_GAUGE_ON").setChecked(True)
         assert page._advanced._badge.text() == "✕ 1"
 
-
-class TestLogPlaceholder:
     def test_log_shows_placeholder_before_first_run(self, page):
         assert page._log.placeholderText() == "未実行"
         assert page._log.toPlainText() == ""
 
 
 class TestImmediateSave:
-    def test_switch_emits_settings_edited(self, page):
-        edited = []
-        page.settings_edited.connect(lambda: edited.append(True))
-        page._joules_switch.click()
-        assert edited == [True]
-
     def test_switch_saves_immediately(self, qt_app, monkeypatch, tmp_path):
-        import json
-
         from app.shell import main_window as mw
 
-        path = tmp_path / "settings.json"
-        monkeypatch.setattr(mw.Settings, "default_path", classmethod(lambda cls: path))
+        target = tmp_path / "settings.json"
+        monkeypatch.setattr(mw.Settings, "default_path", classmethod(lambda cls: target))
         window = mw.MainWindow(Settings())
         try:
             page = window._pages[0]
-            before = bool(window._settings.get("GAUGE_SHOW_JOULES"))
-            page._joules_switch.click()
-            assert path.is_file(), "閉じる前に保存されていない"
-            saved = json.loads(path.read_text(encoding="utf-8"))["values"]
-            assert Settings(saved).get("GAUGE_SHOW_JOULES") is (not before)
+            _choose_input(page, HYBRID)
+            before = bool(Settings().get("GAUGE_SHOW_JOULES"))
+            page._joules_switch.setChecked(not before)
+            assert target.is_file(), "スイッチを切り替えても保存されていない"
+            assert Settings.load(target).get("GAUGE_SHOW_JOULES") is (not before)
+            page._joules_switch.setChecked(before)
+            assert Settings.load(target).get("GAUGE_SHOW_JOULES") is before
         finally:
-            window.close()
+            for p in window._pages:
+                p.shutdown()
+            window.deleteLater()
+
+    def test_switch_emits_settings_edited(self, page):
+        edited = []
+        page.settings_edited.connect(lambda: edited.append(True))
+        page._joules_switch.setChecked(not page._joules_switch.isChecked())
+        assert edited == [True]
