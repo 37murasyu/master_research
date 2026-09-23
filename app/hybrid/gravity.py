@@ -20,7 +20,7 @@ import numpy as np
 import config
 from push_up_model import estimate_gravity, nearest_axis
 
-__all__ = ["GravityChoice", "candidate_axes", "choose_gravity", "read_board_up", "AXIS_LABELS"]
+__all__ = ["GravityChoice", "candidate_axes", "cam0_to_runtime", "choose_gravity", "read_board_up", "AXIS_LABELS"]
 
 AXIS_LABELS = ("X+", "X-", "Y+", "Y-", "Z+", "Z-")
 _PLANE_AXES = {"YZ": ["Y+", "Y-", "Z+", "Z-"], "XZ": ["X+", "X-", "Z+", "Z-"], "XY": ["X+", "X-", "Y+", "Y-"]}
@@ -52,6 +52,17 @@ def _unit(vector) -> np.ndarray | None:
     return v / norm
 
 
+def cam0_to_runtime(vector_cam0) -> np.ndarray | None:
+    """cam0 のカメラ座標のベクトルを実行時の座標 (−x, −z, −y) に直した単位ベクトル。直せなければ None。
+
+    ``calib.py`` の ``_save_checkerboard_short_axis`` と同じ変換（``app.hybrid.gravity_board.to_runtime`` も同じもの）。
+    """
+    v = _unit(vector_cam0)
+    if v is None:
+        return None
+    return _unit([-v[0], -v[2], -v[1]])
+
+
 def _opposite(label: str) -> str:
     return label[0] + ("-" if label[1] == "+" else "+")
 
@@ -60,7 +71,7 @@ def read_board_up(meta: Mapping | None) -> np.ndarray | None:
     """校正の meta から盤の短辺の上向き（実行時の座標の単位ベクトル）を読む。無い・壊れていれば None。
 
     ``meta["checkerboard_short_axis"]["vector_runtime"]`` を使い、無ければ ``vector_cam0`` を
-    (−x, −z, −y) に直す（``calib.py`` の ``_save_checkerboard_short_axis`` と同じ変換）。
+    (−x, −z, −y) に直す（``cam0_to_runtime``）。
     """
     if not isinstance(meta, Mapping):
         return None
@@ -70,10 +81,7 @@ def read_board_up(meta: Mapping | None) -> np.ndarray | None:
     runtime = _unit(entry.get("vector_runtime"))
     if runtime is not None:
         return runtime
-    cam0 = _unit(entry.get("vector_cam0"))
-    if cam0 is None:
-        return None
-    return _unit([-cam0[0], -cam0[2], -cam0[1]])
+    return cam0_to_runtime(entry.get("vector_cam0"))
 
 
 def candidate_axes(level_plane_on: bool, plane: str) -> list[str]:
@@ -83,7 +91,7 @@ def candidate_axes(level_plane_on: bool, plane: str) -> list[str]:
     return list(_PLANE_AXES.get(str(plane).upper(), AXIS_LABELS))
 
 
-def _default(magnitude: float, why: str) -> GravityChoice:
+def _default(why: str) -> GravityChoice:
     vector = np.asarray(config.g, dtype=np.float64).copy()
     label, _, _ = nearest_axis(vector)
     return GravityChoice(vector, label, _opposite(label), "default",
@@ -124,7 +132,7 @@ def choose_gravity(
     board = _unit(board_up) if board_up is not None else None
     if board is None:
         if estimate is None:
-            return _default(magnitude, f"盤の向きが無く、体幹からも重力を決められない（{trunk_error}）")
+            return _default(f"盤の向きが無く、体幹からも重力を決められない（{trunk_error}）")
         return _from_trunk(estimate)
 
     notes = []

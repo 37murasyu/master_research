@@ -3,7 +3,7 @@
 混成の校正の最後に、盤を鉛直に立てて（短辺を上下に）Mac のカメラの前で静止させ、その短辺の向きを
 校正フォルダの ``meta.json`` の ``checkerboard_short_axis`` に残す（USB の ``calib.py`` の
 ``_save_checkerboard_short_axis`` と同じ形に、傾き・ばらつき・標本数などを足したもの）。計測側は
-``app.hybrid.gravity.read_board_up``（= ``board_up_runtime``）で読み、最寄りの軸に吸着させ、符号は体幹で確かめる。
+``app.hybrid.gravity.read_board_up`` で読み、最寄りの軸に吸着させ、符号は体幹で確かめる。
 
 - 混成の盤（``app.hybrid.checkerboard.Board.object_points``）は x が cols（長辺）、y が rows（短辺）で、
   USB の ``calib.py`` と逆。短辺は rows<cols なら y
@@ -15,15 +15,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Mapping
 
 import cv2 as cv
 import numpy as np
 
+from app.hybrid.gravity import _unit, cam0_to_runtime as to_runtime
+
 __all__ = [
     "CAMERA_UP", "NEEDED_SAMPLES", "STILL_PX", "MAX_TILT_DEG", "WARN_TILT_DEG", "METHOD",
     "short_axis_board", "board_axes_cam0", "short_axis_up_cam0", "to_runtime", "angle_deg", "up_label",
-    "short_axis_entry", "UprightCollector", "board_up_runtime",
+    "short_axis_entry", "UprightCollector",
 ]
 
 # カメラの座標で画像の上向き（OpenCV のカメラは y が下向き）
@@ -35,11 +36,6 @@ MAX_TILT_DEG = 30.0
 WARN_TILT_DEG = 10.0
 METHOD = "upright_board_solvepnp_median"
 _LABELS = ("X", "Y", "Z")
-
-
-def _unit(vector) -> np.ndarray:
-    v = np.asarray(vector, dtype=np.float64).reshape(3)
-    return v / np.linalg.norm(v)
 
 
 def short_axis_board(board) -> str:
@@ -63,12 +59,6 @@ def short_axis_up_cam0(axes, board) -> np.ndarray:
     column = 1 if short_axis_board(board) == "y" else 0
     v = _unit(np.asarray(axes, dtype=np.float64)[:, column])
     return v if float(v @ CAMERA_UP) >= 0.0 else -v
-
-
-def to_runtime(vector_cam0) -> np.ndarray:
-    """cam0 のカメラ座標のベクトルを実行時の座標 (−x, −z, −y) に直した単位ベクトル。"""
-    v = _unit(vector_cam0)
-    return _unit([-v[0], -v[2], -v[1]])
 
 
 def angle_deg(a, b) -> float:
@@ -164,13 +154,3 @@ class UprightCollector:
         spread = max(angle_deg(sample, up) for sample in self.samples)
         return short_axis_entry(up, self.board, tilt_deg=angle_deg(up, CAMERA_UP), spread_deg=spread,
                                 samples=len(self.samples))
-
-
-def board_up_runtime(meta: Mapping | None) -> np.ndarray | None:
-    """校正の meta から盤の短辺の上向き（実行時の座標の単位ベクトル）を読む。無い・壊れていれば None。
-
-    読み方は計測側の ``app.hybrid.gravity.read_board_up`` と同じ（そちらに任せる）。
-    """
-    from app.hybrid.gravity import read_board_up
-
-    return read_board_up(meta)

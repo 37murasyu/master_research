@@ -24,7 +24,9 @@ from typing import Mapping
 
 import numpy as np
 
-from config import slot_of
+from app.gauge.protocol import PART_NAMES
+from app.hybrid.gravity import _unit
+from config import env_float, slot_of
 
 __all__ = ["DemoConfig", "DemoGauge"]
 
@@ -32,13 +34,7 @@ SIDES = ("L", "R")
 
 
 def _env_float(env: Mapping[str, str], name: str, default: float) -> float:
-    raw = env.get(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        value = float(str(raw).strip())
-    except ValueError:
-        return default
+    value = env_float(name, default, env=env)
     return value if math.isfinite(value) else default
 
 
@@ -72,16 +68,6 @@ class DemoConfig:
             down_step=_env_float(env, "DEMO_RATIO_DOWN_STEP", d.down_step),
             baseline_ema=_env_float(env, "DEMO_BASELINE_EMA", d.baseline_ema),
         )
-
-
-def _unit(vector) -> np.ndarray | None:
-    if vector is None:
-        return None
-    v = np.asarray(vector, dtype=np.float64).reshape(-1)
-    if v.shape != (3,) or not np.all(np.isfinite(v)):
-        return None
-    norm = float(np.linalg.norm(v))
-    return v / norm if norm > 1e-9 else None
 
 
 def _elbow_angle_deg(shoulder: np.ndarray, elbow: np.ndarray, wrist: np.ndarray) -> float | None:
@@ -182,4 +168,4 @@ class DemoGauge:
             for joint in ("elbow", "wrist"):
                 part = f"{joint}_{side}"
                 values[part] = self._to_joules(ratio, bands.get(part))
-        return {part: values[part] for part in ("elbow_L", "elbow_R", "wrist_L", "wrist_R")}
+        return {part: values[part] for part in PART_NAMES}

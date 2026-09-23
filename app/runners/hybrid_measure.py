@@ -61,10 +61,7 @@ def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementCon
     if reason:
         print(f"[ゲージ] {reason}。その部位は帯（W_0.70〜W_0.85）を出さない", file=sys.stderr)
     level_plane = _flag("GRAVITY_LEVEL_PLANE_ON", False)
-    try:
-        ambiguity = float(os.environ.get("GRAVITY_AMBIG_DELTA") or 0.08)
-    except ValueError:
-        ambiguity = 0.08
+    ambiguity = config.env_float("GRAVITY_AMBIG_DELTA", 0.08)
     return MeasurementConfig(
         body_mass_kg=body_mass_kg,
         gravity_mode=gravity_mode,

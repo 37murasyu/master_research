@@ -2,11 +2,11 @@
 
 import argparse
 from contextlib import ExitStack
-import os
 import sys
 import time
 import cv2 as cv
 import numpy as np
+import config
 from app.core import resources
 from app.core.stop_request import StopRequest
 from app.hybrid.calibration_io import (
@@ -65,18 +65,14 @@ def board_up_enabled(choice=None):
     """盤を立てる段階を行うか。引数 ``--board-up on|off`` が優先し、無ければ ``HYBRID_GRAVITY_BOARD``（既定 1）。"""
     if choice is not None:
         return choice == "on"
-    value = os.environ.get("HYBRID_GRAVITY_BOARD", "1").strip().lower()
-    return value not in ("0", "false", "off", "no")
+    return config.env_flag("HYBRID_GRAVITY_BOARD", True)
 
 
 def board_up_timeout(value=None):
     """盤を立てる段階の時間切れ [s]。引数が優先し、無ければ ``HYBRID_GRAVITY_BOARD_TIMEOUT_S``（既定 30）。"""
     if value is not None:
         return float(value)
-    try:
-        return float(os.environ.get("HYBRID_GRAVITY_BOARD_TIMEOUT_S") or BOARD_UP_TIMEOUT_S)
-    except ValueError:
-        return BOARD_UP_TIMEOUT_S
+    return config.env_float("HYBRID_GRAVITY_BOARD_TIMEOUT_S", BOARD_UP_TIMEOUT_S)
 
 
 def run_board_up(session, board, intrinsic, directory, stop, *, timeout_s=BOARD_UP_TIMEOUT_S):

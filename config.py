@@ -59,23 +59,41 @@ _ENV_TRUE = ("1", "true", "yes", "on")
 _ENV_FALSE = ("0", "false", "no", "off")
 
 
-def env_flag(name, default):
+def env_flag(name, default, env=None):
     """環境変数を真偽値として読む。大文字小文字と前後の空白は問わない。
 
     1 / true / yes / on なら True、0 / false / no / off なら False、未設定やそれ以外は default。
     かつて master_research_code.py は ``in ('1','true','True')`` と ``not in ('0','false','False')`` の
     2 通りで読んでおり、''・'yes'・'TRUE' などで結果が逆になっていた（KNOWN_ISSUES §4-4）。
     設定スキーマの抽出器（tools/extract_env_schema.py）はこの呼び出しを bool として拾う。
+    ``env`` を渡すとその辞書から読む（既定は os.environ）。
     """
-    raw = os.environ.get(name)
+    raw = (os.environ if env is None else env).get(name)
     if raw is None:
         return bool(default)
-    value = raw.strip().lower()
+    value = str(raw).strip().lower()
     if value in _ENV_TRUE:
         return True
     if value in _ENV_FALSE:
         return False
     return bool(default)
+
+
+def env_float(name, default, *, env=None, on_invalid=None):
+    """環境変数を数として読む。未設定・空（空白だけ）は default、数として読めなければ default。
+
+    ``env`` を渡すとその辞書から読む（既定は os.environ）。'nan'・'inf' は float のまま返す（弾くのは呼び出し側）。
+    ``on_invalid`` を渡すと、読めなかったときに元の文字列を渡して呼ぶ（警告を出すため）。
+    """
+    raw = (os.environ if env is None else env).get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        if on_invalid is not None:
+            on_invalid(raw)
+        return default
 
 
 # 入力ストリーム（デフォルトはカメラID 0/1）

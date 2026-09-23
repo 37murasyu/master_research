@@ -23,6 +23,7 @@ from app.core.stop_request import StopRequest
 from app.gauge.tracker import GaugeTicker, GaugeTracker
 from app.hybrid.paths import replay_root
 from app.hybrid.replay import REPLAY_ENV, replay
+from config import env_float
 
 __all__ = ["main"]
 
@@ -31,14 +32,10 @@ _TICK_S = 1.0 / 30.0
 
 
 def _env_float(name: str, default: float | None) -> float | None:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"{name}={raw!r} は数ではないため {default} を使います", file=sys.stderr)
-        return default
+    def invalid(raw):
+        print(f"{name}={raw.strip()!r} は数ではないため {default} を使います", file=sys.stderr)
+
+    return env_float(name, default, on_invalid=invalid)
 
 
 def main(argv=None) -> int:

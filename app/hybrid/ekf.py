@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from app.tuning.ekf_profile import AXES, RuntimeNoise, resolve_profile, runtime_noise
+from config import env_flag, env_float
 from extended_kalman_filter import EKFConfig, LandmarkEKF, SeriesNoise
 
 __all__ = ["DT", "GRID_NS", "REBUILD_GAP_S", "DIVERGE_M", "DIVERGE_FRAMES", "EkfSettings", "GridEkf", "hybrid_noise"]
@@ -36,27 +37,6 @@ REBUILD_GAP_S = 0.5
 # 発散の見張り: 観測からのずれ [m] と、それが続くフレーム数
 DIVERGE_M = 0.15
 DIVERGE_FRAMES = 3
-
-_TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"0", "false", "no", "off"}
-
-
-def _flag(env: Mapping[str, str], name: str, default: bool) -> bool:
-    """``config.env_flag`` と同じ読み方（大文字小文字と前後の空白は問わない）。"""
-    raw = env.get(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    return True if value in _TRUE else False if value in _FALSE else default
-
-
-def _number(env: Mapping[str, str], name: str, default: float) -> float:
-    raw = (env.get(name) or "").strip()
-    try:
-        return float(raw) if raw else default
-    except ValueError:
-        return default
-
 
 @dataclass(frozen=True)
 class EkfSettings:
@@ -77,14 +57,14 @@ class EkfSettings:
     def from_env(cls, env: Mapping[str, str] | None = None) -> "EkfSettings":
         env = os.environ if env is None else env
         return cls(
-            enabled=_flag(env, "EKF_ENABLE", True),
+            enabled=env_flag("EKF_ENABLE", True, env),
             profile=(env.get("HYBRID_EKF_PROFILE") or "").strip() or None,
-            gate_std=_number(env, "EKF_GATE_STD", 3.0),
-            robust_gate=_flag(env, "EKF_ROBUST_GATE", True),
-            max_gap_s=_number(env, "EKF_MAX_GAP_S", 0.0),
-            bpf_low=_number(env, "EKF_BPF_LOW", 0.0),
-            bpf_high=_number(env, "EKF_BPF_HIGH", 0.0),
-            bpf_order=int(_number(env, "EKF_BPF_ORDER", 2)),
+            gate_std=env_float("EKF_GATE_STD", 3.0, env=env),
+            robust_gate=env_flag("EKF_ROBUST_GATE", True, env),
+            max_gap_s=env_float("EKF_MAX_GAP_S", 0.0, env=env),
+            bpf_low=env_float("EKF_BPF_LOW", 0.0, env=env),
+            bpf_high=env_float("EKF_BPF_HIGH", 0.0, env=env),
+            bpf_order=int(env_float("EKF_BPF_ORDER", 2, env=env)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -127,7 +107,6 @@ class GridEkf:
         # 作り直した回数（0.5 s を超える抜け）と、NaN で予測した格子の数
         self.rebuilds = 0
         self.predicted = 0
-        self.failures = 0
         # 発散の見張りで初期化し直した点の延べ数と、点ごとのずれが続いたフレーム数
         self.resets = 0
         self._drift = np.zeros(len(self.landmark_ids), dtype=int)
@@ -185,7 +164,6 @@ class GridEkf:
             pos, vel, _ = self._ekf.step(raw, self.dt)
         except (FloatingPointError, np.linalg.LinAlgError):
             # 数値の破綻だけを拾い、観測をそのまま使う（USB 経路と同じ。形の不整合などは握りつぶさない）
-            self.failures += 1
             return raw.copy(), np.full(raw.shape, np.nan)
         if self._ekf.bandpass_enabled:
             # 前処理の BPF（EKF_BPF_*）が効くと、EKF が追うのは帯域を通した観測で、位置の直流分が抜ける。

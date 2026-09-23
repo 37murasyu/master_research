@@ -134,15 +134,14 @@ def test_the_result_has_the_contract_form():
     assert np.allclose(gb.to_runtime(entry["vector_cam0"]), entry["vector_runtime"])
 
 
-def test_board_up_runtime_reads_what_the_collector_wrote():
+def test_read_board_up_reads_what_the_collector_wrote():
     board = Board()
     collector = gb.UprightCollector(board, K, DIST)
     corners = _corners(board, _rz(4))
     while not collector.done:
         collector.add(corners)
     meta = {"checkerboard_short_axis": collector.result()}
-    up = gb.board_up_runtime(meta)
+    up = gravity.read_board_up(meta)
     assert np.allclose(up, meta["checkerboard_short_axis"]["vector_runtime"])
-    assert np.allclose(up, gravity.read_board_up(meta))
-    assert gb.board_up_runtime({}) is None
-    assert gb.board_up_runtime(None) is None
+    assert gravity.read_board_up({}) is None
+    assert gravity.read_board_up(None) is None

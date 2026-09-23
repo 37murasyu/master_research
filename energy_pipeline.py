@@ -29,6 +29,8 @@ from typing import Mapping, Tuple
 
 import numpy as np
 
+from config import env_flag, env_float
+
 try:
     from scipy.interpolate import PchipInterpolator
     from scipy.signal import butter, filtfilt, welch
@@ -47,32 +49,21 @@ __all__ = [
     "fc_scheduler",
 ]
 
-_ENV_TRUE = ("1", "true", "yes", "on")
-_ENV_FALSE = ("0", "false", "no", "off")
-
-
-def _flag(env: Mapping[str, str], name: str, default: bool) -> bool:
-    """``config.env_flag`` と同じ読み方（空・知らない値は既定）。"""
-    raw = env.get(name)
-    if raw is None:
-        return default
-    value = str(raw).strip().lower()
-    if value in _ENV_TRUE:
-        return True
-    if value in _ENV_FALSE:
-        return False
-    return default
-
 
 def _number(env: Mapping[str, str], name: str, default, kind):
-    raw = env.get(name)
-    if raw is None or not str(raw).strip():
-        return default
+    """``config.env_float`` で読み、読めなければ警告して既定。``kind`` が int なら int に直す。"""
+
+    def invalid(raw, stacklevel=5):
+        warnings.warn(f"{name}={raw!r} を数として読めないので既定の {default} を使う", RuntimeWarning,
+                      stacklevel=stacklevel)
+
+    value = env_float(name, default, env=env, on_invalid=invalid)
+    if kind is not int or value is default:  # 既定はそのまま返す
+        return value
     try:
-        value = float(str(raw).strip())
-        return int(value) if kind is int else value
-    except ValueError:
-        warnings.warn(f"{name}={raw!r} を数として読めないので既定の {default} を使う", RuntimeWarning, stacklevel=3)
+        return int(value)
+    except ValueError:  # 'nan' は float にはなるが int にならない
+        invalid(env.get(name), stacklevel=4)
         return default
 
 
@@ -112,8 +103,8 @@ class EnergyFilterConfig:
             max_dth=_number(env, "E_MAX_DTH", d.max_dth, float),
             winsor_low=_number(env, "E_WLOW", d.winsor_low, float),
             winsor_high=_number(env, "E_WHIGH", d.winsor_high, float),
-            lpf_native_on=_flag(env, "E_LPF_NATIVE_ON", d.lpf_native_on),
-            fc_adaptive_on=_flag(env, "E_FC_ADAPTIVE_ON", d.fc_adaptive_on),
+            lpf_native_on=env_flag("E_LPF_NATIVE_ON", d.lpf_native_on, env),
+            fc_adaptive_on=env_flag("E_FC_ADAPTIVE_ON", d.fc_adaptive_on, env),
             fc_min=_number(env, "E_FC_MIN", d.fc_min, float),
             fc_max=_number(env, "E_FC_MAX", d.fc_max, float),
             fc_k=_number(env, "E_FC_K", d.fc_k, float),
@@ -124,7 +115,7 @@ class EnergyFilterConfig:
             f0_snr_threshold=_number(env, "E_F0_SNR_THRESHOLD", d.f0_snr_threshold, float),
             fps_min=_number(env, "E_FPS_MIN", d.fps_min, float),
             fps_max=_number(env, "E_FPS_MAX", d.fps_max, float),
-            debug=_flag(env, "E_DEBUG", d.debug),
+            debug=env_flag("E_DEBUG", d.debug, env),
         )
 
 
