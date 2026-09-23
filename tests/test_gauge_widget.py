@@ -197,6 +197,89 @@ class TestGaugeWidgetPublicApi:
         assert metrics.inFontUcs4(0x2715) is True  # ✕
 
 
+class TestGaugeWidgetPaintEvent:
+    """``GaugeWidget.paintEvent`` そのもの（静止層の ``QPixmap`` キャッシュの上に
+    動く層を重ねる、実際に画面へ出る経路）の画素を確かめる。
+
+    ``TestPaintScenePixels`` は ``render_image``／``paint_scene``（キャッシュを
+    使わない別経路。``paint_scene`` は毎回 role を問わず全部描く）だけを見て
+    おり、``paintEvent`` の経路（``_ensure_static_pixmap`` のキャッシュ→
+    ``drawPixmap``→動く層を重ねる）を実際に描いて確かめる試験が無かった
+    （レビュー指摘）。``widget.repaint()`` で同期的に描かせたあと
+    ``widget.grab().toImage()`` で画素を拾う。800×450 にしているのは、
+    ``TestPaintScenePixels`` と同じく ``s=1`` で設計座標と画素が 1:1に
+    対応し、``_layout`` の式を試験側で再現しなくて済むため。
+    """
+
+    def test_paint_event_draws_expected_pixels(self, qt_app):
+        from app.gauge.widget import GaugeWidget
+
+        parts = {
+            "elbow_L": PartReading(now=90.0, prev=None, band=BAND),  # 80<=90<100 → 帯が点灯
+            "elbow_R": PartReading(now=120.0, prev=None, band=BAND),  # >=100 → 過負荷
+        }
+        frame = _frame(parts, rep=3)
+
+        widget = GaugeWidget(show_joules=True)
+        try:
+            widget.resize(800, 450)
+            widget.show()
+            qt_app.processEvents()
+            widget.set_frame(frame)
+            widget.repaint()
+            image = widget.grab().toImage()
+
+            lo, hi = BAND
+            fl = max(0.0, min(1.0, lo / (1.25 * hi)))
+            fh = max(0.0, min(1.0, hi / (1.25 * hi)))
+            cx, cy = sc.CENTERS["elbow_L"]
+            x, y = _pt(cx, cy, sc.RB, (fl + fh) / 2.0)
+            assert image.pixelColor(x, y).name() == theme.BAND_ON  # 動く層（帯の色）
+
+            cx, cy = sc.CENTERS["elbow_R"]
+            x, y = _pt(cx, cy, sc.R, 0.5)
+            assert image.pixelColor(x, y).name() == theme.OVER  # 動く層（値の弧）
+
+            # 静止層（QPixmap キャッシュ）側の画素も見ておく: 人物の頭。
+            assert image.pixelColor(400, 118).name() == theme.TEXT
+        finally:
+            widget.deleteLater()
+
+    def test_paint_event_matches_render_image(self, qt_app):
+        from app.core.qt import QtGui
+        from app.gauge.widget import GaugeWidget, render_image
+
+        parts = {
+            "elbow_L": PartReading(now=90.0, prev=70.0, band=BAND),
+            "elbow_R": PartReading(now=120.0, prev=None, band=BAND),
+        }
+        frame = _frame(parts, rep=3)
+
+        widget = GaugeWidget(show_joules=True)
+        try:
+            widget.resize(800, 450)
+            widget.show()
+            qt_app.processEvents()
+            widget.set_frame(frame)
+            widget.repaint()
+            painted = widget.grab().toImage().convertToFormat(QtGui.QImage.Format_ARGB32)
+
+            expected = render_image(widget.state, 800, 450).convertToFormat(QtGui.QImage.Format_ARGB32)
+
+            # 4px おきに標本を取って比較する（全画素の突き合わせは遅いだけで
+            # 得るものが無い）。静止層（キャッシュ経由）と動く層（毎回重ねる）
+            # の両方を通る経路が、キャッシュを使わない paint_scene と同じ画を
+            # 描けているかどうかがここでの関心事。
+            mismatches = 0
+            for x in range(0, 800, 4):
+                for y in range(0, 450, 4):
+                    if painted.pixelColor(x, y) != expected.pixelColor(x, y):
+                        mismatches += 1
+            assert mismatches == 0, f"paintEvent と render_image で {mismatches} 点ずれた（4px おきの標本）"
+        finally:
+            widget.deleteLater()
+
+
 class TestGaugeWidgetPerformance:
     def test_static_layer_is_cached(self, qt_app):
         from app.gauge.widget import GaugeWidget
