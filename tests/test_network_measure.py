@@ -185,20 +185,24 @@ class TestPipeline:
                 assert np.all(np.isfinite(vector)), f"{name} に非有限値: {vector}"
 
     def test_cycles_are_detected_for_realistic_motion(self):
-        """現実的な大きさの往復運動でサイクルが検出されること。
+        """現実的な押し上げ（手を固定して体幹が 13 cm 上がる）で回が閉じること。
 
-        閾値（0.015）は既存パイプラインの単位系に合わせて調整されている。
-        投影行列の並進を m 単位にすると、この閾値が「1.5 m の移動」に相当し、
-        実データでは決して起こらない条件になる。cm 単位で組むこと。
+        2026-09-24 に回の区切りを ``PushCycleDetector``（左肩の y の往復、閾値 0.015）から ``RepDetector``
+        （肩の中点の重力の上向きへの射影）に替えた。以前はこの場所で上肢を左右・奥行きに振る合成（``_body_points``）の
+        往復を数えていたが、実行時の座標の y は奥行きで、実際の押し上げ（上下）では 1 回も閉じなかった。
+        同じ性質（現実的な動作で回が閉じる）を押し上げの合成で確かめる。投影行列の単位系（cm）の注意は同じ。
         """
-        measurement = self._run(frames=150)
-        assert measurement.cycle_count > 0, (
-            "1.2Hz・奥行き15cm の往復でサイクルが検出されない。"
-            "投影行列の単位系（cm）を確認すること。"
-        )
+        from hybrid_pushup import PushUp, run
+
+        measurement = _measurement()
+        run(measurement, PushUp(reps=2))
+        assert measurement.cycle_count == 2, "押し上げ 2 回で回が 2 回閉じない。投影行列の単位系（cm）を確認すること"
 
     def test_cycle_work_is_recorded_per_joint(self):
-        measurement = self._run(frames=150)
+        from hybrid_pushup import PushUp, run
+
+        measurement = _measurement()
+        run(measurement, PushUp(reps=2))
         assert measurement.cycle_count > 0
         for key, values in measurement.cycle_work.items():
             assert len(values) == measurement.cycle_count, f"{key} の記録数が揃っていない"
@@ -250,22 +254,26 @@ class TestJointPower:
         EKF は切る（2026-09-24 に混成へ EKF を入れた）。この合成は全身を 1.2 Hz・奥行き 15 cm で揺らしており、
         同梱の既定値の EKF が追える帯域（約 0.65 Hz）の外で、点ごとの遅れの違いが肘角の見かけの変化になる
         （1 サイクル 0.1〜0.35 J）。ここで確かめたいのは仕事率の式（相対角速度）なので、三角測量の値をそのまま使う。
+        回の区切りも替えた（``RepDetector``。肩は上下しないのでこの動作では回が閉じない）ので、関所を開いたままにして
+        （``dyn_gate=False``）走らせ全体で積んだ仕事を見る。上下の平行移動で同じ性質を見るテストは
+        ``test_hybrid_gate.TestReps.test_rigid_arms_moved_up_and_down_do_no_elbow_work``。
         """
         from app.hybrid.ekf import EkfSettings
 
         P0, P1 = _stereo_projections()
         measurement = NetworkMeasurement(
-            P0, P1, POSE_KEYPOINTS, MeasurementConfig(body_mass_kg=60.0, ekf=EkfSettings(enabled=False)))
+            P0, P1, POSE_KEYPOINTS,
+            MeasurementConfig(body_mass_kg=60.0, ekf=EkfSettings(enabled=False), dyn_gate=False))
         for index in range(150):
             t = index / 30.0
             truth = _body_points_rotating_right_arm(t)
             measurement.process(_pair_from_pixels(
                 int(t * 1e9), _project(measurement.P0, truth), _project(measurement.P1, truth)))
 
-        assert measurement.cycle_count > 0, "前提のサイクル検出が起きていない"
-        work = np.abs(np.array(measurement.cycle_work["elbow_R"]))
-        assert np.all(work < 0.05), (
-            f"肘角が一定なのに elbow_R のサイクル仕事が {work} J 出た。"
+        assert measurement.rep_work.frames > 100, "前提: 仕事を積んだフレームがある"
+        work = measurement.rep_work.work()["elbow_R"]
+        assert abs(work.pos) < 0.05 and abs(work.neg) < 0.05, (
+            f"肘角が一定なのに elbow_R の仕事が {work} J 出た。"
             " 部位の絶対角速度を使っていないか確認すること"
         )
 
@@ -281,81 +289,76 @@ class TestRobustness:
         assert measurement.process(broken) is None
 
     def test_nan_does_not_poison_the_cycle_baseline(self):
-        """NaN が基準値に混ざると、以後一度もサイクルを検出できなくなる。
+        """NaN が基準の高さに混ざると、以後一度も回を区切れなくなる。
 
-        既存のリアルタイム経路が踏んでいた問題（code-review 指摘 #5）と
-        同じ轍を踏まないこと。
+        既存のリアルタイム経路が踏んでいた問題（code-review 指摘 #5）と同じ轍を踏まないこと。
+        2026-09-24 に基準は ``PushCycleDetector`` の左肩の y の平均（5〜14 フレーム目）から、先頭の窓（肩と肘が
+        有限の組を 30 組）の肩の中点の高さの中央値に替わった。確かめる性質（NaN で汚れない）は同じ。
         """
         measurement = _measurement()
         truth = _body_points(0.0)
         p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
 
-        for index in range(20):
+        for index in range(40):
             if index == 7:
-                # 三角測量が破綻する入力（両カメラで同一点）を混ぜる
+                # 三角測量が破綻する入力を混ぜる
                 degenerate = np.full_like(p0, np.nan)
-                measurement.process(_pair_from_pixels(index * 33_000_000, degenerate, degenerate))
+                measurement.process(_pair_from_pixels(index * 33_333_333, degenerate, degenerate))
             else:
-                measurement.process(_pair_from_pixels(index * 33_000_000, p0, p1))
+                measurement.process(_pair_from_pixels(index * 33_333_333, p0, p1))
 
-        assert np.isfinite(measurement._baseline_sum), "基準値が NaN に汚染された"
+        assert np.isfinite(measurement.baseline_height_m), "基準の高さが NaN に汚染された"
 
     def test_missing_frame_at_detector_creation_does_not_disable_detection(self):
-        """検出器が作られる瞬間のフレームが欠測でも、検出が死なないこと。
+        """回の区切りが作られる瞬間のフレームが欠測でも、区切りが死なないこと。
 
-        既存実装は「フレーム番号ちょうど」で検出器を作るため、そのフレームが
-        欠測だと以後一度もサイクルを検出できない。ここでは実際に集まった
-        サンプル数で確定させるので、1 フレームの欠測では死なない。
+        旧来の実装は「フレーム番号ちょうど」で検出器を作るため、そのフレームが欠測だと以後一度も検出できなかった。
+        今は肩と肘が有限の組が 30 組たまった時点で作るので、1 フレームの欠測では死なない（その分 1 組遅れるだけ）。
         """
         measurement = _measurement()
         truth = _body_points(0.0)
         p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
 
-        broken_frame = measurement.config.baseline_last_frame  # 検出器が作られる直前
-        for index in range(20):
+        broken_frame = measurement.config.inertia_ready_frames - 1   # 窓が閉じるはずだったフレーム
+        for index in range(40):
             if index == broken_frame:
                 nan_pixels = np.full_like(p0, np.nan)
-                measurement.process(_pair_from_pixels(index * 33_000_000, nan_pixels, nan_pixels))
+                measurement.process(_pair_from_pixels(index * 33_333_333, nan_pixels, nan_pixels))
             else:
-                measurement.process(_pair_from_pixels(index * 33_000_000, p0, p1))
+                measurement.process(_pair_from_pixels(index * 33_333_333, p0, p1))
 
-        assert measurement._detector is not None, (
-            "1 フレームの欠測でサイクル検出器が作られなくなった"
-        )
+        assert measurement.rep_detector is not None, "1 フレームの欠測で回の区切りが作られなくなった"
 
     def test_baseline_divides_by_the_samples_actually_collected(self):
-        """欠測があっても平均が偏らないこと。
+        """欠測のフレームは先頭の窓に数えない（窓は肩と肘が有限の組を 30 組）。
 
-        固定の窓幅で割ると、欠測のぶんだけ基準値が 0 に寄る。
-        PushCycleDetector は基準値との差を 0.015 m の閾値で見るので、
-        ずれると検出のタイミングが狂う。
+        以前は基準値の平均を固定の窓幅で割ると欠測のぶんだけ 0 に寄る問題を見ていた。今は窓が有限の組だけを
+        数えるので、欠測が 3 つあれば窓が閉じるのが 3 組遅れる。
         """
         measurement = _measurement()
         truth = _body_points(0.0)
         p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
 
         skipped = {6, 8, 10}
-        for index in range(16):
-            if index in skipped:
-                nan_pixels = np.full_like(p0, np.nan)
-                measurement.process(_pair_from_pixels(index * 33_000_000, nan_pixels, nan_pixels))
-            else:
-                measurement.process(_pair_from_pixels(index * 33_000_000, p0, p1))
-
-        window = (
-            measurement.config.baseline_last_frame
-            - measurement.config.baseline_first_frame
-            + 1
-        )
-        assert measurement._baseline_samples == window - len(skipped), (
-            "欠測フレームが基準値のサンプル数に数えられている"
+        closed_at = None
+        for index in range(40):
+            pixels = (np.full_like(p0, np.nan),) * 2 if index in skipped else (p0, p1)
+            result = measurement.process(_pair_from_pixels(index * 33_333_333, *pixels))
+            if result.window_closed:
+                closed_at = index
+        assert closed_at == measurement.config.inertia_ready_frames - 1 + len(skipped), (
+            "欠測フレームが先頭の窓に数えられている"
         )
 
     def test_cycle_axis_follows_the_configuration(self):
-        """既存の RT_CYCLE_AXIS と同じく、既定は y 軸であること。"""
-        assert MeasurementConfig().cycle_axis == "y"
-        assert MeasurementConfig().cycle_axis_index == 1
-        assert MeasurementConfig(cycle_axis="z").cycle_axis_index == 2
+        """回の区切りの設定。かつては RT_CYCLE_AXIS（既定 y）の軸を選んでいたが、2026-09-24 から高さ（重力の上向き）で
+        見るので軸の設定は無い。代わりに関所の既定（HYBRID_DYN_GATE=1）と ``RepDetector`` の既定を確かめる。"""
+        from app.hybrid.rep_detector import RepConfig
+
+        config = MeasurementConfig()
+        assert config.dyn_gate is True
+        assert config.rep == RepConfig()
+        assert not hasattr(config, "cycle_axis")
 
     def test_history_is_bounded(self):
         """長時間の計測でメモリを食い潰さないこと。"""
@@ -415,7 +418,9 @@ class TestWorkUsesEachFramesDt:
 
         monkeypatch.setattr(nm, "push_up_joint_powers",
                             lambda torques, *a, **k: {joint: self.POWER for joint in torques})
-        measurement = _measurement()
+        # 座ったままの合成なので、関所（T9）を開いたままにして全フレームを積む
+        P0, P1 = _stereo_projections()
+        measurement = NetworkMeasurement(P0, P1, POSE_KEYPOINTS, MeasurementConfig(body_mass_kg=60.0, dyn_gate=False))
         truth = _body_points(0.0)
         p0, p1 = _project(measurement.P0, truth), _project(measurement.P1, truth)
         for k in range(frames):

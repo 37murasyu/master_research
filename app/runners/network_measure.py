@@ -11,7 +11,7 @@
 再利用しているもの:
     push_up_model（座位プッシュアップのモデル。USB・オフライン経路と共有）
         estimate_gravity / joint_axes / push_up_torques / segment_from_storage
-    utils.compute_local_torque / compute_joint_power / PushCycleDetector
+    utils.compute_local_torque / compute_joint_power
     utils_dynamic.calculate_inertia_tensor
     link_vector_calculator_module.LinkVectorCalculator
     body_part_storage_module.BodyPartDataStorage
@@ -25,7 +25,14 @@
     - キーポイントの並び順（config.pose_keypoints の昇順）
     - リンク定義（part_calculations）と、関節ごとの局所軸（push_up_model.joint_axes）
     - 慣性テンソルの部位行と長さの取り方
-    - サイクル検出の軸（既定 y）、閾値、mode='rise_to_rise'
+
+混成だけのもの（2026-09-24、USB 経路は触らない）:
+    - 回の区切りと力学の関所は ``app.hybrid.rep_detector.RepDetector``（肩の中点の重力の上向きへの射影＝高さ）。
+      USB と同じ ``PushCycleDetector``（左肩の y の往復）は、実行時の座標の y が奥行きなので、手を固定して体幹が
+      上下するだけの押し上げで 1 回も閉じなかった
+    - トルクと仕事率は関所によらず毎フレーム計算して記録し、仕事とゲージには関所が開いている間だけ積む
+      （座っている間の雑音の仕事を積まない。``MeasurementConfig.dyn_gate``）
+    - 仕事はフレームごとの dt で積む（``app.hybrid.rep_work``）
 
 **揃っていない点（重要）**:
     サイクルごとの量は仕事率 P = τ_y × (ω_リンク − ω_親)·y を積分した**仕事 [J]** で、既存の
@@ -66,7 +73,7 @@ from push_up_model import (
     torso_load_mass,
     trunk_up_vectors,
 )
-from utils import PushCycleDetector, compute_local_torque
+from utils import compute_local_torque
 from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transform_native
 
 from energy_pipeline import angle_between
@@ -74,9 +81,9 @@ from energy_pipeline import angle_between
 from app.gauge.thresholds import PartBand, part_bands
 from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
 from app.hybrid.gravity import GravityChoice, choose_gravity
-from app.hybrid.rep_detector import RepConfig, RepDetector
+from app.hybrid.rep_detector import RepConfig, RepDetector, RepEvent
 from app.tuning.ekf_profile import SCALE_REF_PAIR, body_scale_ratio
-from app.hybrid.rep_work import MAX_STEP_S, RepAccumulator, WorkSample
+from app.hybrid.rep_work import MAX_STEP_S, PartWork, RepAccumulator, WorkSample
 from app.net.sync_buffer import PairedSample
 
 # 歪み補正で扱う画像の外側の余白（幅・高さに対する比）。NetworkMeasurement._undistort を参照。
@@ -118,8 +125,6 @@ PART_LINKS: dict[str, tuple[int, int]] = {
 # 部位キーは config.py が持っている（順序も一致）。
 PART_KEYS = tuple(_PART_KEYS)
 
-_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
-
 
 @dataclass
 class MeasurementConfig:
@@ -132,21 +137,6 @@ class MeasurementConfig:
     # 1 フレームの瞬時値だとその瞬間の三角測量誤差が全実行に固定される（再検算 R-6）。
     inertia_ready_frames: int = INERTIA_LENGTH_FRAMES
     dynamics_ready_frames: int = max(7, INERTIA_LENGTH_FRAMES)
-
-    # サイクル検出の基準値を作るフレーム範囲（既存と同じ 5..14）
-    baseline_first_frame: int = 5
-    baseline_last_frame: int = 14
-    # 基準値を確定させるのに最低限必要なサンプル数。欠測があっても
-    # これだけ集まれば検出器を作る（1 フレームの欠測で無効化されないように）。
-    baseline_min_samples: int = 3
-
-    # サイクル検出に使う軸。既存の RT_CYCLE_AXIS（既定 'y'）に合わせる。
-    cycle_axis: str = "y"
-    cycle_threshold: float = 0.015
-    cycle_velocity_epsilon: float = 0.01
-    cycle_min_interval: int = 10
-    cycle_mode: str = "rise_to_rise"
-    cycle_negative_down: bool = True
 
     # 重力の決め方（push_up_model.estimate_gravity の mode）。慣性テンソルを確定する
     # 初期フレームの体幹の向きから決める。
@@ -163,6 +153,8 @@ class MeasurementConfig:
 
     # 押し上げの回の区切り（関所を兼ねる、app.hybrid.rep_detector）
     rep: RepConfig = field(default_factory=RepConfig)
+    # 力学の関所（HYBRID_DYN_GATE）。偽なら常に開いた扱い（回の区切りは RepDetector のまま）
+    dyn_gate: bool = True
 
     # EKF（app.hybrid.ekf）。既定は有効・同梱の既定値の雑音。計測の子は EkfSettings.from_env() を渡す
     ekf: EkfSettings = field(default_factory=EkfSettings)
@@ -171,10 +163,6 @@ class MeasurementConfig:
     # 物理計算が実際に見るのは直近 2 フレームだけ（LinkVectorCalculator は
     # i と i-1、calculate_M_and_F は [-1] しか使わない）。
     history_limit: int = 600
-
-    @property
-    def cycle_axis_index(self) -> int:
-        return _AXIS_INDEX.get(self.cycle_axis.strip().lower(), 1)
 
 
 @dataclass
@@ -200,6 +188,14 @@ class FrameResult:
     velocity: np.ndarray | None = None
     # このフレームで先頭の窓が閉じた（体格・重力・帯が決まった）
     window_closed: bool = False
+    # 関所が開いていた（このフレームの仕事を回とゲージに積んだ）。先読みで後から積んだフレームは偽のまま
+    dyn_active: bool = False
+    # 高さ = 肩の中点・上向き u [m]（窓が閉じる前・肩が無いフレームは NaN）
+    height_m: float = float("nan")
+    # このフレームが属する回の番号（0 始まり＝それまでに確定した回の数）
+    rep: int = 0
+    # 回を確定したフレームだけ: 部位ごとの W+・W−（app.hybrid.rep_work.PartWork）
+    cycle_parts: dict[str, PartWork] = field(default_factory=dict)
 
 
 class NetworkMeasurement:
@@ -269,11 +265,11 @@ class NetworkMeasurement:
         # ゲージの状態（app.gauge.tracker.GaugeTracker）。None なら積まない
         self.tracker = tracker
 
-        # サイクル検出
-        self._baseline_sum = 0.0
-        self._baseline_samples = 0
-        self._detector = None
+        # 確定した回。cycle_work は部位ごとの符号付きの仕事 W± [J]、cycles は回ごとの詳細（frame・t_ns・parts）
         self.cycle_work: dict[str, list[float]] = {k: [] for k in PART_KEYS}
+        self.cycles: list[dict] = []
+        # 押し上げでなかった回（最小の持ち上げに届かず捨てた）の数
+        self.discarded_reps = 0
         # 今の回の仕事。フレームごとの dt で積む（かつては確定したフレームの dt を全体に掛けていた）
         self.rep_work = RepAccumulator(PART_KEYS)
 
@@ -318,7 +314,6 @@ class NetworkMeasurement:
             del self._recent_points[0]
 
         self._update_links(dt)
-        self._update_baseline(raw)
 
         result = FrameResult(t_ns=pair.t_ns, points_3d=points, dt_s=dt, points_raw=raw,
                              grid_index=grid, velocity=velocity)
@@ -328,10 +323,11 @@ class NetworkMeasurement:
 
         if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
             dynamics = self._dynamics(points)
+            sample = None
             if dynamics is not None:
                 result.local_torques, result.powers, theta, tau_y = dynamics
-                self.rep_work.add(WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y))
-                self._accumulate_cycle(points, dt, result)
+                sample = WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y)
+            self._gate(points, velocity, dt, sample, result)
 
         self.frame_index += 1
         self._append_result(result)
@@ -432,43 +428,6 @@ class NetworkMeasurement:
                 continue
             r_vec, vel, omega, centroid, p1, acc, ang_acc = result
             self.storage.add_data(part, r_vec, vel, omega, centroid, p1, ang_acc, acc)
-
-    def _cycle_value(self, points: np.ndarray) -> float:
-        """サイクル検出に使うスカラー。既存は右手首相当の点の指定軸。"""
-        return float(points[0][self.config.cycle_axis_index])
-
-    def _update_baseline(self, points: np.ndarray) -> None:
-        """サイクル検出の基準値（安定座位での値）を作る。
-
-        欠測に強くしてある。既存はフレーム番号ちょうどで検出器を作るので、
-        その 1 フレームが欠測だと以後一度も検出されない。ここでは
-        実際に集まったサンプル数で平均し、範囲を過ぎた時点で確定させる。
-        """
-        config = self.config
-        value = self._cycle_value(points)
-
-        in_window = config.baseline_first_frame <= self.frame_index <= config.baseline_last_frame
-        if in_window and math.isfinite(value):
-            self._baseline_sum += value
-            self._baseline_samples += 1
-
-        if self._detector is not None:
-            return
-        if self.frame_index < config.baseline_last_frame:
-            return
-        if self._baseline_samples < config.baseline_min_samples:
-            # まだ足りない。窓を過ぎても集まるまで待つ（全滅時は検出しない）。
-            return
-
-        baseline = self._baseline_sum / self._baseline_samples
-        self._detector = PushCycleDetector(
-            baseline,
-            threshold=config.cycle_threshold,
-            velocity_epsilon=config.cycle_velocity_epsilon,
-            min_interval=config.cycle_min_interval,
-            mode=config.cycle_mode,
-            negative_down=config.cycle_negative_down,
-        )
 
     def _collect_window(self, raw: np.ndarray, points: np.ndarray, result: FrameResult) -> None:
         """肩と肘が有限の組を先頭の窓に溜め、埋まったら閉じる。"""
@@ -614,24 +573,64 @@ class NetworkMeasurement:
             tau_y[f"elbow_{side}"] = float(local[f"elbow_{side}"][1])
         return {key: local[key] for key in PART_KEYS}, powers_by_key, theta, tau_y
 
-    def _accumulate_cycle(self, points: np.ndarray, dt: float, result: FrameResult) -> None:
-        """サイクルを検出し、その区間の仕事を積む。"""
-        if self._detector is None:
-            return
+    def _height(self, vectors: np.ndarray | None) -> float:
+        """肩の中点の上向き成分（位置なら高さ [m]、速度なら上向きの速さ [m/s]）。"""
+        if vectors is None or self.up is None:
+            return float("nan")
+        mid = 0.5 * (vectors[slot_of("L_SHOULDER")] + vectors[slot_of("R_SHOULDER")])
+        return float(mid @ self.up)
 
-        value = self._cycle_value(points)
-        if not math.isfinite(value):
-            return
-
-        if self._detector.update(value, self.frame_index):
+    def _gate(self, points: np.ndarray, velocity: np.ndarray | None, dt: float,
+              sample: WorkSample | None, result: FrameResult) -> None:
+        """関所と回の区切り。開いている間だけ仕事とゲージに積み、閉じている間は先読みの輪に置く。"""
+        result.rep = self.cycle_count
+        detector = self.rep_detector
+        gate = self.config.dyn_gate
+        event = RepEvent.NONE
+        result.height_m = self._height(points)
+        if detector is not None:
+            speed = self._height(velocity) if velocity is not None else None
+            event = detector.update(result.height_m, speed, dt)
+        if event is RepEvent.OPENED and gate:
+            for held in self.rep_work.release():
+                self._feed_tracker(held)
+        is_open = (not gate) or (detector is not None and detector.is_open) \
+            or event in (RepEvent.CLOSED, RepEvent.DISCARDED)
+        result.dyn_active = is_open
+        if sample is not None:
+            if is_open:
+                if self.rep_work.add(sample):
+                    self._feed_tracker(sample)
+            else:
+                self.rep_work.hold(sample)
+        if event is RepEvent.CLOSED:
             self._close_rep(result)
+        elif event is RepEvent.DISCARDED and gate:
+            # 押し上げでなかった（持ち上げが 3 cm に届かない）。今の回の仕事を捨てる
+            self.rep_work.reset()
+            self.discarded_reps += 1
+            if self.tracker is not None:
+                self.tracker.discard_rep()
+
+    def _feed_tracker(self, sample: WorkSample) -> None:
+        if self.tracker is None:
+            return
+        for part in self.tracker.parts:
+            power = sample.powers.get(part)
+            if power is not None:
+                self.tracker.add(part, power, sample.dt)
 
     def _close_rep(self, result: FrameResult) -> None:
         """今の回を確定する。仕事はフレームごとの dt で積んだ値（``rep_work``）。"""
         result.cycle_detected = True
-        for key, work in self.rep_work.reset().items():
+        parts = self.rep_work.reset()
+        for key, work in parts.items():
             self.cycle_work[key].append(work.net)
             result.cycle_work_j[key] = work.net
+        result.cycle_parts = parts
+        self.cycles.append({"frame": self.frame_index, "t_ns": result.t_ns, "parts": parts})
+        if self.tracker is not None:
+            self.tracker.close_rep()
 
     # -- メモリ管理 --------------------------------------------------------
     def _append_result(self, result: FrameResult) -> None:
