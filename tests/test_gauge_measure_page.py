@@ -567,3 +567,74 @@ class TestCalibrationTime:
             assert window._stack.currentIndex() == 1
         finally:
             window.close()
+
+
+# ---------------------------------------------------------------------------
+# 計算を壊す設定の件数バッジ・ログの「未実行」・スイッチの即時保存
+# ---------------------------------------------------------------------------
+
+
+class TestBrokenFlagBadge:
+    def test_badge_counts_enabled_broken_flags(self, qt_app):
+        from app.shell.page_measure import MeasurePage
+
+        settings = Settings()
+        settings.set("DEMO_MONO_GAUGE_ON", True)
+        page = MeasurePage(settings)
+        try:
+            assert page._advanced._badge.text() == "✕ 1"
+            assert not page._advanced._badge.isHidden()
+            settings.set("E_LPF_NATIVE_ON", True)
+            page._form.changed.emit()
+            assert page._advanced._badge.text() == "✕ 2"
+            assert page._dev._badge.text() == "✕ 2", "中の開示にも、どこを見ればよいかを出す"
+        finally:
+            page.shutdown()
+
+    def test_badge_is_hidden_when_every_flag_is_at_its_default(self, page):
+        assert page._advanced._badge.isHidden()
+        assert page._dev._badge.isHidden()
+
+    def test_badge_follows_the_nested_form(self, page):
+        from app.core.qt import QtWidgets
+
+        # 行の見出しは設定名。DEMO_MONO_CAM0_ONLY のチェックボックスを押す
+        for form in page._form.findChildren(QtWidgets.QFormLayout):
+            for row in range(form.rowCount()):
+                label = form.itemAt(row, QtWidgets.QFormLayout.LabelRole)
+                if label is not None and label.widget().text() == "DEMO_MONO_CAM0_ONLY":
+                    form.itemAt(row, QtWidgets.QFormLayout.FieldRole).widget().click()
+        assert page._settings.get("DEMO_MONO_CAM0_ONLY") is True
+        assert page._advanced._badge.text() == "✕ 1"
+
+
+class TestLogPlaceholder:
+    def test_log_shows_placeholder_before_first_run(self, page):
+        assert page._log.placeholderText() == "未実行"
+        assert page._log.toPlainText() == ""
+
+
+class TestImmediateSave:
+    def test_switch_emits_settings_edited(self, page):
+        edited = []
+        page.settings_edited.connect(lambda: edited.append(True))
+        page._joules_switch.click()
+        assert edited == [True]
+
+    def test_switch_saves_immediately(self, qt_app, monkeypatch, tmp_path):
+        import json
+
+        from app.shell import main_window as mw
+
+        path = tmp_path / "settings.json"
+        monkeypatch.setattr(mw.Settings, "default_path", classmethod(lambda cls: path))
+        window = mw.MainWindow(Settings())
+        try:
+            page = window._pages[0]
+            before = bool(window._settings.get("GAUGE_SHOW_JOULES"))
+            page._joules_switch.click()
+            assert path.is_file(), "閉じる前に保存されていない"
+            saved = json.loads(path.read_text(encoding="utf-8"))["values"]
+            assert Settings(saved).get("GAUGE_SHOW_JOULES") is (not before)
+        finally:
+            window.close()
