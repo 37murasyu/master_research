@@ -129,12 +129,14 @@ def test_no_css_classes_or_vars():
 
 # ---------------------------------------------------------------------------
 # 見た目のつながり（QtSvg で実際に描いて確かめる）
+#
+# importorskip と PySide6 の import は、Qt が要る試験だけが実行する
+# qt_app フィクスチャの中に閉じる（tests/test_hybrid_gui.py の
+# test_input_switch_disables_during_run が前例）。モジュール直下に置くと、
+# PySide6 の無い環境でファイル全体が collection の時点でスキップになり、
+# その手前にある Qt に依存しない 4 件（test_svgs_are_well_formed 等）まで
+# 消えてしまう。
 # ---------------------------------------------------------------------------
-
-pytest.importorskip("PySide6", reason="Qt が無い環境ではスキップ")
-
-from PySide6 import QtSvg  # noqa: E402（importorskip の後でだけ import する）
-from app.core.qt import QtCore, QtGui, QtWidgets  # noqa: E402
 
 SCALE = 4  # 800x450 を 3200x1800 で描く
 
@@ -149,6 +151,9 @@ SEAT_Y = 302.0  # id="seat" の d="M370 302H430"
 
 
 def _render(svg: str, background: str):
+    from PySide6 import QtSvg
+    from app.core.qt import QtCore, QtGui
+
     renderer = QtSvg.QSvgRenderer(QtCore.QByteArray(svg.encode("utf-8")))
     assert renderer.isValid(), "SVG を解釈できない"
     width, height = int(800 * SCALE), int(450 * SCALE)
@@ -163,6 +168,8 @@ def _render(svg: str, background: str):
 
 def _column(image, x: float, y0: float, y1: float, background) -> None:
     """列（x 固定）を y0 から y1 まで走査し、地の色の画素が無いことを確かめる。"""
+    from app.core.qt import QtGui
+
     px = round(x * SCALE)
     field = QtGui.QColor(background)
     y = y0
@@ -175,6 +182,9 @@ def _column(image, x: float, y0: float, y1: float, background) -> None:
 
 @pytest.fixture(scope="module")
 def qt_app():
+    pytest.importorskip("PySide6", reason="Qt が無い環境ではスキップ")
+    from app.core.qt import QtWidgets
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     yield app
 
@@ -191,6 +201,8 @@ def test_figure_is_continuous_from_shoulders_to_feet(qt_app):
 
 
 def test_seat_passes_behind_the_legs(qt_app):
+    from app.core.qt import QtGui
+
     svg = pictograms.figure_svg(**FIGURE_COLORS)
     image = _render(svg, theme.FIELD)
 
