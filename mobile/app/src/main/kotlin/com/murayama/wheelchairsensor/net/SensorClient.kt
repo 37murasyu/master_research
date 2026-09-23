@@ -31,6 +31,11 @@ class SensorClient(
         fun onProgress(sent: Long, dropped: Long)
         /** PC から撮影要求が届いた（OkHttp のスレッドで呼ばれる）。 */
         fun onCaptureRequested(request: Protocol.CaptureRequest) {}
+        /**
+         * 接続が切れた（OkHttp のスレッドで、状態の通知より先に呼ばれる）。
+         * [retryable] が真なら、同じ接続先へつなぎ直してよい（[isRetryableClose]）。
+         */
+        fun onConnectionLost(retryable: Boolean) {}
     }
 
     enum class State { IDLE, CONNECTING, SYNCING, STREAMING, ERROR }
@@ -108,6 +113,8 @@ class SensorClient(
                 if (!isCurrent()) return
                 Log.w(TAG, "接続に失敗しました", t)
                 socket = null
+                // PC 側のツールがまだ起動していない・Wi-Fi が切れた、など。つなぎ直せば戻る
+                listener.onConnectionLost(retryable = true)
                 updateState(State.ERROR, t.message ?: "接続に失敗しました")
             }
 
@@ -119,6 +126,7 @@ class SensorClient(
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (!isCurrent()) return
                 socket = null
+                listener.onConnectionLost(retryable = isRetryableClose(code))
                 if (code == NORMAL_CLOSURE || code == GOING_AWAY) {
                     updateState(State.IDLE, reason.ifBlank { null })
                 } else {
@@ -264,5 +272,17 @@ class SensorClient(
 
         private const val NORMAL_CLOSURE = 1000
         private const val GOING_AWAY = 1001
+        /** PC が名乗りを断った（役割違い・別の session・校正と違う端末）。 */
+        private const val POLICY_VIOLATION = 1008
+        /** 同じ役割の別の接続に席を譲った（app/net/server.py の CLOSE_TAKEN_OVER）。 */
+        private const val TAKEN_OVER = 4000
+
+        /**
+         * PC に閉じられたとき、同じ接続先へ自動でつなぎ直してよいか。
+         *
+         * PC がはっきり断ったときはつなぎ直さない。断られ続け、理由の表示もすぐ消える。
+         * PC 側のツールを終えた（1001）・通信の異常（1006）などは、PC を起動し直せば戻る。
+         */
+        fun isRetryableClose(code: Int): Boolean = code != POLICY_VIOLATION && code != TAKEN_OVER
     }
 }

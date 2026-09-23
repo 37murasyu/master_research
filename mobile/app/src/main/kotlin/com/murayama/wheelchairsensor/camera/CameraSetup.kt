@@ -4,7 +4,9 @@ import android.hardware.camera2.CaptureRequest
 import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -13,6 +15,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 
 /**
  * カメラを開き、姿勢推定にフレームを流す。
@@ -31,6 +34,8 @@ class CameraSetup(
 ) {
 
     private var provider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+    private var purpose: CameraPurpose? = null
 
     fun start(
         provider: ProcessCameraProvider,
@@ -69,15 +74,20 @@ class CameraSetup(
             it.setAnalyzer(analysisExecutor, analyzer)
         }
 
-        provider.bindToLifecycle(
+        camera = provider.bindToLifecycle(
             lifecycleOwner,
             CameraSelector.DEFAULT_BACK_CAMERA,
             preview,
             analysis,
         )
+        this.purpose = purpose
+        // QR 読み取りは最初に画面の中央へピントを合わせる。既定の連続 AF だけだと、
+        // 画面に映した QR のような細かい模様で微妙に外れたまま落ち着くことがある。
+        if (!purpose.fixOptics) previewView.post { focusCenter() }
 
         val optics = if (purpose.fixOptics) "AF・AE・AWB 固定" else "オートフォーカス"
-        onReady("解像度 ${TARGET_RESOLUTION.width}x${TARGET_RESOLUTION.height} / $optics")
+        // 実際の解像度は目標（TARGET_RESOLUTION）と違うことがある（4:3 が選ばれる）。表示は実際のフレームから出す
+        onReady(optics)
     }
 
     /**
@@ -118,9 +128,32 @@ class CameraSetup(
         }
     }
 
+    /**
+     * プレビュー上の点 ([x], [y]) にピントと露出を合わせる（タップでのピント合わせ）。
+     *
+     * **光学系を固定している用途（計測）では何もしない**。レンズが動くと、校正で求めた
+     * 内部パラメータが実際の映像と合わなくなる。3 秒後に連続 AF へ戻る。
+     */
+    fun focusAt(x: Float, y: Float) {
+        val current = camera ?: return
+        if (purpose?.fixOptics != false) return
+        val point = previewView.meteringPointFactory.createPoint(x, y)
+        val action = FocusMeteringAction.Builder(
+            point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+        )
+            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+            .build()
+        current.cameraControl.startFocusAndMetering(action)
+    }
+
+    /** 画面の中央にピントを合わせる。QR は中央に写すことが多い。 */
+    fun focusCenter() = focusAt(previewView.width / 2f, previewView.height / 2f)
+
     fun stop() {
         provider?.unbindAll()
         provider = null
+        camera = null
+        purpose = null
     }
 
     companion object {

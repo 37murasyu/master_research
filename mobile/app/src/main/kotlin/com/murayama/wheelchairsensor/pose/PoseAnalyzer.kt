@@ -44,7 +44,25 @@ class PoseAnalyzer(
         val landmarks: List<FloatArray>,
     )
 
+    @Volatile
     private var landmarker: PoseLandmarker? = null
+
+    /** 推定器を閉じるのと、推定器へ画像を渡すのを排他にする（analyze / close）。 */
+    private val lifecycleLock = Any()
+
+    /** 実際に解析しているフレームの寸法。CameraX は目標の 1280x720 ではなく 4:3 を選ぶことがある。 */
+    @Volatile
+    var lastFrameWidth = 0
+        private set
+
+    @Volatile
+    var lastFrameHeight = 0
+        private set
+
+    /** 最後に人を検出した時刻（端末の単調時計）。画面に「人が写っていない」を出すのに使う。 */
+    @Volatile
+    var lastPersonNanos = 0L
+        private set
 
     /** 送り出したフレームの情報。結果が返ってきたときに突き合わせる。 */
     private data class PendingFrame(val captureNanos: Long, val width: Int, val height: Int)
@@ -90,8 +108,7 @@ class PoseAnalyzer(
     }
 
     override fun analyze(image: ImageProxy) {
-        val detector = landmarker
-        if (detector == null) {
+        if (landmarker == null) {
             image.close()
             return
         }
@@ -116,8 +133,16 @@ class PoseAnalyzer(
                 pendingFrames[timestampMs] =
                     PendingFrame(captureNanos, bitmap.width, bitmap.height)
             }
+            lastFrameWidth = bitmap.width
+            lastFrameHeight = bitmap.height
 
-            detector.detectAsync(BitmapImageBuilder(bitmap).build(), timestampMs)
+            // close() と同じロックの中で渡す。閉じかけの推定器に渡すと、ネイティブ側が
+            // 解放済みのメモリに触れてプロセスごと落ちる（detectAsync の画像生成で
+            // SIGSEGV / SIGABRT になった記録がある）。
+            synchronized(lifecycleLock) {
+                val current = landmarker ?: return
+                current.detectAsync(BitmapImageBuilder(bitmap).build(), timestampMs)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "フレームを処理できませんでした", e)
         } finally {
@@ -138,6 +163,7 @@ class PoseAnalyzer(
 
         val poses = result.landmarks()
         if (poses.isEmpty()) return  // 人が写っていないフレームは送らない
+        lastPersonNanos = SystemClock.elapsedRealtimeNanos()
 
         val points = poses[0].map { landmark ->
             floatArrayOf(
@@ -158,9 +184,14 @@ class PoseAnalyzer(
         )
     }
 
+    /**
+     * 推定器を閉じる。解析のスレッドが detectAsync の途中なら、それが終わるのを待ってから閉じる。
+     */
     fun close() {
-        landmarker?.close()
-        landmarker = null
+        val closing = synchronized(lifecycleLock) {
+            landmarker.also { landmarker = null }
+        }
+        closing?.close()
     }
 
     companion object {
