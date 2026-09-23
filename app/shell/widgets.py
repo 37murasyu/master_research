@@ -68,18 +68,24 @@ class SettingsForm(QtWidgets.QWidget):
 
     ``Setting.ui_visible`` が真のものだけを扱う。135 個すべてを並べても
     使えないので、意味のあるものに絞ってある（``settings.CURATED`` を参照）。
+    ``exclude`` に挙げた項目は並べない（画面が専用の欄を別に置いているもの）。
     """
 
     changed = QtCore.Signal()
 
-    def __init__(self, settings: Settings, parent: QtWidgets.QWidget | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        exclude: frozenset[str] = frozenset(),
+        parent: QtWidgets.QWidget | None = None,
+    ):
         super().__init__(parent)
         self._settings = settings
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        visible = [s for s in SCHEMA.values() if s.ui_visible]
+        visible = [s for s in SCHEMA.values() if s.ui_visible and s.name not in exclude]
         groups: dict[str, list[Setting]] = {}
         for setting in visible:
             groups.setdefault(setting.group, []).append(setting)

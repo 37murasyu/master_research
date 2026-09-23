@@ -41,15 +41,21 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self._stack, 1)
         self.setCentralWidget(central)
 
+        measure = MeasurePage(self._settings)
+        calibrate = CalibratePage(self._settings)
         for label, page in (
-            ("計測", MeasurePage(self._settings)),
-            ("キャリブレーション", CalibratePage(self._settings)),
+            ("計測", measure),
+            ("キャリブレーション", calibrate),
             ("解析", AnalyzePage(self._settings)),
         ):
             self._nav.addItem(label)
             self._stack.addWidget(page)
             self._pages.append(page)
 
+        # 計測画面の校正の「変更」リンクで、キャリブレーション画面へ移る
+        measure.calibration_requested.connect(
+            lambda: self._nav.setCurrentRow(self._pages.index(calibrate))
+        )
         self._nav.currentRowChanged.connect(self._stack.setCurrentIndex)
         self._nav.setCurrentRow(0)
 
