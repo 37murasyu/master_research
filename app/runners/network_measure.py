@@ -38,7 +38,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import cv2 as cv
 import numpy as np
@@ -71,7 +71,11 @@ from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transfor
 
 from energy_pipeline import angle_between
 
+from app.gauge.thresholds import PartBand, part_bands
 from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
+from app.hybrid.gravity import GravityChoice, choose_gravity
+from app.hybrid.rep_detector import RepConfig, RepDetector
+from app.tuning.ekf_profile import SCALE_REF_PAIR, body_scale_ratio
 from app.hybrid.rep_work import MAX_STEP_S, RepAccumulator, WorkSample
 from app.net.sync_buffer import PairedSample
 
@@ -88,7 +92,18 @@ def _translate_image(P: np.ndarray, shift: np.ndarray) -> np.ndarray:
     S = np.array([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]], [0.0, 0.0, 1.0]])
     return S @ P
 
-__all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig"]
+__all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig", "ImplausibleBodyScale", "EXIT_IMPLAUSIBLE_SCALE"]
+
+# 体格の検査で止めたときの終了コード（USB 経路の EXIT_IMPLAUSIBLE_SCALE と同じ。解像度の不一致と共用し、meta の error で見分ける）
+EXIT_IMPLAUSIBLE_SCALE = 3
+
+
+class ImplausibleBodyScale(ValueError):
+    """先頭の窓の肩–肘の長さが人体の範囲（``ekf_profile.PLAUSIBLE_REF_LEN``）の外。
+
+    座標の単位か校正が壊れている（校正の並進を m で保存すると 1/100 になる。2026-09-23 の実機は右上腕が 6.4 m）。
+    そのまま逆動力学に入れるとトルクが桁違いになるので計測を止める。
+    """
 
 # 体幹から重力を決められないときの既定（三角測量の変換で z が上になる。カメラが水平という前提）
 DEFAULT_GRAVITY = np.asarray(_CONFIG_GRAVITY, dtype=np.float64)
@@ -136,6 +151,18 @@ class MeasurementConfig:
     # 重力の決め方（push_up_model.estimate_gravity の mode）。慣性テンソルを確定する
     # 初期フレームの体幹の向きから決める。
     gravity_mode: str = "axis"
+    # 盤の向きを吸着させる候補の軸（None なら 6 つ。app.hybrid.gravity.candidate_axes）、
+    # 上位 2 つが近いときに優先する重力の向き（実行時の座標は z が上）と、その近さの幅（GRAVITY_AMBIG_DELTA）
+    gravity_candidates: tuple[str, ...] | None = None
+    gravity_preferred: str = "Z-"
+    gravity_ambiguity: float = 0.08
+
+    # 被験者の 1RM [kg]（部位 → 値、app.gauge.thresholds.load_one_rm）。None なら帯を出さない
+    one_rm: Mapping[str, float | None] | None = None
+    subject_id: str | None = None
+
+    # 押し上げの回の区切り（関所を兼ねる、app.hybrid.rep_detector）
+    rep: RepConfig = field(default_factory=RepConfig)
 
     # EKF（app.hybrid.ekf）。既定は有効・同梱の既定値の雑音。計測の子は EkfSettings.from_env() を渡す
     ekf: EkfSettings = field(default_factory=EkfSettings)
@@ -171,6 +198,8 @@ class FrameResult:
     grid_index: int = 0
     # EKF の速度 [m/s]（点 × 3）。EKF が無効なら None
     velocity: np.ndarray | None = None
+    # このフレームで先頭の窓が閉じた（体格・重力・帯が決まった）
+    window_closed: bool = False
 
 
 class NetworkMeasurement:
@@ -186,6 +215,9 @@ class NetworkMeasurement:
         pose_keypoints: Sequence[int],
         config: MeasurementConfig | None = None,
         lens: dict | None = None,
+        *,
+        tracker=None,
+        board_up: np.ndarray | None = None,
     ):
         self.P0 = np.asarray(projection_left, dtype=np.float64)
         self.P1 = np.asarray(projection_right, dtype=np.float64)
@@ -219,8 +251,23 @@ class NetworkMeasurement:
         self.ekf = GridEkf(self.config.ekf, self.pose_keypoints) if self.config.ekf.enabled else None
 
         self._inertia: dict[str, np.ndarray] = {}
-        self._inertia_samples: list[np.ndarray] = []
         self.gravity: np.ndarray | None = None
+        self.gravity_choice: GravityChoice | None = None
+
+        # 先頭の窓（肩と肘が有限の組を inertia_ready_frames 組）。閉じたら体格・重力・帯・回の区切りが決まる
+        self._window_raw: list[np.ndarray] = []
+        self._window_points: list[np.ndarray] = []
+        self.window_closed = False
+        self.window: dict = {}
+        # 校正に盤を立てた向き（実行時の座標の単位ベクトル、app.hybrid.gravity.read_board_up）
+        self.board_up = None if board_up is None else np.asarray(board_up, dtype=np.float64)
+        self.up: np.ndarray | None = None
+        self.baseline_height_m: float | None = None
+        self.forearm_m: dict[str, float | None] = {}
+        self.bands: dict[str, PartBand] = {}
+        self.rep_detector: RepDetector | None = None
+        # ゲージの状態（app.gauge.tracker.GaugeTracker）。None なら積まない
+        self.tracker = tracker
 
         # サイクル検出
         self._baseline_sum = 0.0
@@ -276,11 +323,8 @@ class NetworkMeasurement:
         result = FrameResult(t_ns=pair.t_ns, points_3d=points, dt_s=dt, points_raw=raw,
                              grid_index=grid, velocity=velocity)
 
-        if not self._inertia:
-            self._inertia_samples.append(points)
-            if len(self._inertia_samples) >= self.config.inertia_ready_frames:
-                self._build_inertia(np.stack(self._inertia_samples))
-                self._inertia_samples = []
+        if not self.window_closed:
+            self._collect_window(raw, points, result)
 
         if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
             dynamics = self._dynamics(points)
@@ -426,6 +470,67 @@ class NetworkMeasurement:
             negative_down=config.cycle_negative_down,
         )
 
+    def _collect_window(self, raw: np.ndarray, points: np.ndarray, result: FrameResult) -> None:
+        """肩と肘が有限の組を先頭の窓に溜め、埋まったら閉じる。"""
+        needed = [slot_of(name) for name in ("L_SHOULDER", "R_SHOULDER", "L_ELBOW", "R_ELBOW")]
+        if not np.all(np.isfinite(raw[needed])):
+            return
+        self._window_raw.append(raw)
+        self._window_points.append(points)
+        if len(self._window_raw) >= self.config.inertia_ready_frames:
+            self._close_window()
+            result.window_closed = True
+
+    def _close_window(self) -> None:
+        """先頭の窓で、体格の検査・EKF の掛け直し・慣性・重力・上向きと基準の高さ・前腕長・帯・回の区切りを決める。
+
+        体格の検査は EKF の手前の値（``points_raw``）で、プロファイルの有無によらず行う（USB はプロファイル使用時だけ）。
+        それ以外は EKF の後の値。
+        """
+        raw = np.stack(self._window_raw)
+        points = np.stack(self._window_points)
+        self._window_raw, self._window_points = [], []
+
+        first, second = (self._keypoints_in_id_order.index(i) for i in SCALE_REF_PAIR)
+        run_length = float(np.nanmedian(np.linalg.norm(raw[:, first] - raw[:, second], axis=1)))
+        noise = None if self.ekf is None else self.ekf.noise
+        scale_ref = noise.resolution.scale_ref if noise is not None and noise.origin == "profile" else None
+        try:
+            ratio = body_scale_ratio(scale_ref, run_length)
+        except ValueError as error:
+            raise ImplausibleBodyScale(str(error)) from error
+        if scale_ref:
+            self.ekf.set_scale(ratio)
+
+        self._build_inertia(points)
+        self.up = -self.gravity / np.linalg.norm(self.gravity)
+        shoulders = 0.5 * (points[:, slot_of("L_SHOULDER")] + points[:, slot_of("R_SHOULDER")])
+        self.baseline_height_m = float(np.nanmedian(shoulders @ self.up))
+
+        def median_length(a: str, b: str) -> float | None:
+            lengths = np.linalg.norm(points[:, slot_of(a)] - points[:, slot_of(b)], axis=1)
+            lengths = lengths[np.isfinite(lengths)]
+            return float(np.median(lengths)) if lengths.size else None
+
+        self.forearm_m = {side: median_length(f"{side}_ELBOW", f"{side}_WRIST") for side in ("L", "R")}
+        self.bands = part_bands(self.config.body_mass_kg, self.forearm_m, self.config.one_rm or {})
+        if self.tracker is not None:
+            self.tracker.set_bands(self.bands)
+        if math.isfinite(self.baseline_height_m):
+            self.rep_detector = RepDetector(self.baseline_height_m, self.config.rep)
+
+        choice = self.gravity_choice
+        self.window = {
+            "ekf_scale_ratio": ratio if scale_ref else None,
+            "ekf_run_length_m": run_length,
+            "gravity": self.gravity.tolist(),
+            "gravity_label": None if choice is None else choice.label,
+            "gravity_source": None if choice is None else choice.source,
+            "baseline_height_m": self.baseline_height_m,
+            "forearm_len_m": dict(self.forearm_m),
+        }
+        self.window_closed = True
+
     def _build_inertia(self, samples: np.ndarray) -> None:
         """慣性テンソルと重力を確定させる。
 
@@ -434,7 +539,8 @@ class NetworkMeasurement:
         ``I = a*w + b*l + c`` は l に極端に敏感なので大きくずれる（再検算 R-6）。
         腕は左右で長さが違うので、テンソルも左右別に持つ（計画メモ E-1d）。
 
-        重力は同じ初期フレームの体幹（腰中点 → 肩中点）の向きから決める（§1-5）。
+        重力は同じ初期フレームの体幹（腰中点 → 肩中点）の向きから決める（§1-5）。校正の meta に盤を立てた
+        向き（``board_up``）があれば、最寄りの軸に吸着させて使う（``app.hybrid.gravity.choose_gravity``）。
         """
         mass = self.config.body_mass_kg
 
@@ -449,13 +555,17 @@ class NetworkMeasurement:
             "forearm_L": calculate_inertia_tensor(4, mass, length("L_ELBOW", "L_WRIST")),
         }
         ups = trunk_up_vectors(*(samples[:, slot_of(n)] for n in ("L_SHOULDER", "R_SHOULDER", "L_HIP", "R_HIP")))
-        try:
-            self.gravity = estimate_gravity(ups, G_SCALAR, self.config.gravity_mode).vector
-        except ValueError as error:
+        config = self.config
+        choice = choose_gravity(
+            ups, self.board_up, magnitude=G_SCALAR, mode=config.gravity_mode,
+            candidates=config.gravity_candidates, preferred_gravity=config.gravity_preferred,
+            ambiguity=config.gravity_ambiguity)
+        if choice.source == "default":
             # 腰が一度も取れなかった。受信ループを止めないよう、z が上（カメラが水平）の既定で続ける
-            warnings.warn(f"初期フレームの体幹から重力を決められない（{error}）。既定の {DEFAULT_GRAVITY.tolist()} を使う",
+            warnings.warn(f"初期フレームの体幹から重力を決められない（{choice.detail}）",
                           RuntimeWarning, stacklevel=2)
-            self.gravity = DEFAULT_GRAVITY.copy()
+        self.gravity_choice = choice
+        self.gravity = np.asarray(choice.vector, dtype=np.float64).copy()
 
     def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:
         dynamics = self._dynamics(points)
