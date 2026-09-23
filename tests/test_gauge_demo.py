@@ -13,6 +13,7 @@ CLI には 3 つの使い方があるが、引数なしの経路（``GaugeWindow
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -124,3 +125,33 @@ class TestEmit:
             text=True,
         )
         assert result.returncode == 3
+
+
+class TestViaWorker:
+    """--via-worker: 実測と同じ経路（WorkerRunner → 子の --emit → gauge_frame）で流す。"""
+
+    def _run(self, *extra: str) -> subprocess.CompletedProcess:
+        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
+        return subprocess.run(
+            [sys.executable, "-m", "app.gauge.demo", "--via-worker", *extra],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+    def test_via_worker_delivers_every_frame_and_none_to_the_log(self):
+        result = self._run("--count", "10", "--interval", "0.02")
+        summary = result.stdout.strip().splitlines()[-1]
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "frames=10/10" in summary
+        assert "gauge_in_log=0" in summary
+        assert "exit=0" in summary
+
+    def test_via_worker_passes_the_child_exit_code_through(self):
+        result = self._run("--count", "1", "--interval", "0", "--exit-code", "3")
+        summary = result.stdout.strip().splitlines()[-1]
+        assert "exit=3" in summary
+        # 子の終了コードが求めたとおりなら、経路としては成功。
+        assert result.returncode == 0, result.stdout + result.stderr
