@@ -135,6 +135,25 @@ def test_reset_forgets_previous_run():
     assert demux.flush() == ""
 
 
+def test_prefix_appearing_mid_line_is_split_into_log_and_gauge_candidate():
+    """任意の要件: 行の途中に PREFIX が現れたら、手前はログへ・PREFIX から先はゲージの行の候補へ。"""
+    demux = LineDemux()
+
+    # 改行で終わった行の途中に PREFIX が現れる場合
+    line = "stray text before" + _gauge_line()
+    log, frames = demux.feed(line.encode("utf-8"))
+    assert log == "stray text before"
+    assert frames == [_gauge_frame()]
+
+    # 改行で終わっていない途中の行の途中に PREFIX が現れる場合
+    demux2 = LineDemux()
+    partial = "stray text before" + g.PREFIX + '{"v":2'
+    log, frames = demux2.feed(partial.encode("utf-8"))
+    assert log == "stray text before"
+    assert frames == []
+    assert demux2.flush() == g.PREFIX + '{"v":2'
+
+
 def test_throughput_handles_30hz_easily():
     gauge_lines = [_gauge_line(rep=i) for i in range(3000)]
     ordinary_lines = [f"progress: {i}\n" for i in range(3000)]
