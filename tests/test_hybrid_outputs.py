@@ -154,3 +154,48 @@ class TestTiming:
         assert timing["frames"] == int(round(PushUp(reps=1).duration_s * 30))
         assert 0.0 < timing["median_ms"] <= timing["p95_ms"] <= timing["max_ms"]
         assert timing["p95_ms"] < 50.0
+
+
+class TestCheck:
+    def test_the_structure_checks_pass(self, tmp_path):
+        """朝の手順の ``python -m tools.verify_run check <計測フォルダ>`` が、新しい記録で構造の検査に通る。"""
+        from tools import verify_run as vr
+
+        session, _ = _session(tmp_path, reps=2)
+        report = vr.check_run(session.directory, expect_stop=True)
+        assert report["kind"] == "hybrid"
+        failed = [c for c in report["checks"] if not c["ok"] and not c["name"].startswith(("3D:", "配置:", "速さ:"))]
+        assert not failed, failed
+        assert report["cycles"]["detected"] == 2
+
+
+class TestCycleEnergy:
+    """肘の濾波 E±（USB 経路の ``compute_cycle_energy_filtered``、``cycle_energy_debug_*`` と同じ量）を回ごとに残す。
+
+    混成の回の値は Σ P·dt（関節の仕事）で、USB が肘に使う濾波の経路（LPF → 80 点に再標本化 → τ を分位で切る →
+    dθ 制限 → ∫τdθ の正負）と直接比べられなかった。オフラインの検証で比べられるよう、同じ計算を回の確定で行う。
+    """
+
+    def test_one_row_per_elbow_per_rep(self, tmp_path):
+        session, _ = _session(tmp_path, reps=2)
+        table = pd.read_csv(_file(session, "cycle_energy"))
+        assert list(table.columns) == ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u"]
+        assert sorted(table.part) == ["elbow_L", "elbow_L", "elbow_R", "elbow_R"]
+        assert (table.fc_current == 1.2).all() and (table.n_u == 80).all()
+        assert table.dt_sec.iloc[0] == pytest.approx(1 / 30)
+        work = pd.read_csv(_file(session, "cycle_work"))
+        elbow = work[work.joint == "elbow_R"].work_pos_j.to_numpy()
+        energy = table[table.part == "elbow_R"]
+        # 向きの取り方（θ は肩→肘と肘→手首のなす角）で E+ と E− のどちらに出るかは変わる。大きさは Σ max(P,0)·dt と同じ桁
+        magnitude = np.maximum(energy.e_pos.to_numpy(), energy.e_neg.to_numpy())
+        np.testing.assert_allclose(magnitude, elbow, rtol=0.5)
+
+    def test_the_adaptive_cutoff_runs(self, tmp_path):
+        from energy_pipeline import EnergyFilterConfig
+
+        session, _ = _session(tmp_path, reps=2, energy_filter=EnergyFilterConfig(fc_adaptive_on=True))
+        table = pd.read_csv(_file(session, "cycle_energy"))
+        assert len(table) == 4
+        # fc は既定の 1.2 Hz から EMA（β=0.15、1 秒ごと）で推定値 k·f0 の側へ動いていく。短い合成では途中の値
+        assert (table.fc_current > 1.2).all() and (table.fc_current <= 6.0).all()
+        assert np.isfinite(table.e_pos).all()

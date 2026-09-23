@@ -78,7 +78,7 @@ from push_up_model import (
 from utils import compute_local_torque
 from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transform_native
 
-from energy_pipeline import angle_between
+from energy_pipeline import AdaptiveCutoff, EnergyFilterConfig, angle_between, compute_cycle_energy_filtered
 
 from app.gauge.thresholds import PartBand, part_bands
 from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
@@ -163,6 +163,8 @@ class MeasurementConfig:
     rep: RepConfig = field(default_factory=RepConfig)
     # 力学の関所（HYBRID_DYN_GATE）。偽なら常に開いた扱い（回の区切りは RepDetector のまま）
     dyn_gate: bool = True
+    # 肘の濾波 E± の前処理（energy_pipeline、USB の E_*）。計測の子は EnergyFilterConfig.from_env() を渡す
+    energy_filter: EnergyFilterConfig = field(default_factory=EnergyFilterConfig)
     # 腕の長さの安全策: 先頭の窓の上腕長・前腕長（中央値）から、この比を超えてずれた腕の仕事率を回とゲージに
     # 積まない（トルクは記録する）。0 で無効。三角測量の誤りが続くと EKF でも吸収しきれず、2026-09-23 の実機の
     # 記録の再生で右腕の |τy| が最大 24 万 N·m になった
@@ -211,6 +213,8 @@ class FrameResult:
     # 回を確定したフレームだけ: 部位ごとの W+・W−（app.hybrid.rep_work.PartWork）と W_1RM [J]（帯が無い部位は None）
     cycle_parts: dict[str, PartWork] = field(default_factory=dict)
     cycle_w1rm: dict[str, float | None] = field(default_factory=dict)
+    # 回を確定したフレームだけ: 肘の濾波 E±（部位 → {"e_pos","e_neg","fc","n_u"}）
+    cycle_energy: dict[str, dict] = field(default_factory=dict)
 
 
 class NetworkMeasurement:
@@ -262,6 +266,9 @@ class NetworkMeasurement:
         self._durations: deque[float] = deque(maxlen=_TIMING_WINDOW)
         self._duration_max = 0.0
         self._timed = 0
+
+        # 肘の濾波 E± の適応カットオフ（E_FC_ADAPTIVE_ON=1 のときだけ動く）。毎フレーム左右の肘角の平均を渡す
+        self._cutoff = AdaptiveCutoff(self.config.energy_filter, fps=30.0)
 
         # EKF（app.hybrid.ekf）。無効なら None
         self.ekf = GridEkf(self.config.ekf, self.pose_keypoints) if self.config.ekf.enabled else None
@@ -370,6 +377,9 @@ class NetworkMeasurement:
             result.arm_ok = self._arm_ok(points)
             if dynamics is not None:
                 result.local_torques, result.powers, theta, tau_y = dynamics
+                angles = [v for v in theta.values() if math.isfinite(v)]
+                if angles:
+                    self._cutoff.step(float(np.mean(angles)))
                 sample = self._guarded_sample(
                     WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y), result.arm_ok)
             self._gate(points, velocity, dt, sample, result)
@@ -726,6 +736,18 @@ class NetworkMeasurement:
             if self.tracker is not None:
                 self.tracker.discard_rep()
 
+    def _elbow_energy(self) -> dict[str, dict]:
+        """今の回の肘の濾波 E±（USB 経路と同じ ``compute_cycle_energy_filtered``、dt は格子の 1/30 s）。"""
+        config = self.config.energy_filter
+        fc = self._cutoff.fc if config.fc_adaptive_on else None
+        energy = {}
+        for side in ("L", "R"):
+            theta, tau = self.rep_work.series(f"elbow_{side}")
+            e_pos, e_neg, info = compute_cycle_energy_filtered(theta, tau, 1.0 / 30.0, fc_override=fc, config=config)
+            energy[f"elbow_{side}"] = {"e_pos": e_pos, "e_neg": e_neg, "fc": info.get("fc"),
+                                       "n_u": int(info.get("n_u", 0))}
+        return energy
+
     def _feed_tracker(self, sample: WorkSample) -> None:
         if self.tracker is None:
             return
@@ -737,13 +759,15 @@ class NetworkMeasurement:
     def _close_rep(self, result: FrameResult) -> None:
         """今の回を確定する。仕事はフレームごとの dt で積んだ値（``rep_work``）。"""
         result.cycle_detected = True
+        result.cycle_energy = self._elbow_energy()
         parts = self.rep_work.reset()
         for key, work in parts.items():
             self.cycle_work[key].append(work.net)
             result.cycle_work_j[key] = work.net
         result.cycle_parts = parts
         result.cycle_w1rm = {key: (self.bands[key].w1rm if key in self.bands else None) for key in parts}
-        self.cycles.append({"frame": self.frame_index, "t_ns": result.t_ns, "parts": parts})
+        self.cycles.append({"frame": self.frame_index, "t_ns": result.t_ns, "parts": parts,
+                            "energy": result.cycle_energy})
         if self.tracker is not None:
             self.tracker.close_rep()
 

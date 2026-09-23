@@ -102,6 +102,8 @@ class Recorder:
         self.torques = writer("local_torque", ["frame", "t_ns", "joint", "x", "y", "z"])
         # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）
         self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score"])
+        # 肘の濾波 E±（USB の cycle_energy_debug_* と同じ量。回の確定ごとに肘の左右で 1 行ずつ）
+        self.energy = writer("cycle_energy", ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u"])
         # EKF の手前の生 3D（EKF の較正 tune_ekf の入力）。1/30 s の格子で、抜けた格子は NaN の行で埋める
         # （行を詰めると dt 一定の前提が崩れる）。raw_provenance が無ければ書かない（EKF を通さない記録）
         self.raw3d = None
@@ -184,6 +186,10 @@ class Recorder:
         self.work.writerows(
             [self.frames, result.t_ns, key, value, *_cycle_columns(result, key)]
             for key, value in result.cycle_work_j.items()
+        )
+        self.energy.writerows(
+            [self.frames, result.t_ns, part, e["e_pos"], e["e_neg"], e["fc"], 1.0 / 30.0, e["n_u"]]
+            for part, e in (getattr(result, "cycle_energy", None) or {}).items()
         )
         self.frames += 1
         self.flush()

@@ -25,6 +25,7 @@ from app.hybrid.measurement import MeasurementSession
 from app.hybrid.pose_detector import PoseDetector
 from app.runners.hybrid_preview import poll_window
 from app.hybrid.ekf import EkfSettings
+from energy_pipeline import EnergyFilterConfig
 from app.hybrid.gravity import candidate_axes
 from app.runners.network_measure import MeasurementConfig
 
@@ -79,6 +80,7 @@ def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementCon
         subject_id=subject,
         dyn_gate=_flag("HYBRID_DYN_GATE", True),
         ekf=EkfSettings.from_env(),
+        energy_filter=EnergyFilterConfig.from_env(),
     )
 
 
