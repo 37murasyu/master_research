@@ -53,18 +53,25 @@ class Stereo:
 
 
 def detect_board(image, board):
+    """盤の内側の交点を探す。見つからなければ None。
+
+    縮小画像（幅 640 px）で見つけた角点を拡大し、全解像度では cornerSubPix で精密化するだけにする。
+    全解像度で findChessboardCorners をやり直すと、実物の画像では 1 枚 90〜220 ms かかり
+    （2026-09-23 の実測）、盤集めの間 Mac の取り込みが 5〜8 fps に落ちて、時刻の合うフレームが
+    無くなっていた。この形なら約 20 ms で、角点は最大 0.001 px しか違わない。
+    """
     gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY) if image.ndim == 3 else image
     factor = min(1.0, 640 / gray.shape[1])
-    small = cv.resize(gray, None, fx=factor, fy=factor) if factor < 1 else gray
-    flags = cv.CALIB_CB_ADAPTIVE_THRESH | cv.CALIB_CB_NORMALIZE_IMAGE
-    found, _ = cv.findChessboardCorners(
-        small, board.pattern, flags | cv.CALIB_CB_FAST_CHECK
+    small = (
+        cv.resize(gray, None, fx=factor, fy=factor, interpolation=cv.INTER_AREA)
+        if factor < 1
+        else gray
     )
+    flags = cv.CALIB_CB_ADAPTIVE_THRESH | cv.CALIB_CB_NORMALIZE_IMAGE | cv.CALIB_CB_FAST_CHECK
+    found, corners = cv.findChessboardCorners(small, board.pattern, flags)
     if not found:
         return None
-    found, corners = cv.findChessboardCorners(gray, board.pattern, flags)
-    if not found:
-        return None
+    corners = (np.asarray(corners, np.float32).reshape(-1, 1, 2) / factor).astype(np.float32)
     grid = corners.reshape(board.rows, board.cols, 2)
     spacing = np.median(np.linalg.norm(np.diff(grid, axis=1), axis=2))
     window = int(np.clip(round(spacing * 0.35), 3, 11))

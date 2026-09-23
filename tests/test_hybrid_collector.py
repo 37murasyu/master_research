@@ -65,6 +65,24 @@ def test_detection_results_are_reused():
     assert calls == [], "渡した検出結果（見つからない場合を含む）を使っていない"
 
 
+def test_accepts_a_pair_with_the_real_detector():
+    """本物の detect_board を通す。
+
+    OpenCV 5.0 の角点は (N, 2) で返る。偽の検出器が (N, 1, 2) を返していたため、
+    静止判定の axis=2 が実機で初めて AxisError になった（2026-09-23）。
+    """
+    from app.hybrid.checkerboard import detect_board
+    from test_hybrid_calibration import render_board
+
+    board = Board()
+    frame = render_board(board)
+    c = BoardCollector(board, detect=detect_board, mono_required=1, pairs_required=1)
+    for t in range(0, 301, 30):
+        c.add_mac(t * 1_000_000, frame, corners=detect_board(frame, board))
+    c.add_remote(150_000_000, frame)
+    assert len(c.pairs) == 1
+
+
 def test_one_sided_views_and_bounded_ring():
     c = make_collector()
     for t in range(0, 3001, 30):

@@ -82,7 +82,11 @@ def _install(monkeypatch, tmp_path, *, collector_errors=0):
         pair_images = [(zero0, zero1)] * len(a)
 
         def __init__(self, *args):
+            from collections import Counter
+
             self.cached = (False, False)
+            self.reasons = Counter()
+            self.last_motion_px = None
 
         def add_mac(self, *args, **kwargs):
             pass

@@ -22,7 +22,7 @@ from app.hybrid.checkerboard import (
     max_view_error,
     reprojections,
 )
-from app.hybrid.collector import BoardCollector
+from app.hybrid.collector import REASONS, STILL_PX, BoardCollector
 from app.hybrid.display import compose
 from app.hybrid.live import LiveSession
 from app.hybrid.session import stable_session
@@ -35,6 +35,16 @@ from app.runners.hybrid_preview import poll_window
 # OpenCV のカメラ番号は入れ替わる（Camo や iPhone の連係カメラ）ので、キャッシュの鍵が
 # 合っても別のカメラのものを引きうる。超えたら捨てて、単体ビューから求め直す。
 CACHE_TOLERANCE_PX = 1.5
+
+
+def rejection_summary(collector):
+    """ペアを見送った理由を、多い順に短く並べる。使う人が何を直せばよいか分かるように。"""
+    top = collector.reasons.most_common(3)
+    motion = collector.last_motion_px
+    text = "見送り: " + ("・".join(f"{REASONS[k]} {n}" for k, n in top) if top else "なし")
+    if motion is not None:
+        text += f" / 直近の盤の動き {motion:.1f} px（{STILL_PX:.1f} 以下で採用）"
+    return text
 
 
 def board_defaults():
@@ -93,6 +103,7 @@ def main(argv=None):
         keys = [None, None]
         cameras = []
         review = None
+        last_report = 0.0
 
         def restart(message):
             """盤集めを最初からやり直す。例外で落ちると、集めた盤がすべて消える。"""
@@ -115,11 +126,15 @@ def main(argv=None):
                         )
                         if phase == "preview"
                         else (
-                            f"単体 Mac {len(collector.mono[0])}/15  Pixel {len(collector.mono[1])}/15 / ペア {len(collector.pairs)}/12",
-                            "盤を静止させてください。採用後は位置・距離・傾きを大きく変えます",
-                            f"キャッシュ Mac: {bool(cached[0])} Pixel: {bool(cached[1])}",
+                            f"単体 Mac {len(collector.mono[0])}/15  Pixel {len(collector.mono[1])}/15 / ペア {len(collector.pairs)}/12"
+                            f"  （キャッシュ Mac {'あり' if cached[0] else 'なし'}・Pixel {'あり' if cached[1] else 'なし'}）",
+                            "両方のカメラに盤全体が写る位置で静止。採用されたら位置・距離・傾きを大きく変えます",
+                            rejection_summary(collector),
                         )
                     )
+                    if phase == "collect" and time.monotonic() - last_report > 5:
+                        last_report = time.monotonic()
+                        print(f"[盤集め] ペア {len(collector.pairs)} / {rejection_summary(collector)}")
                     # 返るのは復号できた画像だけ。復号結果と盤の検出結果は session に置かれる
                     capture = session.step(infer=phase == "preview", lines=lines)
                     if phase == "collect" and time.monotonic() - start > 1.2:
