@@ -22,7 +22,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from config import SEGMENT_MASS_FRACTIONS, SUPPORT_SHARE_DEFAULT, SUPPORTED_MASS_FRACTION
+from config import SEGMENT_MASS_FRACTIONS, SUPPORT_SHARE_DEFAULT, SUPPORTED_MASS_FRACTION, slot_of
+from utils import compute_joint_power
 from utils_dynamic import compute_MF_batch_native, compute_tau_chain_native
 
 GRAVITY_MODES = ("axis", "trunk")
@@ -179,6 +180,31 @@ def joint_axes(shoulder, elbow, wrist, hand=None, other_shoulder=None):
     }
 
 
+# USB・スマホ経路の点列（pose_keypoints の昇順）から片腕の局所軸を作る。
+# 部位名は config.part_calculations のキー（左の上腕だけ歴史的に名前が違う）。
+ARM_PARTS: dict[str, dict[str, str]] = {
+    "R": {"upper_arm": "upper_arm_R", "forearm": "forearm_R"},
+    "L": {"upper_arm": "up_arm_l", "forearm": "forearm_L"},
+}
+_OTHER_SIDE = {"R": "L", "L": "R"}
+
+
+def arm_axes(points, side: str):
+    """点列（pose_keypoints の昇順）から片腕の ``joint_axes`` を作る。
+
+    関節はランドマーク名で指す。位置索引を直書きすると pose_keypoints に点を足したときに
+    別の関節を指す（再検算 R-1 と同じ壊れ方）。手首の軸は手の点（小指・人差し指）の中点から作る。
+    """
+    def at(landmark: str) -> np.ndarray:
+        return np.asarray(points[slot_of(landmark)], dtype=np.float64)
+
+    return joint_axes(
+        at(f"{side}_SHOULDER"), at(f"{side}_ELBOW"), at(f"{side}_WRIST"),
+        hand=hand_point(at(f"{side}_PINKY"), at(f"{side}_INDEX")),
+        other_shoulder=at(f"{_OTHER_SIDE[side]}_SHOULDER"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 慣性テンソル（§2-3）
 # ---------------------------------------------------------------------------
@@ -277,3 +303,33 @@ def push_up_torques(
         np.stack([shoulder, elbow]).astype(np.float64),
         zero, float(hand_mass_kg) * g, np.asarray(wrist, dtype=np.float64))
     return {"wrist": wrist_base[0], "elbow": wrist_base[1], "shoulder": hanging[0]}
+
+
+def push_up_joint_powers(torques, axes, forearm: SegmentState, upper_arm: SegmentState, trunk_omega, up=None):
+    """関節の仕事率 P = τ_y × (ω_外側 − ω_内側)·y を返す（キーは "wrist" / "elbow" / "shoulder"）。
+
+    局所 y 軸は局所トルクと同じ（``joint_axes``）。鎖の外側と内側の部位の相対角速度を使う:
+
+    - 手首: 前腕（手は固定端）
+    - 肘: 上腕 − 前腕
+    - 肩: 上腕 − 上胴体（両肩の線の角速度。無ければ 0 とみなす）
+
+    かつて部位の絶対角速度との内積 τ·ω で、肘角を保ったまま腕を振るだけで仕事が出ていた
+    （計画メモ A-4 (2)、H-B）。入力に非有限が混じる関節は 0 にする。
+    """
+    trunk = None if trunk_omega is None else np.asarray(trunk_omega, dtype=np.float64)
+    relative = {
+        "wrist": (forearm.omega, None),
+        "elbow": (upper_arm.omega, forearm.omega),
+        "shoulder": (upper_arm.omega, trunk),
+    }
+    powers = {}
+    for joint, torque in torques.items():
+        link, parent = axes[joint]
+        omega, omega_parent = relative[joint]
+        vectors = [torque, omega, link] + ([omega_parent] if omega_parent is not None else [])
+        if any(not np.all(np.isfinite(v)) for v in vectors):
+            powers[joint] = 0.0
+            continue
+        powers[joint] = compute_joint_power(torque, omega, omega_parent, link, parent, up)
+    return powers

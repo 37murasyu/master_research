@@ -258,30 +258,29 @@ class TestTorqueLinksHandedness:
     """局所トルクの基準リンクが左右を取り違えていない。"""
 
     def test_right_side_links_use_right_side_joints(self):
-        from app.runners.network_measure import TORQUE_LINKS
+        from app.runners.network_measure import arm_axes
 
         points = _synthetic_skeleton()
-        # 右側の関節は x > 0、左側は x < 0 に置いてある
-        for name, fn in TORQUE_LINKS.items():
-            if name.startswith("shoulder"):
-                continue   # 肩は両肩を結ぶので左右判定の対象外
-            vec = fn(points)
-            span = float(np.linalg.norm(vec))
-            assert 0.13 <= span <= 0.40, (
-                f"{name} の長さ {span:.3f} m が上肢のリンクとして不自然"
-            )
+        for side in ("R", "L"):
+            for joint, (link, _) in arm_axes(points, side).items():
+                span = float(np.linalg.norm(link))
+                assert 0.13 <= span <= 0.40, (
+                    f"{joint}_{side} の長さ {span:.3f} m が上肢のリンクとして不自然"
+                )
 
     def test_right_and_left_are_mirror_images(self):
-        """左右対称な骨格なら、対応するリンクは x 成分だけが反転する。"""
-        from app.runners.network_measure import TORQUE_LINKS
+        """左右対称な骨格なら、対応するリンクと親は x 成分だけが反転する。"""
+        from app.runners.network_measure import arm_axes
 
         points = _synthetic_skeleton()
-        for right, left in (("wrist_R", "wrist_L"), ("elbow_R", "elbow_L")):
-            vr, vl = TORQUE_LINKS[right](points), TORQUE_LINKS[left](points)
-            assert np.allclose(vr, vl * np.array([-1.0, 1.0, 1.0])), (
-                f"{right} と {left} が鏡像になっていない: {vr} / {vl}。"
-                " 左右の索引を取り違えていないか確認すること"
-            )
+        right, left = arm_axes(points, "R"), arm_axes(points, "L")
+        for joint in ("wrist", "elbow", "shoulder"):
+            for which, vr, vl in (("link", right[joint][0], left[joint][0]),
+                                  ("parent", right[joint][1], left[joint][1])):
+                assert np.allclose(vr, vl * np.array([-1.0, 1.0, 1.0])), (
+                    f"{joint} の {which} が左右で鏡像になっていない: {vr} / {vl}。"
+                    " 左右の索引を取り違えていないか確認すること"
+                )
 
 
 class TestLinkDefinitionsSurviveAddedLandmarks:

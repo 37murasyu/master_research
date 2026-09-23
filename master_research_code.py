@@ -54,7 +54,7 @@ from config import (
     input_stream2,
     m1,
     m2,
-    m4,
+    OUTPUT_SCHEMA_VERSION,
     part_calculations,
     slot_of,
     INERTIA_LENGTH_FRAMES,
@@ -89,17 +89,23 @@ from utils import (
     extract_keypoints,
     get_projection_matrix,
     put_text_jp,
-    compute_joint_power,
     compute_local_torque,
     PushCycleDetector,
 )
 from utils_dynamic import (
-    calculate_individual_torques,
     calculate_inertia_tensor,
-    calculate_M_and_F,
-    compute_tau_chain_native,
     compute_lpf_exp_fb_native,
     compute_triangulate_transform_native,
+)
+# 座位プッシュアップの力学モデル。オフライン・スマホ経路と同じ関数を呼ぶ（KNOWN_ISSUES §5-7・§5-8）
+from push_up_model import (
+    ARM_PARTS,
+    arm_axes,
+    hand_mass,
+    push_up_joint_powers,
+    push_up_torques,
+    segment_from_storage,
+    torso_load_mass,
 )
 try:
     from Gauge_display import GaugeDisplay
@@ -960,31 +966,14 @@ def draw_all_local_axes(frame0, frame1, P0, P1, transformed_p3ds, links, x_offse
     """全ての上肢リンクについてローカル座標軸を描画 (frame0 に描画。必要あれば両方)。"""
     if transformed_p3ds is None or links is None:
         return
-    # 各リンクの近位関節(原点)とベクトルから回転取得
-    # 安全のためキーが存在するか確認しつつ進める
-    # インデックス対応は links 構築ロジックに追随 (近位 = distal - link_vec)
     for name, vec in links.items():
         if vec is None or not np.all(np.isfinite(vec)):
             continue
-        # 原点推定: distal = proximal + vec なので proximal = distal - vec
-        # ここではヒューリスティック: 肘/手首などで distal 推定に曖昧さあるため
-        # 既知: wrist_R link = hand - elbow (近位=肘), など個別条件化
-        origin = None
+        # 原点は関節の位置（キーは wrist_R など。push_up_model.joint_axes の関節）
         try:
-            # 索引は config.pose_keypoints の昇順（links と同じ規約）
-            if name == 'wrist_R':
-                origin = transformed_p3ds[3]  # 右肘
-            elif name == 'elbow_R':
-                origin = transformed_p3ds[1]  # 右肩
-            elif name == 'shoulder_R':
-                origin = transformed_p3ds[1]  # 右肩基準
-            elif name == 'wrist_L':
-                origin = transformed_p3ds[2]  # 左肘
-            elif name == 'elbow_L':
-                origin = transformed_p3ds[0]  # 左肩
-            elif name == 'shoulder_L':
-                origin = transformed_p3ds[0]  # 左肩基準
-        except Exception:
+            _joint, _side = name.rsplit("_", 1)
+            origin = transformed_p3ds[slot_of(f"{_side}_{_joint.upper()}")]
+        except (KeyError, ValueError, IndexError):
             origin = None
         R = _compute_local_rotation_from_link(vec)
         _draw_axes_for_link(frame0, P0, origin, R, scale=0.25, x_offset=x_offset)
@@ -1509,7 +1498,7 @@ THRESHOLD = None
 
 
 aim_torque = []
-I1R = I1L = I2R = I2L = I3 = I4 = I5R = I5L = I6 = I7 = None
+I1R = I1L = I2R = I2L = None   # 上腕・前腕の慣性テンソル（左右別）
 
 storage = BodyPartDataStorage()
 # 部位ごとの計算設定を辞書に格納
@@ -2093,93 +2082,6 @@ _pose_roi1 = _roi_from_keypoints(frame1_kpts, frame1.shape) if POSE_ROI_ON else 
 _pose_roi0_miss = 0
 _pose_roi1_miss = 0
 
-
-# %%
-# M/F 計算をまとめて走らせる小ユーティリティ
-def run_specs(specs):
-    Ms, Fs, Parts = [], [], []
-    # ネイティブ一括（環境変数でON）
-    USE_NATIVE_DYNAMICS = os.getenv('USE_NATIVE_DYNAMICS', '1') in ('1','true','True')
-    if USE_NATIVE_DYNAMICS and specs:
-        try:
-            # バッチ入力を収集
-            from utils_dynamic import compute_MF_batch_native, trunk_segment_inputs
-            I_batch = []
-            m_batch = []
-            omega = []
-            dot_omega = []
-            ddpg = []
-            parts = []
-            native_possible = True
-            for I, mass, data_seq, kwargs in specs:
-                # calculate_M_and_F が参照するデータ形状: data_seq[-1]['omega'], ['dot_omega'], ['dot_dot_pg'], ['part_name']
-                if not data_seq:
-                    native_possible = False
-                    break
-                last = data_seq[-1]
-                I_use = I if I is not None else np.zeros((3,3))
-                m_eff = float(mass) if mass is not None else 0.0
-                wv = np.array(last.get('omega', np.zeros(3)), dtype=np.float64)
-                dwv = np.array(last.get('dot_omega', np.zeros(3)), dtype=np.float64)
-                ag = np.array(last.get('dot_dot_pg', np.zeros(3)), dtype=np.float64)
-
-                # 上胴体・下胴体の補正は utils_dynamic.trunk_segment_inputs を共有する。
-                # かつてここに同じ補正が手書きで複製されており、右肩でだけ ω・ω̇ を
-                # 反転する誤り（計画メモ E-1b）も両方に入っていた。
-                Imode = (kwargs or {}).get('Imode', None)
-                if Imode in (3, 4):
-                    Info_I3 = (kwargs or {}).get('Info_I3', None)
-                    add_part_data = (kwargs or {}).get('add_part_data', None)
-                    if not add_part_data or (Imode == 3 and Info_I3 is None):
-                        native_possible = False
-                        break
-                    m_eff, wv, dwv, ag = trunk_segment_inputs(
-                        m_eff, wv, dwv, ag,
-                        add_part_data=add_part_data,
-                        condition=(kwargs or {}).get('condition', None),
-                        Imode=Imode,
-                        Info_I3=Info_I3,
-                        body_mass=w,
-                    )
-
-                I_batch.append(np.array(I_use, dtype=np.float64))
-                m_batch.append(m_eff)
-                omega.append(wv)
-                dot_omega.append(dwv)
-                ddpg.append(ag)
-                parts.append(last.get('part_name', 'unknown'))
-            if native_possible and I_batch:
-                I_b = np.ascontiguousarray(np.stack(I_batch, axis=0), dtype=np.float64)
-                m_b = np.ascontiguousarray(np.array(m_batch, dtype=np.float64))
-                w_b = np.ascontiguousarray(np.stack(omega, axis=0), dtype=np.float64)
-                dw_b = np.ascontiguousarray(np.stack(dot_omega, axis=0), dtype=np.float64)
-                a_b = np.ascontiguousarray(np.stack(ddpg, axis=0), dtype=np.float64)
-                g_v = np.ascontiguousarray(np.array(g, dtype=np.float64))
-                M_b, F_b = compute_MF_batch_native(I_b, m_b, w_b, dw_b, a_b, g_v)
-                if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
-                    # 入出力のノルム統計でゼロ化を監査
-                    def _nz(a):
-                        return int(np.count_nonzero(np.isfinite(a) & (np.abs(a) > 1e-12)))
-                    print(f"[DYN:MF] N={I_b.shape[0]} | w_nz={_nz(w_b)} dw_nz={_nz(dw_b)} acc_nz={_nz(a_b)} m_sum={float(np.sum(m_b)):.3f}")
-                    print(f"[DYN:MF] out | M_norm={float(np.linalg.norm(M_b)):.6f} F_norm={float(np.linalg.norm(F_b)):.6f}")
-                    # 詳細を見たい場合は下記を一時的に解除
-                    # print('[DYN:MF] M_b=', M_b)
-                    # print('[DYN:MF] F_b=', F_b)
-                Ms = [M_b[i] for i in range(M_b.shape[0])]
-                Fs = [F_b[i] for i in range(F_b.shape[0])]
-                Parts = list(parts)
-                return Ms, Fs, Parts
-        except (RuntimeError, ValueError, TypeError, AttributeError) as _e:
-            if os.getenv('POSE_DEBUG','0') in ('1','true','True'):
-                print(f"[Dyn] native MF fallback due to: {_e}")
-            # フォールバックで個別計算へ
-    # フォールバック: 個別にPythonで計算
-    for I, mass, data_seq, kwargs in specs:
-        M, F, Part = calculate_M_and_F(I, mass, data_seq, g, **kwargs)
-        Ms.append(M)
-        Fs.append(F)
-        Parts.append(Part)
-    return Ms, Fs, Parts
 
 # フレームスキップ管理（設定値を変えずローカルで制御）
 skip_counter = 0
@@ -3317,49 +3219,33 @@ while True:
             ia, ib = slot_of(a), slot_of(b)
             return float(np.nanmedian(np.linalg.norm(_lead[:, ia] - _lead[:, ib], axis=1)))
 
-        # 腕と大腿は左右で長さが違うので、テンソルも左右別に持つ。かつて左腕と右脚の
-        # 長さを左右共通で使っており、右腕の慣性が左腕の長さで決まっていた（計画メモ E-1d）。
+        # 腕は左右で長さが違うので、テンソルも左右別に持つ。かつて左腕の長さを
+        # 左右共通で使っており、右腕の慣性が左腕の長さで決まっていた（計画メモ E-1d）。
+        # 胴体・大腿・下腿のテンソルは、体幹荷重を肩に載せるモデル（§2-1）では使わない。
         _len_upper_arm_R = _median_span("R_SHOULDER", "R_ELBOW")
         _len_upper_arm_L = _median_span("L_SHOULDER", "L_ELBOW")
         _len_forearm_R = _median_span("R_ELBOW", "R_WRIST")
         _len_forearm_L = _median_span("L_ELBOW", "L_WRIST")
-        _len_thigh_R = _median_span("R_HIP", "R_KNEE")
-        _len_thigh_L = _median_span("L_HIP", "L_KNEE")
-        _len_shank = _median_span("R_KNEE", "R_ANKLE")
-        # 胴体の半長 = |肩中点 − 腰中点| / 2
-        _shoulders = _lead[:, slot_of("L_SHOULDER")] + _lead[:, slot_of("R_SHOULDER")]
-        _hips = _lead[:, slot_of("L_HIP")] + _lead[:, slot_of("R_HIP")]
-        len_half_body = 0.25 * float(np.nanmedian(np.linalg.norm(_shoulders - _hips, axis=1)))
 
         I1R = calculate_inertia_tensor(3, w, _len_upper_arm_R)  # 上腕
         I1L = calculate_inertia_tensor(3, w, _len_upper_arm_L)
         I2R = calculate_inertia_tensor(4, w, _len_forearm_R)    # 前腕
         I2L = calculate_inertia_tensor(4, w, _len_forearm_L)
-        I3 = calculate_inertia_tensor(1, w, len_half_body)      # 上胴体
-        I4 = calculate_inertia_tensor(0, w, len_half_body)      # 下胴体
-        I5R = calculate_inertia_tensor(6, w, _len_thigh_R)      # 太もも
-        I5L = calculate_inertia_tensor(6, w, _len_thigh_L)
-        I6 = calculate_inertia_tensor(7, w, _len_shank)         # 下腿
-        I7 = calculate_inertia_tensor(2, w, 0.25)               # 頭
         print(f"[INERTIA] リンク長を {INERTIA_LENGTH_FRAMES} フレームの中央値で確定: "
               f"上腕 R/L={_len_upper_arm_R:.3f}/{_len_upper_arm_L:.3f} "
-              f"前腕 R/L={_len_forearm_R:.3f}/{_len_forearm_L:.3f} "
-              f"胴体半長={len_half_body:.3f} 大腿 R/L={_len_thigh_R:.3f}/{_len_thigh_L:.3f} "
-              f"下腿={_len_shank:.3f} [m]")
+              f"前腕 R/L={_len_forearm_R:.3f}/{_len_forearm_L:.3f} [m]")
 
     # 計算とデータの格納をループで行う
     if len(kpts_3d) < 7:
         continue
     # 依存データが未蓄積の部位があれば次フレームへ
+    # 力学に要るのは左右の上腕・前腕と、肩の相対角速度に使う両肩の線
     required_lists = [
         part_data["upper_arm_R"],
         part_data["forearm_R"],
-        part_data["both_shoulder"],
-        part_data["both_hip"],
         part_data["up_arm_l"],
         part_data["forearm_L"],
-        part_data["upper_Leg_R"],
-        part_data["upper_Leg_L"],
+        part_data["both_shoulder"],
     ]
 
     # ======== 重力向きの自動検出（初期フレーム） ========
@@ -3390,211 +3276,49 @@ while True:
                 print(f"[GRAVITY] detect failed: {_ge}")
     if any((lst is None) or (len(lst) == 0) for lst in required_lists):
         continue
-    # トルクと力の計算（右/左）をループで簡潔に構築
-    right_specs = [
-        (I1R, m1, part_data["upper_arm_R"], {}),
-        (I2R, m2, part_data["forearm_R"], {}),
-        (I3, w, part_data["both_shoulder"], {"add_part_data": part_data["both_hip"], "condition": 1, "Imode": 3, "Info_I3": transformed_p3ds}),
-        (I4, w, part_data["both_hip"], {"add_part_data": part_data["both_shoulder"], "Imode": 4}),
-        (I5R, m4, part_data["upper_Leg_R"], {}),
-    ]
-    left_specs = [
-        (I1L, m1, part_data["up_arm_l"], {}),
-        (I2L, m2, part_data["forearm_L"], {}),
-        (I3, w, part_data["both_shoulder"], {"add_part_data": part_data["both_hip"], "condition": 0, "Imode": 3, "Info_I3": transformed_p3ds}),
-        (I4, w, part_data["both_hip"], {"add_part_data": part_data["both_shoulder"], "Imode": 4}),
-        (I5L, m4, part_data["upper_Leg_L"], {}),
-    ]
+    # 座位プッシュアップのモデル（push_up_model、KNOWN_ISSUES §2-1）で左右の腕を解く。
+    # 手を固定端に前腕（関節 = 手首）→ 上腕（関節 = 肘）の鎖を解き、体幹＋頭の荷重を肩に載せる。
+    # 肩は腕を肩から吊った鎖の自重。局所軸と仕事率も同じモジュールで作る。オフライン・スマホ経路と
+    # 同じ関数なので、同じ姿勢から同じトルクが出る（tests/test_path_consistency.py）。
+    #
+    # かつてはここで [上腕, 前腕, 上胴体, 下胴体, 大腿] の鎖を組み、部位 j の始点まわりに j 以降を
+    # 足していた。上腕の始点は肘なので wrist_R が右肘まわり、elbow_R が右手首まわりのトルクで、
+    # 局所軸はさらに 1 つずれていた（§5-7）。下胴体に体重 60 kg を丸ごと渡しており、手首・肘・肩が
+    # 200〜300 N·m になっていた（§5-8）。大腿の角度で付ける地面反力の簡易モデルもこの鎖の一部だった。
     _dyn_should_run = ((not RT_DYN_ON_RISE_ONLY) or _dyn_active) and (not DEMO_MONO_GAUGE_ON)
+    if (not _dyn_should_run) and E_DEBUG and (WHILE_COUNT % 30 == 0):
+        print(f"[DYNGATE] paused frame={WHILE_COUNT} (waiting rise trigger)")
+    _arm_inertia = {"R": (I2R, I1R), "L": (I2L, I1L)}   # (前腕, 上腕)
+    _load = torso_load_mass(w)
+    _hand = hand_mass(w)
+    _up = -np.asarray(g, dtype=np.float64)
+    globals_map, locals_map, links, powers_map = {}, {}, {}, {}
     t_seg = time.perf_counter()
-    if _dyn_should_run:
-        MsR, FsR, partsR = run_specs(right_specs)
-        MsL, FsL, partsL = run_specs(left_specs)
-        if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
-            def _safe_norm_list(lst):
-                try:
-                    return float(np.linalg.norm(np.array(lst, dtype=np.float64)))
-                except Exception:
-                    return float('nan')
-            print(f"[DYN:run_specs] R | M_norm={_safe_norm_list(MsR):.6f} F_norm={_safe_norm_list(FsR):.6f} parts={len(partsR)}")
-            print(f"[DYN:run_specs] L | M_norm={_safe_norm_list(MsL):.6f} F_norm={_safe_norm_list(FsL):.6f} parts={len(partsL)}")
-    else:
-        MsR, FsR, partsR = [], [], []
-        MsL, FsL, partsL = [], [], []
-        if E_DEBUG and (WHILE_COUNT % 30 == 0):
-            print(f"[DYNGATE] paused frame={WHILE_COUNT} (waiting rise trigger)")
-    _perf.add('run_specs', time.perf_counter() - t_seg)
-    if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
-        #print(f"[TRACE] run_specs done R/L")
-        pass
-    if STOP_AFTER.lower() in ("run_specs",):
-        _perf.next()
-        break
-    # --- Debug: 各トルク入力の有効性チェック ---
-    if DEBUG_LOGS and WHILE_COUNT % 30 == 0:
-        def _safe_len(x):
-            try:
-                return len(x)
-            except Exception:
-                return 'n/a'
-        print(f"[DBG] frame {WHILE_COUNT}: MsR={_safe_len(MsR)} FsR={_safe_len(FsR)} MsL={_safe_len(MsL)} FsL={_safe_len(FsL)}")
-
-    # 左大腿の向きで地面反力を付けるかを決める。ランドマーク名で指す（再検算 R-1）。
-    vector = transformed_p3ds[slot_of("L_KNEE")] - transformed_p3ds[slot_of("L_HIP")]
-    norm_vec = np.linalg.norm(vector)
-    angle_degrees = 0.0
-    if norm_vec > 1e-8:
-        # Z成分とベクトル長からXY平面との角度を計算（安全にクリップ）
-        cos_val = np.clip(vector[2] / norm_vec, -1.0, 1.0)
-        angle_with_xy_plane = np.pi / 2 - np.arccos(cos_val)
-        angle_degrees = float(np.degrees(angle_with_xy_plane))
-
-    if DEBUG_LOGS:
-        print("angle=", angle_degrees)
-    # 地面反力の簡易モデル: ファイルモードでない、かつ角度が±20°以内のときに付与
-    if (not file_mode) and (-20.0 <= angle_degrees <= 20.0):
-        f_E = np.array([0, 0, w * 0.66 * np.linalg.norm(g) / 2])
-    else:
-        f_E = np.array([0, 0, 0])
-    r_x = part_data["both_hip"][-1]["centroid"]
-    # r_x = .5*(both_shoulder_data[-1]['p1']+both_hip_data[-1]['p1'])+.25*(both_shoulder_data[-1]['relative_position_vector']+both_hip_data[-1]['relative_position_vector'])  # この例での r_x
-
-    tau_E = np.array([0, 0, 0])
-
-    # r_g は各チェーンの部位順に合わせる（右/左で別個に構築）
-    r_g_R = [
-        part_data["upper_arm_R"][-1]["centroid"],
-        part_data["forearm_R"][-1]["centroid"],
-        (part_data["both_shoulder"][-1]["centroid"] * 3 + part_data["both_hip"][-1]["centroid"]) / 4,
-        (part_data["both_shoulder"][-1]["centroid"] + part_data["both_hip"][-1]["centroid"] * 3) / 4,
-        part_data["upper_Leg_R"][-1]["centroid"],
-    ]
-    r_g_L = [
-        part_data["up_arm_l"][-1]["centroid"],
-        part_data["forearm_L"][-1]["centroid"],
-        (part_data["both_shoulder"][-1]["centroid"] * 3 + part_data["both_hip"][-1]["centroid"]) / 4,
-        (part_data["both_shoulder"][-1]["centroid"] + part_data["both_hip"][-1]["centroid"] * 3) / 4,
-        part_data["upper_Leg_L"][-1]["centroid"],
-    ]
-
-    t_seg = time.perf_counter()
-    if _dyn_should_run:
-        # 各部位の関節位置。胴体（both_shoulder / both_hip）は左右のチェーンで部位データを
-        # 共有しており、storage の p1 はリンク始点の左肩・左腰になる。右チェーンの肩トルクが
-        # 左肩まわりで計算されていたので、チェーン側の肩・腰を使う（計画メモ E-1f）。
-        def _collect_p1s(parts: list[str], side: str) -> np.ndarray:
-            own = {
-                "both_shoulder": transformed_p3ds[slot_of(f"{side}_SHOULDER")],
-                "both_hip": transformed_p3ds[slot_of(f"{side}_HIP")],
-            }
-            p1s = []
-            for part in parts:
-                data_list = storage.get_data(part)
-                if part in own:
-                    p1s.append(own[part])
-                elif data_list:
-                    p1s.append(data_list[-1]['p1'])
-                else:
-                    p1s.append(np.zeros(3))
-            return np.array(p1s, dtype=np.float64)
-
-        p1sR = _collect_p1s(partsR, "R")
-        p1sL = _collect_p1s(partsL, "L")
-        USE_NATIVE_DYNAMICS = os.getenv('USE_NATIVE_DYNAMICS', '1') in ('1','true','True')
-        if USE_NATIVE_DYNAMICS:
-            try:
-                r_g_R_arr = np.array(r_g_R, dtype=np.float64)
-                r_g_L_arr = np.array(r_g_L, dtype=np.float64)
-
-                tauR = compute_tau_chain_native(np.array(MsR, dtype=np.float64), np.array(FsR, dtype=np.float64), r_g_R_arr, p1sR, np.array(tau_E, dtype=np.float64), np.array(f_E, dtype=np.float64), np.array(r_x, dtype=np.float64))
-                tauL = compute_tau_chain_native(np.array(MsL, dtype=np.float64), np.array(FsL, dtype=np.float64), r_g_L_arr, p1sL, np.array(tau_E, dtype=np.float64), np.array(f_E, dtype=np.float64), np.array(r_x, dtype=np.float64))
-                if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
-                    # レバーアーム |r_g - p1| のノルム統計でゼロ・ミスアラインを検知
-                    try:
-                        rg_minus_p1_R = np.linalg.norm(r_g_R_arr - p1sR, axis=1)
-                        rg_minus_p1_L = np.linalg.norm(r_g_L_arr - p1sL, axis=1)
-                        print(f"[DYN:TAU] lever R | min={float(np.min(rg_minus_p1_R)):.4f} max={float(np.max(rg_minus_p1_R)):.4f} L | min={float(np.min(rg_minus_p1_L)):.4f} max={float(np.max(rg_minus_p1_L)):.4f}")
-                    except Exception:
-                        pass
-                if TRACE_DYN and (WHILE_COUNT % TRACE_EVERY == 0):
-                    print(f"[DYN:TAU] R | tau_norm={float(np.linalg.norm(tauR)):.6f}  L | tau_norm={float(np.linalg.norm(tauL)):.6f}")
-                    # 詳細を見たい場合は下記を一時的に解除
-                    # print('[DYN:TAU] tauR=', tauR)
-                    # print('[DYN:TAU] tauL=', tauL)
-
-                # 既存構造 (値, 部位名) の形に合わせる
-                torquesR = [(tauR[i], partsR[i]) for i in range(len(partsR))]
-                torquesL = [(tauL[i], partsL[i]) for i in range(len(partsL))]
-            except (RuntimeError, ValueError, TypeError, AttributeError) as _nd_e:
-                if os.getenv('POSE_DEBUG','0') in ('1','true','True'):
-                    print(f"[Dyn] native tau fallback due to: {_nd_e}")
-                # フォールバック
-                torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage, p1s=p1sR)
-                torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage, p1s=p1sL)
+    for _side, _parts in ARM_PARTS.items():
+        _axes = arm_axes(transformed_p3ds, _side)
+        _fa = segment_from_storage(part_data[_parts["forearm"]][-1], _arm_inertia[_side][0], m2)
+        _ua = segment_from_storage(part_data[_parts["upper_arm"]][-1], _arm_inertia[_side][1], m1)
+        if _dyn_should_run:
+            _tau = push_up_torques(
+                _fa, _ua,
+                transformed_p3ds[slot_of(f"{_side}_WRIST")],
+                transformed_p3ds[slot_of(f"{_side}_ELBOW")],
+                transformed_p3ds[slot_of(f"{_side}_SHOULDER")],
+                g, _load, _hand)
         else:
-            torquesR = calculate_individual_torques(MsR, FsR, np.array(r_g_R), tau_E, f_E, r_x, partsR, storage, p1s=p1sR)
-            torquesL = calculate_individual_torques(MsL, FsL, np.array(r_g_L), tau_E, f_E, r_x, partsL, storage, p1s=p1sL)
-    else:
-        _zero = np.zeros(3, dtype=np.float64)
-        torquesR = [(_zero.copy(), "wrist_R"), (_zero.copy(), "elbow_R"), (_zero.copy(), "shoulder_R")]
-        torquesL = [(_zero.copy(), "wrist_L"), (_zero.copy(), "elbow_L"), (_zero.copy(), "shoulder_L")]
-    if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
-        print(f"[TRACE] torques computed R/L")
+            _tau = {_joint: np.zeros(3) for _joint in ("wrist", "elbow", "shoulder")}
+        _powers = push_up_joint_powers(_tau, _axes, _fa, _ua, part_data["both_shoulder"][-1].get("omega"), _up)
+        for _joint, _torque in _tau.items():
+            _key = f"{_joint}_{_side}"
+            _link, _parent = _axes[_joint]
+            globals_map[_key] = _torque
+            links[_key] = _link
+            powers_map[_key] = _powers[_joint]
+            locals_map[_key] = compute_local_torque(_torque, _link, _parent, _up)
     _perf.add('torques', time.perf_counter() - t_seg)
-    if STOP_AFTER.lower() in ("torques", "torque"):
-        _perf.next()
-        break
-
-    # 各リンクベクトルとグローバルトルクを辞書に集約。
-    # 索引は config.pose_keypoints の昇順（[0]左肩 [1]右肩 [2]左肘 [3]右肘 [4]左手首 [5]右手首）。
-    # かつて [0]右肩 [1]左肩 [2]右肘 … という左右が逆の規約で書かれており、
-    # wrist_R として出ていたのは左前腕だった（再検算 R-1）。
-    _p = transformed_p3ds
-    links = {
-        "wrist_R": _p[slot_of("R_WRIST")] - _p[slot_of("R_ELBOW")],
-        "elbow_R": _p[slot_of("R_ELBOW")] - _p[slot_of("R_SHOULDER")],
-        "shoulder_R": _p[slot_of("R_SHOULDER")] - _p[slot_of("L_SHOULDER")],
-        "wrist_L": _p[slot_of("L_WRIST")] - _p[slot_of("L_ELBOW")],
-        "elbow_L": _p[slot_of("L_ELBOW")] - _p[slot_of("L_SHOULDER")],
-        "shoulder_L": _p[slot_of("L_SHOULDER")] - _p[slot_of("R_SHOULDER")],
-    }
-    if DEBUG_LOGS and WHILE_COUNT % TRACE_EVERY == 0:
-        link_norms = {k: float(np.linalg.norm(v)) if v is not None and np.all(np.isfinite(v)) else None for k, v in links.items()}
-        print(f"[DBG] frame {WHILE_COUNT}: link norms {link_norms}")
-    globals_map = {
-        "wrist_R": torquesR[0][0],
-        "elbow_R": torquesR[1][0],
-        "shoulder_R": torquesR[2][0],
-        "wrist_L": torquesL[0][0],
-        "elbow_L": torquesL[1][0],
-        "shoulder_L": torquesL[2][0],
-    }
     if TRACE_DYN and (WHILE_COUNT % 30 == 0):
-        try:
-            gn = {k: float(np.linalg.norm(v)) for k, v in globals_map.items()}
-        except Exception:
-            gn = {k: float('nan') for k in globals_map.keys()}
-        print(f"[DYN:GLOBAL TAU] norms={gn}")
-    # parent linkを定義（ローカル軸y安定化: 肘面基準）
-    parent_links = {
-        "wrist_R": links["elbow_R"],
-        "elbow_R": links["shoulder_R"],
-        "shoulder_R": None,
-        "wrist_L": links["elbow_L"],
-        "elbow_L": links["shoulder_L"],
-        "shoulder_L": None,
-    }
-    locals_map = {}
-    t_seg = time.perf_counter()
-    for _k in globals_map.keys():
-        try:
-            locals_map[_k] = compute_local_torque(globals_map[_k], links[_k], parent_vec=parent_links[_k])
-        except Exception as e:
-            if DEBUG_LOGS:
-                print(f"[DBG] compute_local_torque failed for {_k}: {e}")
-            locals_map[_k] = np.array([0.0, 0.0, 0.0])
-    _perf.add('local_torque', time.perf_counter() - t_seg)
-    if STOP_AFTER.lower() in ("local_torque", "local"):
+        print(f"[DYN:GLOBAL TAU] norms={ {k: float(np.linalg.norm(v)) for k, v in globals_map.items()} }")
+    if STOP_AFTER.lower() in ("run_specs", "torques", "torque", "local_torque", "local"):
         _perf.next()
         break
     if DEBUG_LOGS and WHILE_COUNT % TRACE_EVERY == 0:
@@ -3619,7 +3343,7 @@ while True:
                 globals()['_offline_wrist_vectors'].append(np.asarray(_fw_vec_R, dtype=float))  # type: ignore
                 tyR = float(_tau_wrist_R[1]) if (_tau_wrist_R is not None and np.all(np.isfinite(_tau_wrist_R))) else 0.0
                 globals()['_offline_wrist_tau_y'].append(tyR)  # type: ignore
-            # Left forearm vector (elbow_L->wrist_L)
+            # 左前腕（手首→肘。手首の局所軸の z と同じ向き）
             _fw_vec_L = links.get('wrist_L')
             _tau_wrist_L = locals_map.get('wrist_L')
             if _fw_vec_L is not None and np.all(np.isfinite(_fw_vec_L)):
@@ -3632,10 +3356,13 @@ while True:
 
     # ==== サイクルE用の角度・トルク蓄積（肘） ====
     try:
-        v_ua_R = links["elbow_R"]          # 肘関節に近い上腕方向（肩->肘）
-        v_fa_R = links["wrist_R"]          # 前腕方向（肘->手首）
-        v_ua_L = links["elbow_L"]
-        v_fa_L = links["wrist_L"]
+        # 肘角 = 上腕（肩→肘）と前腕（肘→手首）のなす角。局所 y は上腕 × 前腕の逆向きなので、
+        # τ_y·dθ がそのまま肘の仕事になる（push_up_model.joint_axes）。
+        _pp = transformed_p3ds
+        v_ua_R = _pp[slot_of("R_ELBOW")] - _pp[slot_of("R_SHOULDER")]
+        v_fa_R = _pp[slot_of("R_WRIST")] - _pp[slot_of("R_ELBOW")]
+        v_ua_L = _pp[slot_of("L_ELBOW")] - _pp[slot_of("L_SHOULDER")]
+        v_fa_L = _pp[slot_of("L_WRIST")] - _pp[slot_of("L_ELBOW")]
         th_R = angle_between(v_ua_R, v_fa_R)
         th_L = angle_between(v_ua_L, v_fa_L)
         tau_R = float(locals_map.get("elbow_R", np.zeros(3))[1])
@@ -3763,52 +3490,18 @@ while True:
     # torque_sssへのトルク値の追加（左右腕 6 要素）
     temp_local = [locals_map[k] for k in part_keys]
 
-    # --- 新: エネルギー用トルク成分履歴収集 ---
-    for k in current_energy_component_history.keys():  # 表示対象 (フィルタ後) のみに限定
-        ty = locals_map[k][1] if k in locals_map else 0.0
-        contrib = 0.0
-        if k in ELBOW_KEYS:
-            # 上腕: ローカル y 成分のマイナスのみ（屈曲 or 伸展側想定）
-            if ty < 0:
-                contrib = -ty  # 正値として蓄積
-        elif k in WRIST_KEYS:
-            # 前腕: ローカル y 成分のプラスのみ
-            if ty > 0:
-                contrib = ty
-        # 肩・体幹は未定: 0 のまま
-        current_energy_component_history[k].append(contrib)
+    # 手首のサイクル量は正の仕事 ∫max(P, 0)dt [J]（スコアの W_pos と同じ定義）。
+    # かつて局所 y 成分の正の部分の時間積分（N·m·s）で、しかも wrist_R は右肘まわりのトルクだった
+    # （§5-7）。肘は _E_buffers の τ·dθ、肩・体幹は仕事率の積分を使うので、ここでは手首だけ溜める。
+    for k in current_energy_component_history.keys():
+        current_energy_component_history[k].append(
+            max(powers_map.get(k, 0.0), 0.0) if k in WRIST_KEYS else 0.0)
 
-    # 仕事率 P = τ_y × (ω_リンク − ω_親)·y。トルクと同じ局所軸に射影する（utils.compute_joint_power）。
+    # 仕事率 P = τ_y × (ω_外側 − ω_内側)·y（push_up_model.push_up_joint_powers）。
     # かつて P = τ·ω（全体座標の内積、各部位の絶対角速度）で、肘角を保ったまま腕を振るだけで
-    # 仕事が出ていた（計画メモ A-4 (2)、H-B）。親の対応は parent_links と同じ。
-    omega_map = {
-        "wrist_R": part_data["forearm_R"][-1]["omega"],
-        "elbow_R": part_data["upper_arm_R"][-1]["omega"],
-        "shoulder_R": part_data["both_shoulder"][-1]["omega"],
-        "wrist_L": part_data["forearm_L"][-1]["omega"],
-        "elbow_L": part_data["up_arm_l"][-1]["omega"],
-        "shoulder_L": part_data["both_shoulder"][-1]["omega"],
-    }
-    parent_key_of = {
-        "wrist_R": "elbow_R", "elbow_R": "shoulder_R", "shoulder_R": None,
-        "wrist_L": "elbow_L", "elbow_L": "shoulder_L", "shoulder_L": None,
-    }
-    for key in current_power_history.keys():  # 表示対象に合わせて計算
-        parent_key = parent_key_of.get(key)
-        vectors = [globals_map.get(key), omega_map.get(key), links.get(key)]
-        if parent_key is not None:
-            vectors += [omega_map.get(parent_key), parent_links.get(key)]
-        if any(v is None or not np.all(np.isfinite(v)) for v in vectors):
-            p_val = 0.0
-        else:
-            p_val = compute_joint_power(
-                globals_map[key],
-                omega_map[key],
-                omega_map[parent_key] if parent_key is not None else None,
-                links[key],
-                parent_links[key],
-            )
-        current_power_history[key].append(p_val)
+    # 仕事が出ていた（計画メモ A-4 (2)、H-B）。
+    for key in current_power_history.keys():
+        current_power_history[key].append(powers_map.get(key, 0.0))
     _perf.add('hist_store', time.perf_counter() - t_u_hist)
 
     t_u_cyc = time.perf_counter()
@@ -3947,17 +3640,8 @@ while True:
                     # 正しいJ単位の連続エネルギー
                     energy_cont = float(_continuous_energy_J.get(pk, 0.0))
                 elif pk in WRIST_KEYS:
-                    # 暫定: 旧トルク成分の時間積分をスケールダウン
-                    raw_sum = float(sum(current_energy_component_history.get(pk, [])) * _DYN_DT)
-                    energy_cont = raw_sum / 50.0
-                    if energy_cont == 0.0:
-                        # 微小代替: ローカルトルクy絶対値で最初の僅かな動きを可視化
-                        try:
-                            lt = locals_map.get(pk)
-                            ty_abs = abs(float(lt[1])) if lt is not None and np.all(np.isfinite(lt)) else 0.0
-                        except Exception:
-                            ty_abs = 0.0
-                        energy_cont = float(ty_abs * _DYN_DT)
+                    # 正の仕事 ∫max(P, 0)dt [J]。サイクル確定時の値と同じ定義
+                    energy_cont = float(sum(current_energy_component_history.get(pk, [])) * _DYN_DT)
                 else:
                     energy_cont = float(sum(current_power_history.get(pk, [])) * _DYN_DT)
                 current_impulses[pk] = energy_cont
@@ -4345,7 +4029,7 @@ for frame_idx, frame_data in enumerate(aim_torque):
 
 # DataFrameにして保存
 df = pd.DataFrame(csv_rows)
-save_path = os.path.join(save_dir, f"aim_torque_vec_{timestamp}{_grav_tag}.csv")
+save_path = os.path.join(save_dir, f"aim_torque_vec_{timestamp}_s{OUTPUT_SCHEMA_VERSION}{_grav_tag}.csv")
 df.to_csv(save_path, index=False, encoding="utf-8-sig")
 
 print(f"✅ aim_torque（ベクトル形式）を保存しました: {save_path}")
@@ -4355,7 +4039,7 @@ print(f"✅ aim_torque（ベクトル形式）を保存しました: {save_path}
 # -------------------------------
 if cycle_energy_debug_rows:
     df_cycle_dbg = pd.DataFrame(cycle_energy_debug_rows)
-    cycle_dbg_path = os.path.join(save_dir, f"cycle_energy_debug_{timestamp}{_grav_tag}.csv")
+    cycle_dbg_path = os.path.join(save_dir, f"cycle_energy_debug_{timestamp}_s{OUTPUT_SCHEMA_VERSION}{_grav_tag}.csv")
     df_cycle_dbg.to_csv(cycle_dbg_path, index=False, encoding="utf-8-sig")
     print(f"✅ cycle_energy_debug を保存しました: {cycle_dbg_path}")
 else:
@@ -4371,8 +4055,8 @@ if os.getenv('OFFLINE_WRIST_CAPTURE','0') in ('1','true','True'):
         if _wv and _wt and len(_wv) == len(_wt):
             wv_arr = np.asarray(_wv, dtype=float)
             wt_arr = np.asarray(_wt, dtype=float)
-            np.save(os.path.join(save_dir, f"forearm_R_{timestamp}.npy"), wv_arr)
-            np.save(os.path.join(save_dir, f"tau_wrist_R_{timestamp}.npy"), wt_arr)
+            np.save(os.path.join(save_dir, f"forearm_R_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wv_arr)
+            np.save(os.path.join(save_dir, f"tau_wrist_R_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wt_arr)
             print(f"✅ OFFLINE_WRIST_CAPTURE: 保存 forearm_R_{timestamp}.npy / tau_wrist_R_{timestamp}.npy (N={len(wv_arr)})")
         else:
             print('[OFFLINE_WRIST_CAPTURE] データ不足のため保存スキップ')
@@ -4382,8 +4066,8 @@ if os.getenv('OFFLINE_WRIST_CAPTURE','0') in ('1','true','True'):
         if _wvL and _wtL and len(_wvL) == len(_wtL):
             wv_arr_L = np.asarray(_wvL, dtype=float)
             wt_arr_L = np.asarray(_wtL, dtype=float)
-            np.save(os.path.join(save_dir, f"forearm_L_{timestamp}.npy"), wv_arr_L)
-            np.save(os.path.join(save_dir, f"tau_wrist_L_{timestamp}.npy"), wt_arr_L)
+            np.save(os.path.join(save_dir, f"forearm_L_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wv_arr_L)
+            np.save(os.path.join(save_dir, f"tau_wrist_L_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wt_arr_L)
             print(f"✅ OFFLINE_WRIST_CAPTURE: 保存 forearm_L_{timestamp}.npy / tau_wrist_L_{timestamp}.npy (N={len(wv_arr_L)})")
     except Exception as _sv_e:  # noqa: BLE001
         print(f"[OFFLINE_WRIST_CAPTURE] 保存失敗: {_sv_e}")

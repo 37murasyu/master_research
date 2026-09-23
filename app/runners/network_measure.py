@@ -6,39 +6,38 @@
 新設することになり、4,383 行に手を入れる羽目になる。
 
 そこでオーケストレーションだけ新規に書き、**物理計算はすべて既存モジュールを
-再利用する**。既存の USB 経路は一切変更しないので回帰リスクがゼロ。
+再利用する**。
 
 再利用しているもの:
+    push_up_model（座位プッシュアップのモデル。USB・オフライン経路と共有）
+        estimate_gravity / joint_axes / push_up_torques / segment_from_storage
     utils.compute_local_torque / compute_joint_power / PushCycleDetector
-    utils_dynamic.calculate_inertia_tensor / calculate_M_and_F /
-                  calculate_individual_torques
+    utils_dynamic.calculate_inertia_tensor
     link_vector_calculator_module.LinkVectorCalculator
     body_part_storage_module.BodyPartDataStorage
 
+モデル（KNOWN_ISSUES §2-1）: 手を固定端に前腕 → 上腕の鎖を解き、体幹＋頭の荷重を肩に載せる。
+重力は慣性テンソルを確定する初期フレームの体幹の向きから決める。かつては USB 経路と同じく
+部位の並びが 1 つずれて ``wrist_R`` が右肘まわりのトルクになっており（§5-7）、下胴体に
+体重 60 kg を丸ごと渡して 200〜300 N·m 出ていた（§5-8）。
+
 既存 USB 経路と揃えてある点:
-    - キーポイントの並び順（config.pose_keypoints の宣言順）
-    - リンク定義（part_calculations / links / parent_links）
-    - 慣性テンソルの部位行と長さの取り方、r_g の重み、Imode / condition
+    - キーポイントの並び順（config.pose_keypoints の昇順）
+    - リンク定義（part_calculations）と、関節ごとの局所軸（push_up_model.joint_axes）
+    - 慣性テンソルの部位行と長さの取り方
     - サイクル検出の軸（既定 y）、閾値、mode='rise_to_rise'
-    - ``compute_local_torque`` への parent_vec（肘面を基準に取る）
 
 **揃っていない点（重要）**:
     サイクルごとの量は仕事率 P = τ_y × (ω_リンク − ω_親)·y を積分した**仕事 [J]** で、既存の
-    ``master_research_code.py`` が肘・手首に対して使う特別な経路
-    （``compute_cycle_energy_filtered`` と局所 y 成分の片側積算）は再現していない。
-    したがって肘・手首の値は USB 経路と**直接比較できない**。肩・体幹に相当する
-    「その他」分岐（同じ仕事率の積分）とは同じ定義。
-
-注記: キーポイントの並び順が下流のインデックス演算と整合しているかには疑義がある
-（code-review 指摘 #1 と同じ論点）。ここでは既存と同じ規約に揃えることを優先し、
-規約自体は変更していない。
+    ``master_research_code.py`` が肘に対して使う特別な経路（``compute_cycle_energy_filtered``）は
+    再現していない。したがって肘の値は USB 経路と**直接比較できない**。
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -46,21 +45,26 @@ import numpy as np
 # 最初の数フレームの中で utils(0.12s) + utils_dynamic(0.70s) の読み込みが走り、
 # その間 asyncio の受信ループが止まる（同期バッファの窓 2 秒の 1/3 を食う）。
 from body_part_storage_module import BodyPartDataStorage
-# 部位キーと重力は config.py が持っている。utils 経由で既に読み込まれているので
+# 部位キーと重力の大きさは config.py が持っている。utils 経由で既に読み込まれているので
 # 追加コストなしで再利用できる。
-from config import INERTIA_LENGTH_FRAMES
-from config import g as GRAVITY
+from config import G_SCALAR, INERTIA_LENGTH_FRAMES, SEGMENT_MASS_FRACTIONS
 from config import part_calculations
 from config import part_keys as _PART_KEYS
 from config import slot_of
 from link_vector_calculator_module import LinkVectorCalculator
-from utils import PushCycleDetector, compute_joint_power, compute_local_torque
-from utils_dynamic import (
-    calculate_individual_torques,
-    calculate_inertia_tensor,
-    calculate_M_and_F,
-    compute_triangulate_transform_native,
+from push_up_model import (
+    ARM_PARTS,
+    arm_axes,
+    estimate_gravity,
+    hand_mass,
+    push_up_joint_powers,
+    push_up_torques,
+    segment_from_storage,
+    torso_load_mass,
+    trunk_up_vectors,
 )
+from utils import PushCycleDetector, compute_local_torque
+from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transform_native
 
 from app.net.sync_buffer import PairedSample
 
@@ -71,50 +75,6 @@ __all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig"]
 # ここでは (start, end) のタプル形式に落として使う。
 PART_LINKS: dict[str, tuple[int, int]] = {
     name: (spec["start"], spec["end"]) for name, spec in part_calculations.items()
-}
-
-# 局所トルクの基準リンク（既存 master_research_code.py の links 辞書と同じ）。
-# 関節はランドマーク名で指す。位置索引を直書きすると pose_keypoints に点を足したときに
-# 別の関節を指す（再検算 R-1 と同じ壊れ方）。
-_TORQUE_LINK_IDS: dict[str, tuple[str, str]] = {
-    "wrist_R": ("R_ELBOW", "R_WRIST"),        # 右手首 - 右肘
-    "elbow_R": ("R_SHOULDER", "R_ELBOW"),     # 右肘 - 右肩
-    "shoulder_R": ("L_SHOULDER", "R_SHOULDER"),   # 右肩 - 左肩
-    "wrist_L": ("L_ELBOW", "L_WRIST"),        # 左手首 - 左肘
-    "elbow_L": ("L_SHOULDER", "L_ELBOW"),     # 左肘 - 左肩
-    "shoulder_L": ("R_SHOULDER", "L_SHOULDER"),   # 左肩 - 右肩
-}
-
-
-def _link_getter(origin: str, tip: str) -> Callable[[np.ndarray], np.ndarray]:
-    a, b = slot_of(origin), slot_of(tip)
-    return lambda p: p[b] - p[a]
-
-
-TORQUE_LINKS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
-    name: _link_getter(*ids) for name, ids in _TORQUE_LINK_IDS.items()
-}
-
-# 親リンク。局所座標の y 軸を親×z（肘面の法線）で取るために使う。
-# 既存 master_research_code.py:3587-3594 と同じ対応。
-PARENT_OF: dict[str, str | None] = {
-    "wrist_R": "elbow_R",
-    "elbow_R": "shoulder_R",
-    "shoulder_R": None,
-    "wrist_L": "elbow_L",
-    "elbow_L": "shoulder_L",
-    "shoulder_L": None,
-}
-
-# 仕事率を求めるときに、各関節のリンク側として使う部位の角速度。
-# 親側は PARENT_OF の関節の部位を引く（既存 master_research_code.py の omega_map と同じ）。
-OMEGA_SOURCE: dict[str, str] = {
-    "wrist_R": "forearm_R",
-    "elbow_R": "upper_arm_R",
-    "shoulder_R": "both_shoulder",
-    "wrist_L": "forearm_L",
-    "elbow_L": "up_arm_l",
-    "shoulder_L": "both_shoulder",
 }
 
 # 部位キーは config.py が持っている（順序も一致）。
@@ -149,6 +109,10 @@ class MeasurementConfig:
     cycle_min_interval: int = 10
     cycle_mode: str = "rise_to_rise"
     cycle_negative_down: bool = True
+
+    # 重力の決め方（push_up_model.estimate_gravity の mode）。慣性テンソルを確定する
+    # 初期フレームの体幹の向きから決める。
+    gravity_mode: str = "axis"
 
     # 保持するフレーム数の上限。長時間の計測でメモリを食い潰さないため。
     # 物理計算が実際に見るのは直近 2 フレームだけ（LinkVectorCalculator は
@@ -206,6 +170,7 @@ class NetworkMeasurement:
 
         self._inertia: dict[str, np.ndarray] = {}
         self._inertia_samples: list[np.ndarray] = []
+        self.gravity: np.ndarray | None = None
 
         # サイクル検出
         self._baseline_sum = 0.0
@@ -335,13 +300,14 @@ class NetworkMeasurement:
         )
 
     def _build_inertia(self, samples: np.ndarray) -> None:
-        """慣性テンソルを確定させる。部位行と引数は既存と同じ。
+        """慣性テンソルと重力を確定させる。
 
         ``samples`` は (フレーム, 関節, 3) の点列。リンク長は**中央値**で決める。
         1 フレームの瞬時値だと三角測量の誤差がそのまま固定され、回帰式
         ``I = a*w + b*l + c`` は l に極端に敏感なので大きくずれる（再検算 R-6）。
-        関節はランドマーク名で指す。位置索引を直書きすると pose_keypoints に
-        点を足したときに別の関節を指す（再検算 R-1 と同じ壊れ方）。
+        腕は左右で長さが違うので、テンソルも左右別に持つ（計画メモ E-1d）。
+
+        重力は同じ初期フレームの体幹（腰中点 → 肩中点）の向きから決める（§1-5）。
         """
         mass = self.config.body_mass_kg
 
@@ -349,163 +315,49 @@ class NetworkMeasurement:
             ia, ib = slot_of(a), slot_of(b)
             return float(np.nanmedian(np.linalg.norm(samples[:, ia] - samples[:, ib], axis=1)))
 
-        # 胴体の半長 = |肩中点 − 腰中点| / 2
-        shoulders = samples[:, slot_of("L_SHOULDER")] + samples[:, slot_of("R_SHOULDER")]
-        hips = samples[:, slot_of("L_HIP")] + samples[:, slot_of("R_HIP")]
-        half_body = 0.25 * float(np.nanmedian(np.linalg.norm(shoulders - hips, axis=1)))
-
-        # 腕と大腿は左右で長さが違うので、テンソルも左右別に持つ。かつて左腕と右脚の
-        # 長さを左右共通で使っており、右腕の慣性が左腕の長さで決まっていた（計画メモ E-1d）。
         self._inertia = {
             "upper_arm_R": calculate_inertia_tensor(3, mass, length("R_SHOULDER", "R_ELBOW")),
             "upper_arm_L": calculate_inertia_tensor(3, mass, length("L_SHOULDER", "L_ELBOW")),
             "forearm_R": calculate_inertia_tensor(4, mass, length("R_ELBOW", "R_WRIST")),
             "forearm_L": calculate_inertia_tensor(4, mass, length("L_ELBOW", "L_WRIST")),
-            "upper_body": calculate_inertia_tensor(1, mass, half_body),
-            "lower_body": calculate_inertia_tensor(0, mass, half_body),
-            "thigh_R": calculate_inertia_tensor(6, mass, length("R_HIP", "R_KNEE")),
-            "thigh_L": calculate_inertia_tensor(6, mass, length("L_HIP", "L_KNEE")),
         }
+        ups = trunk_up_vectors(*(samples[:, slot_of(n)] for n in ("L_SHOULDER", "R_SHOULDER", "L_HIP", "R_HIP")))
+        self.gravity = estimate_gravity(ups, G_SCALAR, self.config.gravity_mode).vector
 
     def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:
         data = {name: self.storage.get_data(name) for name in PART_LINKS}
-        if any(not values for values in data.values()):
+        needed = [part for parts in ARM_PARTS.values() for part in parts.values()] + ["both_shoulder"]
+        if any(not data[name] for name in needed):
             return None
 
         mass = self.config.body_mass_kg
-        # 部位質量。config.py の m1(上腕) m2(前腕) m4(太腿) と同じ係数。
-        m_upper_arm = mass * 0.0227
-        m_forearm = mass * 0.016
-        m_thigh = mass * 0.11
+        load = torso_load_mass(mass)
+        hand = hand_mass(mass)
+        gravity = self.gravity
+        up = -gravity
 
-        inertia = self._inertia
-
-        def chain(side: str, arm: str, forearm: str, leg: str, condition: int):
-            specs = [
-                (inertia[f"upper_arm_{side}"], m_upper_arm, data[arm], {}),
-                (inertia[f"forearm_{side}"], m_forearm, data[forearm], {}),
-                (
-                    inertia["upper_body"],
-                    mass,
-                    data["both_shoulder"],
-                    {
-                        "add_part_data": data["both_hip"],
-                        "condition": condition,
-                        "Imode": 3,
-                        "Info_I3": points,
-                    },
-                ),
-                (
-                    inertia["lower_body"],
-                    mass,
-                    data["both_hip"],
-                    {"add_part_data": data["both_shoulder"], "Imode": 4},
-                ),
-                (inertia[f"thigh_{side}"], m_thigh, data[leg], {}),
-            ]
-            rows = [
-                calculate_M_and_F(tensor, mass_i, data_i, GRAVITY, **kwargs)
-                for tensor, mass_i, data_i, kwargs in specs
-            ]
-            moments, forces, parts = (list(col) for col in zip(*rows))
-            return moments, forces, parts
-
-        try:
-            Ms_r, Fs_r, parts_r = chain("R", "upper_arm_R", "forearm_R", "upper_Leg_R", condition=1)
-            Ms_l, Fs_l, parts_l = chain("L", "up_arm_l", "forearm_L", "upper_Leg_L", condition=0)
-        except (IndexError, KeyError, ValueError):
-            return None
-
-        def centroids(arm: str, forearm: str, leg: str) -> list[np.ndarray]:
-            shoulder = data["both_shoulder"][-1]["centroid"]
-            hip = data["both_hip"][-1]["centroid"]
-            return [
-                data[arm][-1]["centroid"],
-                data[forearm][-1]["centroid"],
-                (shoulder * 3 + hip) / 4,
-                (shoulder + hip * 3) / 4,
-                data[leg][-1]["centroid"],
-            ]
-
-        r_x = data["both_hip"][-1]["centroid"]
-        tau_E = np.zeros(3)
-        f_E = np.zeros(3)
-
-        def joint_points(parts: list[str], side: str) -> list[np.ndarray]:
-            # 胴体は左右のチェーンで部位データを共有しており、storage の p1 はリンク始点の
-            # 左肩・左腰になる。右肩のトルクが左肩まわりで計算されていたので、
-            # チェーン側の肩・腰を使う（計画メモ E-1f）。
-            own = {
-                "both_shoulder": points[slot_of(f"{side}_SHOULDER")],
-                "both_hip": points[slot_of(f"{side}_HIP")],
-            }
-            return [own[part] if part in own else data[part][-1]["p1"] for part in parts]
-
-        torques_r = calculate_individual_torques(
-            Ms_r, Fs_r, np.array(centroids("upper_arm_R", "forearm_R", "upper_Leg_R")),
-            tau_E, f_E, r_x, parts_r, self.storage, p1s=joint_points(parts_r, "R"),
-        )
-        torques_l = calculate_individual_torques(
-            Ms_l, Fs_l, np.array(centroids("up_arm_l", "forearm_L", "upper_Leg_L")),
-            tau_E, f_E, r_x, parts_l, self.storage, p1s=joint_points(parts_l, "L"),
-        )
-
-        global_torques = {
-            "wrist_R": torques_r[0][0],
-            "elbow_R": torques_r[1][0],
-            "shoulder_R": torques_r[2][0],
-            "wrist_L": torques_l[0][0],
-            "elbow_L": torques_l[1][0],
-            "shoulder_L": torques_l[2][0],
-        }
-
-        links = {key: builder(points) for key, builder in TORQUE_LINKS.items()}
-
-        local = {}
-        for key, global_torque in global_torques.items():
-            parent_key = PARENT_OF[key]
-            local[key] = compute_local_torque(
-                global_torque,
-                links[key],
-                parent_vec=links[parent_key] if parent_key else None,
-            )
-            self.storage.add_torque(key, local[key])
-
-        self._accumulate_power(global_torques, links, data)
-        return local
-
-    def _accumulate_power(
-        self,
-        global_torques: dict[str, np.ndarray],
-        links: dict[str, np.ndarray],
-        data: dict[str, list],
-    ) -> None:
-        """仕事率 P = τ_y × (ω_リンク − ω_親)·y を溜める（utils.compute_joint_power）。
-
-        局所 y 軸は局所トルクと同じ作り方（リンクと親リンク）。関節の仕事率なので
-        親との相対角速度を使う。かつて絶対角速度との内積 τ·ω で、肘角を保ったまま
-        腕を振るだけで仕事が出ていた（計画メモ A-4 (2)、H-B）。
-        既存 master_research_code.py の仕事率と同じ式。
-        """
-        def latest_omega(key: str):
-            entries = data.get(OMEGA_SOURCE[key])
-            return entries[-1]["omega"] if entries else None
-
-        for key in OMEGA_SOURCE:
-            parent_key = PARENT_OF[key]
-            vectors = [global_torques.get(key), latest_omega(key), links.get(key)]
-            if parent_key is not None:
-                vectors += [latest_omega(parent_key), links.get(parent_key)]
-            if any(v is None or not np.all(np.isfinite(v)) for v in vectors):
-                self._power_history[key].append(0.0)
-                continue
-            self._power_history[key].append(compute_joint_power(
-                global_torques[key],
-                latest_omega(key),
-                latest_omega(parent_key) if parent_key is not None else None,
-                links[key],
-                links[parent_key] if parent_key is not None else None,
-            ))
+        local: dict[str, np.ndarray] = {}
+        for side, parts in ARM_PARTS.items():
+            forearm = segment_from_storage(
+                data[parts["forearm"]][-1], self._inertia[f"forearm_{side}"], mass * SEGMENT_MASS_FRACTIONS["forearm"])
+            upper_arm = segment_from_storage(
+                data[parts["upper_arm"]][-1], self._inertia[f"upper_arm_{side}"],
+                mass * SEGMENT_MASS_FRACTIONS["upper_arm"])
+            torques = push_up_torques(
+                forearm, upper_arm,
+                points[slot_of(f"{side}_WRIST")], points[slot_of(f"{side}_ELBOW")],
+                points[slot_of(f"{side}_SHOULDER")], gravity, load, hand)
+            axes = arm_axes(points, side)
+            for joint, torque in torques.items():
+                key = f"{joint}_{side}"
+                link, parent = axes[joint]
+                local[key] = compute_local_torque(torque, link, parent, up)
+                self.storage.add_torque(key, local[key])
+            powers = push_up_joint_powers(
+                torques, axes, forearm, upper_arm, data["both_shoulder"][-1].get("omega"), up)
+            for joint, power in powers.items():
+                self._power_history[f"{joint}_{side}"].append(power)
+        return {key: local[key] for key in PART_KEYS}
 
     def _accumulate_cycle(self, points: np.ndarray, dt: float, result: FrameResult) -> None:
         """サイクルを検出し、その区間の仕事を積む。"""

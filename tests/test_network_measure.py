@@ -240,11 +240,12 @@ class TestJointPower:
     """サイクルごとの仕事は、関節の相対角速度から求める。"""
 
     def test_rigid_arm_rotation_does_no_work_at_the_elbow(self):
-        """肘角を保ったまま腕全体が回るだけなら、wrist_R（前腕リンク）の仕事は 0。
+        """肘角を保ったまま腕全体が回るだけなら、elbow_R の仕事は 0。
 
-        wrist_R の局所 y 軸は「上腕 × 前腕」の法線（肘の屈曲軸）なので、仕事率には
-        前腕と上腕の相対角速度を使う。かつて前腕の絶対角速度との内積 τ·ω を使っており、
-        腕を振るだけで仕事が出ていた（計画メモ A-4 (2)、H-B）。
+        肘の局所 y 軸は腕の面の法線（肘の屈曲軸）なので、仕事率には上腕と前腕の相対角速度を
+        使う。かつて部位の絶対角速度との内積 τ·ω を使っており、腕を振るだけで仕事が出ていた
+        （計画メモ A-4 (2)、H-B）。当時は部位の並びが 1 つずれており、肘の値は wrist_R の名前で
+        出ていた（KNOWN_ISSUES §5-7）。
         """
         measurement = _measurement()
         for index in range(150):
@@ -254,10 +255,10 @@ class TestJointPower:
                 int(t * 1e9), _project(measurement.P0, truth), _project(measurement.P1, truth)))
 
         assert measurement.cycle_count > 0, "前提のサイクル検出が起きていない"
-        work = np.abs(np.array(measurement.cycle_work["wrist_R"]))
+        work = np.abs(np.array(measurement.cycle_work["elbow_R"]))
         assert np.all(work < 0.05), (
-            f"肘角が一定なのに wrist_R のサイクル仕事が {work} J 出た。"
-            " 前腕の絶対角速度を使っていないか確認すること"
+            f"肘角が一定なのに elbow_R のサイクル仕事が {work} J 出た。"
+            " 部位の絶対角速度を使っていないか確認すること"
         )
 
 
