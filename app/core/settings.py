@@ -245,6 +245,21 @@ CURATED: dict[str, dict[str, Any]] = {
             "処理の間隔が合うものを使う。空なら従来の固定値。プロファイルは解析ページで生 CSV から作れる。"
         ),
     },
+    # ゲージ画面の項目。スキーマの生成元（master_research_code.py・config.py）は
+    # ゲージ表示を知らないので、GAUGE_SHOW_JOULES はここだけで定義する（_load_schema が
+    # CURATED 専用の Setting を組み立てる）。操作口はゲージ画面のスイッチだけにするため、
+    # 設定フォームには出さない（ui_visible=False）。
+    "GAUGE_SHOW_JOULES": {
+        "type": "bool",
+        "code_default": "1",
+        "group": "表示",
+        "description": "ゲージに J（仕事）の数値を表示する。",
+    },
+    "BODY_MASS_KG": {
+        "ui_visible": True,
+        "group": "被験者",
+        "description": "体重 [kg]。",
+    },
 }
 
 
