@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
 import warnings
 from collections import deque
@@ -143,6 +144,9 @@ class MeasurementConfig:
     # 慣性テンソルのリンク長を確定するまでに溜めるフレーム数。
     # 1 フレームの瞬時値だとその瞬間の三角測量誤差が全実行に固定される（再検算 R-6）。
     inertia_ready_frames: int = INERTIA_LENGTH_FRAMES
+    # 左右の肩と肘がそろう組が窓に満たないまま、肩が有限の組がこれだけたまったら、有限の値だけで窓を閉じる（約 5 秒）。
+    # 片方の肘が画面の外に出続けると窓が永久に閉じず、トルクもゲージも出なかった（2026-09-24 のレビュー）
+    window_timeout_frames: int = 150
     dynamics_ready_frames: int = max(7, INERTIA_LENGTH_FRAMES)
 
     # 重力の決め方（push_up_model.estimate_gravity の mode）。慣性テンソルを確定する
@@ -287,6 +291,9 @@ class NetworkMeasurement:
         # 先頭の窓（肩と肘が有限の組を inertia_ready_frames 組）。閉じたら体格・重力・帯・回の区切りが決まる
         self._window_raw: list[np.ndarray] = []
         self._window_points: list[np.ndarray] = []
+        # 肩が有限の組（窓が埋まらないときの予備）。直近 window_timeout_frames 組
+        self._loose_raw: deque[np.ndarray] = deque(maxlen=max(1, self.config.window_timeout_frames))
+        self._loose_points: deque[np.ndarray] = deque(maxlen=max(1, self.config.window_timeout_frames))
         self.window_closed = False
         self.window: dict = {}
         # 校正に盤を立てた向き（実行時の座標の単位ベクトル、app.hybrid.gravity.read_board_up）
@@ -525,28 +532,54 @@ class NetworkMeasurement:
             self.storage.add_data(part, r_vec, vel, omega, centroid, p1, ang_acc, acc)
 
     def _collect_window(self, raw: np.ndarray, points: np.ndarray, result: FrameResult) -> None:
-        """肩と肘が有限の組を先頭の窓に溜め、埋まったら閉じる。"""
-        needed = [slot_of(name) for name in ("L_SHOULDER", "R_SHOULDER", "L_ELBOW", "R_ELBOW")]
-        if not np.all(np.isfinite(raw[needed])):
-            return
-        self._window_raw.append(raw)
-        self._window_points.append(points)
-        if len(self._window_raw) >= self.config.inertia_ready_frames:
-            self._close_window()
-            result.window_closed = True
+        """肩と肘が有限の組を先頭の窓に溜め、埋まったら閉じる。
 
-    def _close_window(self) -> None:
+        左右の肩が有限の組は予備にも溜め、窓が埋まらないまま ``window_timeout_frames`` 組たまったら、予備の組の
+        有限の値だけで閉じる（見えない側の前腕長と帯は出さない）。
+        """
+        shoulders = [slot_of("L_SHOULDER"), slot_of("R_SHOULDER")]
+        if not np.all(np.isfinite(raw[shoulders])):
+            return
+        self._loose_raw.append(raw)
+        self._loose_points.append(points)
+        needed = shoulders + [slot_of("L_ELBOW"), slot_of("R_ELBOW")]
+        if np.all(np.isfinite(raw[needed])):
+            self._window_raw.append(raw)
+            self._window_points.append(points)
+        timeout = self.config.window_timeout_frames
+        if len(self._window_raw) >= self.config.inertia_ready_frames:
+            self._close_window(self._window_raw, self._window_points, fallback=False)
+        elif timeout > 0 and len(self._loose_raw) >= timeout:
+            print("[計測] 先頭の窓: 左右の肩と肘がそろう組が 5 秒でたまらなかったので、見えている点だけで決めた"
+                  "（見えない側の帯は出さない）。両方の画面に両腕が入っているか確かめること", file=sys.stderr)
+            self._close_window(list(self._loose_raw), list(self._loose_points), fallback=True)
+        else:
+            return
+        self._window_raw, self._window_points = [], []
+        self._loose_raw.clear()
+        self._loose_points.clear()
+        result.window_closed = True
+
+    def _close_window(self, raw_frames: list[np.ndarray], point_frames: list[np.ndarray], *,
+                      fallback: bool = False) -> None:
         """先頭の窓で、体格の検査・EKF の掛け直し・慣性・重力・上向きと基準の高さ・前腕長・帯・回の区切りを決める。
 
         体格の検査は EKF の手前の値（``points_raw``）で、プロファイルの有無によらず行う（USB はプロファイル使用時だけ）。
         それ以外は EKF の後の値。
         """
-        raw = np.stack(self._window_raw)
-        points = np.stack(self._window_points)
-        self._window_raw, self._window_points = [], []
+        raw = np.stack(raw_frames)
+        points = np.stack(point_frames)
 
-        first, second = (self._keypoints_in_id_order.index(i) for i in SCALE_REF_PAIR)
-        run_length = float(np.nanmedian(np.linalg.norm(raw[:, first] - raw[:, second], axis=1)))
+        def ref_length(pair) -> float:
+            first, second = (self._keypoints_in_id_order.index(i) for i in pair)
+            lengths = np.linalg.norm(raw[:, first] - raw[:, second], axis=1)
+            lengths = lengths[np.isfinite(lengths)]
+            return float(np.median(lengths)) if lengths.size else float("nan")
+
+        # 右の肩–肘（SCALE_REF_PAIR）が見えないときは左の肩–肘で確かめる（窓の予備で閉じたとき）
+        run_length = ref_length(SCALE_REF_PAIR)
+        if not math.isfinite(run_length):
+            run_length = ref_length((11, 13))
         noise = None if self.ekf is None else self.ekf.noise
         scale_ref = noise.resolution.scale_ref if noise is not None and noise.origin == "profile" else None
         try:
@@ -583,6 +616,7 @@ class NetworkMeasurement:
             "gravity_source": None if choice is None else choice.source,
             "baseline_height_m": self.baseline_height_m,
             "forearm_len_m": dict(self.forearm_m),
+            "fallback": fallback,
         }
         self.window_closed = True
 
