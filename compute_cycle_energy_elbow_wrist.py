@@ -20,6 +20,11 @@ FOREARM_MASS_FRAC = SEGMENT_MASS_FRACTIONS["forearm"]
 HAND_MASS_FRAC = SEGMENT_MASS_FRACTIONS["hand"]
 FOREARM_COM_FRAC = COM_FRACTIONS["forearm"]
 HAND_COM_FRAC = COM_FRACTIONS["hand"]
+# 手長 / 前腕長。手長は実測が無いので、Drillis & Contini の体節長比（手 0.108H、前腕 0.146H）で推定する
+HAND_TO_FOREARM_LENGTH = 0.108 / 0.146
+# 1RM の列。elbow_*_outer は「肘が内側へ曲がろうとするトルクを打ち消す向き」の筋力（肘の伸展の力）。
+# プッシュアップで肘がするのも伸展なので、こちらを使う（KNOWN_ISSUES §6-4）
+ONE_RM_COLUMNS = {"elbow": "elbow_{side}_outer", "wrist": "wrist_{side}"}
 DEFAULT_FPS = 30.0
 
 RIGHT = {
@@ -199,6 +204,32 @@ def _theoretical_work(m_x: float, m_db: float, r_g: float, r_x: float) -> float:
     return (m_x * r_g + m_db * r_x) * THEORETICAL_WORK_COEFF
 
 
+def theoretical_1rm_work(joint: str, body_mass: float, forearm_len: float, m_db: float) -> float:
+    """理論 1RM 仕事量（スコアの分母）[J]。W = (m_x·r_g + m_db·r_x) × THEORETICAL_WORK_COEFF。
+
+    - 肘: 前腕＋手を回す。手は手首の質点（手長が分からないため）。ダンベルは前腕長の位置
+    - 手首: 手を回す。ダンベルは手のひらにあり、手首の軸から手の中心（手長 × 0.506）だけ離れている。
+      手長は前腕長から体節長比で推定する（HAND_TO_FOREARM_LENGTH）
+
+    分母は手を含める（2026-09-23 決定、§2-2）。1RM はダンベルを手に持つ試技なので手も一緒に持ち上がる。
+    分子（プッシュアップ）の鎖は手をアームレストに置いた固定端とするので手の重さは入らない。両者の差は
+    動作の違いであって定義の食い違いではない。
+
+    かつて手首はダンベルのてこの腕を 0 としており（論文 53 ページの定義）、手首の 1RM が分母に効かず、
+    手首のスコアが 2〜30 になっていた。2026-09-23 に定義を直した（§2-6）。
+    """
+    m_forearm = body_mass * FOREARM_MASS_FRAC
+    m_hand = body_mass * HAND_MASS_FRAC
+    if joint == "elbow":
+        m_x = m_forearm + m_hand
+        r_g = (m_forearm * forearm_len * FOREARM_COM_FRAC + m_hand * forearm_len) / m_x
+        return _theoretical_work(m_x, m_db, r_g, forearm_len)
+    if joint == "wrist":
+        hand_centre = HAND_COM_FRAC * HAND_TO_FOREARM_LENGTH * forearm_len
+        return _theoretical_work(m_hand, m_db, hand_centre, hand_centre)
+    raise ValueError(f"理論 1RM 仕事量は elbow か wrist: {joint!r}")
+
+
 def _load_mmax(mmax_df: pd.DataFrame, subject_id: int, col: str) -> float:
     row = mmax_df.loc[mmax_df["subject_id"] == subject_id]
     if row.empty:
@@ -297,44 +328,19 @@ def main() -> int:
             elbow_cycles = _aggregate_cycles(np.arange(n), elbow_power, cycle_idx, dt)
             wrist_cycles = _aggregate_cycles(np.arange(n), wrist_power, cycle_idx, dt)
 
-            # lever arms (forearm length as elbow->wrist distance)
-            forearm_vec, forearm_len_med, r_x_elbow = _compute_lengths(pose_scaled, side)
-            # equivalent masses
-            #
-            # 分母（理論 1RM 仕事量）は前腕＋手を回す仕事で、**手を含める**（2026-09-23 決定、§2-2）。
-            # 1RM はダンベルを手に持って肘を曲げる試技なので、手も一緒に持ち上がる。
-            # 分子（プッシュアップのトルク）の鎖は手をアームレストに置いた固定端とするので、
-            # 手の重さはアームレストが直接支え、手首・肘のトルクには入らない。両者の差は
-            # 動作の違い（手が動くか固定か）であって定義の食い違いではない。腕を肩から吊る
-            # 側の鎖（肩トルク）には、分母と同じく手を手首の質点として入れている（push_up_model）。
-            m_forearm = args.body_mass * FOREARM_MASS_FRAC
-            m_hand = args.body_mass * HAND_MASS_FRAC
-            m_x_elbow = m_forearm + m_hand
-            m_x_wrist = m_hand
-            # COM distances from joint
-            r_forearm = forearm_len_med * FOREARM_COM_FRAC
-            # hand COM distance from elbow: assume COM at wrist (hand length unknown)
-            r_hand_from_elbow = forearm_len_med
-            r_g_elbow = (m_forearm * r_forearm + m_hand * r_hand_from_elbow) / max(m_x_elbow, 1e-9)
-            # wrist COM distance (hand COM from wrist). Use forearm length as proxy.
-            r_g_wrist = forearm_len_med * HAND_COM_FRAC
-            # external force point at wrist
-            r_x_wrist = 0.0
-
-            # 1RM from m_max_all_merged
-            try:
-                m_db_elbow = _load_mmax(mmax_df, subject_id, f"elbow_{side_name}_outer")
-            except Exception as e:
-                print(f"[WARN] {stem} {side_name} elbow mmax missing: {e}")
-                m_db_elbow = np.nan
-            try:
-                m_db_wrist = _load_mmax(mmax_df, subject_id, f"wrist_{side_name}")
-            except Exception as e:
-                print(f"[WARN] {stem} {side_name} wrist mmax missing: {e}")
-                m_db_wrist = np.nan
-
-            theor_elbow = _theoretical_work(m_x_elbow, m_db_elbow, r_g_elbow, r_x_elbow) if np.isfinite(m_db_elbow) else np.nan
-            theor_wrist = _theoretical_work(m_x_wrist, m_db_wrist, r_g_wrist, r_x_wrist) if np.isfinite(m_db_wrist) else np.nan
+            # 前腕長（肘→手首の中央値）。分母のてこの腕と重心距離はここから決める
+            _, forearm_len_med, _ = _compute_lengths(pose_scaled, side)
+            theoretical = {}
+            for joint in ("elbow", "wrist"):
+                column = ONE_RM_COLUMNS[joint].format(side=side_name)
+                try:
+                    m_db = _load_mmax(mmax_df, subject_id, column)
+                except Exception as e:
+                    print(f"[WARN] {stem} {side_name} {joint} mmax missing: {e}")
+                    theoretical[joint] = np.nan
+                    continue
+                theoretical[joint] = theoretical_1rm_work(joint, args.body_mass, forearm_len_med, m_db)
+            theor_elbow, theor_wrist = theoretical["elbow"], theoretical["wrist"]
 
             elbow_cycles["part"] = f"elbow_{side_name}"
             elbow_cycles["subject_id"] = subject_id
