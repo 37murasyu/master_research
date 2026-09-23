@@ -161,7 +161,7 @@ GRAVITY_AMBIG_DELTA = float(os.getenv('GRAVITY_AMBIG_DELTA', '0.08'))  # 近接�
 GRAVITY_LEVEL_PLANE_WEBCAM_OK = env_flag('GRAVITY_LEVEL_PLANE_WEBCAM_OK', False)
 
 # ===================== 適応的LPF設定（リアルタイムf0追跡）=====================
-E_FC_ADAPTIVE_ON = int(os.getenv('E_FC_ADAPTIVE_ON', '0'))  # 0=固定fc, 1=適応fc
+E_FC_ADAPTIVE_ON = env_flag('E_FC_ADAPTIVE_ON', False)  # 0=固定fc, 1=適応fc
 E_FC_MIN = float(os.getenv('E_FC_MIN', '2.1'))  # fc下限 [Hz]
 E_FC_MAX = float(os.getenv('E_FC_MAX', '6.0'))  # fc上限 [Hz]
 E_FC_K = float(os.getenv('E_FC_K', '6.0'))  # f0→fc倍数（オフライン統計値）
@@ -562,8 +562,8 @@ def compute_cycle_energy_filtered(theta: np.ndarray, tau: np.ndarray, dt_sec: fl
 
 # ========= MediaPipe Pose Landmarker (Lite) 切替対応 =========
 # USE_POSE_LANDMARKER=1 かつ モデルファイルが存在すれば Tasks API を使用。なければ従来の Solutions Pose を使用。
-USE_POSE_LANDMARKER = str(os.getenv('USE_POSE_LANDMARKER', '1')).lower() in ('1', 'true', 'yes')
-USE_NATIVE_POSE = str(os.getenv('USE_NATIVE_POSE', '0')).lower() in ('1', 'true', 'yes')
+USE_POSE_LANDMARKER = env_flag('USE_POSE_LANDMARKER', True)
+USE_NATIVE_POSE = env_flag('USE_NATIVE_POSE', False)
 DEFAULT_TASK_MODEL = os.path.join(os.path.dirname(__file__), 'pose_landmarker_lite.task')
 POSE_TASK_MODEL = os.getenv('POSE_TASK_MODEL', DEFAULT_TASK_MODEL)
 # 置かれた .task を自動検出（環境変数未指定 or 既定パスが存在しない場合）
@@ -1264,7 +1264,7 @@ if (not env_flag('DISABLE_MPL', False)) and not HEADLESS:
         # 追加: 自動エネルギーしきい値（GAUGE_THRESH_AUTO=1 で有効）
         try:
             # 既定を ON にする（未指定なら自動適用）
-            if str(os.getenv('GAUGE_THRESH_AUTO', '1')).strip() in ('1', 'true', 'True'):
+            if env_flag('GAUGE_THRESH_AUTO', True):
                 body_mass = float(os.getenv('BODY_MASS_KG', '65'))
                 # r_x（有効半径[m]）の既定。必要に応じて環境変数や外部ファイル化を検討
                 R_X_MAP = {
@@ -1315,7 +1315,7 @@ esc_count = 0
 
 # ESCを即時終了キーとして扱うかのフラグ（デフォルト: 有効）。
 # もし誤検出で勝手に終了するなら IMMEDIATE_ESC_BREAK=0 を環境変数で設定してください。
-IMMEDIATE_ESC_BREAK = os.getenv('IMMEDIATE_ESC_BREAK', '1') == '1'
+IMMEDIATE_ESC_BREAK = env_flag('IMMEDIATE_ESC_BREAK', True)
 # ── 2) 監修モード／非監修モードごとの準備 ──────────────────
 # %%
 
@@ -2285,9 +2285,9 @@ def _hx711_csv_quick_diag_from_bytes(csv_bytes: bytes, max_rows: int = 20000) ->
     else:
         print('[HX711][DIAG] raw2に非ゼロ値があります（ハード/ファームは動作）。校正や符号の見直し推奨。')
 # --- Optional perf logging (disabled by default) ---
-PERF_LOG = bool(int(os.getenv('PERF_LOG', '0')))
+PERF_LOG = env_flag('PERF_LOG', False)
 PERF_INT = int(os.getenv('PERF_INT', '60')) if os.getenv('PERF_INT') else 15
-LOOP_FILE_PLAYBACK = bool(int(os.getenv('LOOP_FILE_PLAYBACK', '0')))
+LOOP_FILE_PLAYBACK = env_flag('LOOP_FILE_PLAYBACK', False)
 # ステージ切り分け用: このステージ名の直後でループを早期終了（計測用）
 # 例: STOP_AFTER=mediapipe / kps2d / triang / calc / run_specs / torques / local_torque / imshow / gauge / retrieve / write / crop / preproc / postproc
 STOP_AFTER = os.getenv('STOP_AFTER', '').strip()
@@ -2342,7 +2342,7 @@ class _LoopPerf:
         self.frame: dict[str, float] = {}
         self.n = 0
         # 詳細トレース設定（環境変数で制御）
-        self.trace = bool(int(os.getenv('PERF_TRACE', '0')))
+        self.trace = env_flag('PERF_TRACE', False)
         self.trace_every = int(os.getenv('PERF_TRACE_EVERY', '5')) if os.getenv('PERF_TRACE_EVERY') else 5
         self.topk = int(os.getenv('PERF_TOPK', '7')) if os.getenv('PERF_TOPK') else 7
         # 情報用（非加算）カウンタ。区間同士が重なるため TOTAL と Top-K からは外す

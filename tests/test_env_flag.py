@@ -75,3 +75,26 @@ class TestMainScriptUsesEnvFlag:
                 if values in (["1", "true", "True"], ["0", "false", "False"]):
                     leftovers.append(node.lineno)
         assert not leftovers, f"os.getenv の真偽値の慣用句が残っている（行 {leftovers}）"
+
+
+@pytest.mark.parametrize("name,default", [
+    ("USE_POSE_LANDMARKER", True), ("USE_NATIVE_POSE", False),
+    ("GAUGE_THRESH_AUTO", True), ("IMMEDIATE_ESC_BREAK", True),
+    ("PERF_LOG", False), ("LOOP_FILE_PLAYBACK", False), ("PERF_TRACE", False),
+    ("E_FC_ADAPTIVE_ON", False),
+])
+def test_remaining_flags_use_shared_parser_and_bool_schema(name, default):
+    """残った真偽値設定も TRUE/on を受け付け、GUI に真偽値として出すため。"""
+    from tools.extract_env_schema import extract
+
+    path = REPO_ROOT / "master_research_code.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id == "env_flag" and len(node.args) == 2
+             and isinstance(node.args[0], ast.Constant) and node.args[0].value == name]
+    assert len(calls) == 1
+    assert ast.literal_eval(calls[0].args[1]) is default
+    setting = extract(path)[name]
+    assert setting["type"] == "bool"
+    assert setting["default"] == str(int(default))
