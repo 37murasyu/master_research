@@ -242,3 +242,89 @@ class TestGaugeWindowWiring:
         assert page._gauge_window.isVisible()
         assert state.phase is gm.Phase.WAITING
         assert state.frame is None
+
+
+# ---------------------------------------------------------------------------
+# 見出しの状態（点と文字の組。色だけにしない）
+# ---------------------------------------------------------------------------
+
+
+class TestHeaderStatus:
+    def test_header_shows_amber_dot_and_rep_while_running(self, page, monkeypatch):
+        from app.shell import theme
+
+        assert page._run_status.text() == "停止中"
+
+        _start_hybrid(monkeypatch, page)
+        page._runner.gauge_frame.emit(_frame(rep=6))
+        text = page._run_status.text()
+        assert "●" in text and theme.AMBER in text, "琥珀の点が無い"
+        assert "計測中 7 回目" in text, "回数は「完了した回数＋1」"
+
+    def test_header_shows_no_rep_for_usb(self, page, monkeypatch):
+        _choose_input(page, USB)
+        _fake_start(monkeypatch, page)
+        page._main_button.click()
+        text = page._run_status.text()
+        assert "計測中" in text
+        assert "回目" not in text
+
+    def test_header_shows_link_only_for_hybrid(self, page, monkeypatch):
+        _choose_input(page, USB)
+        _fake_start(monkeypatch, page)
+        page._main_button.click()
+        assert page._link_status.isHidden(), "USB の計測で Pixel の接続を出している"
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(0)
+
+        _start_hybrid(monkeypatch, page)
+        assert not page._link_status.isHidden()
+        assert page._link_status.text() == "○ Pixel 接続待ち"
+        assert "回目" not in page._run_status.text(), "つながる前に回数を出している"
+
+        page._runner.gauge_frame.emit(_frame(rep=0, link="connected"))
+        assert "●" in page._link_status.text() and "Pixel 接続" in page._link_status.text()
+        assert "接続待ち" not in page._link_status.text()
+        assert "計測中 1 回目" in page._run_status.text()
+
+        page._runner.gauge_frame.emit(_frame(rep=1, link="waiting"))
+        assert page._link_status.text() == "○ Pixel 接続待ち", "切れたら接続待ちに戻す"
+
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(0)
+        assert page._link_status.isHidden(), "終わった後も接続を出している"
+
+    def test_header_after_finish_shows_result(self, page, monkeypatch):
+        _start_hybrid(monkeypatch, page)
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(0)
+        assert page._run_status.text() == "✓ 正常終了"
+
+        page._main_button.click()
+        assert "計測中" in page._run_status.text()
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(1)
+        text = page._run_status.text()
+        assert "✕" in text and "異常終了" in text
+
+    def test_header_shows_stopped_after_failed_start(self, page, monkeypatch):
+        _choose_input(page, HYBRID)
+        _fake_start(monkeypatch, page, ok=False)
+        page._main_button.click()
+        assert page._run_status.text() == "停止中"
+        assert page._link_status.isHidden()
+
+    def test_status_badge_is_hidden_on_measure_page(self, page):
+        assert page._badge.isHidden()
+        for state in ("starting", "running", "stopped"):
+            page._runner.state_changed.emit(state)
+            assert page._badge.isHidden(), state
+
+    def test_other_pages_keep_their_badge(self, qt_app):
+        from app.shell.page_calibrate import CalibratePage
+
+        page = CalibratePage(Settings())
+        try:
+            assert not page._badge.isHidden()
+        finally:
+            page.shutdown()
