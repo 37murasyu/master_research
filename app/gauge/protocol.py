@@ -129,6 +129,15 @@ def encode(frame: GaugeFrame) -> str:
     return f"{PREFIX}{body}\n"
 
 
+def finite_or_none(value: Any) -> float | None:
+    """有限の数なら float に、それ以外（None・NaN・無限・数でないもの）なら None にする。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def _is_number(value: Any) -> bool:
     """「数か null」の「数」。bool と非有限（NaN・±inf）は数として扱わない。
 

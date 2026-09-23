@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from app.gauge.protocol import PART_NAMES
+from app.gauge.protocol import PART_NAMES, finite_or_none
 from compute_cycle_energy_elbow_wrist import ONE_RM_COLUMNS, theoretical_1rm_work
 
 # 部位の並びはゲージの行（protocol）と同じものを使う。``app/runners/hybrid_measure.py``
@@ -94,14 +94,6 @@ class PartBand:
     reason: str = ""
 
 
-def _finite(value) -> float | None:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) else None
-
-
 def part_bands(
     body_mass_kg: float,
     forearm_m: Mapping[str, float | None],
@@ -111,12 +103,12 @@ def part_bands(
 
     前腕長が ``FOREARM_RANGE_M`` の外・1RM が無い・体重が正でないときは ``band=None`` と理由を返す。
     """
-    mass = _finite(body_mass_kg)
+    mass = finite_or_none(body_mass_kg)
     bands: dict[str, PartBand] = {}
     for part in PARTS:
         joint, side = part.split("_")
-        length = _finite(forearm_m.get(side))
-        m_db = _finite(one_rm.get(part))
+        length = finite_or_none(forearm_m.get(side))
+        m_db = finite_or_none(one_rm.get(part))
         reason = ""
         if mass is None or mass <= 0.0:
             reason = f"体重 {body_mass_kg!r} kg が正でない"
@@ -139,7 +131,7 @@ def classify(value: float | None, band: tuple[float, float] | None) -> str | Non
     """値の状態。lo ちょうどは目標帯、hi ちょうどは過負荷。帯か値が無ければ None。"""
     if band is None:
         return None
-    v = _finite(value)
+    v = finite_or_none(value)
     if v is None:
         return None
     lo, hi = band

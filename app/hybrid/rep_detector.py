@@ -22,9 +22,10 @@ now がちらつく）。傾きなら開かない代わりに約 1 フレーム�
 from __future__ import annotations
 
 import enum
-import math
 from collections import deque
 from dataclasses import dataclass
+
+from app.gauge.protocol import finite_or_none
 
 __all__ = ["RepConfig", "RepDetector", "RepEvent"]
 
@@ -53,21 +54,11 @@ class RepConfig:
     lookback_frames: int = 5
 
 
-def _finite(value) -> float | None:
-    if value is None:
-        return None
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) else None
-
-
 class RepDetector:
     """押し上げの回を開閉する状態機械。``update`` を 1 フレームごとに呼ぶ。"""
 
     def __init__(self, baseline_m: float, config: RepConfig | None = None):
-        base = _finite(baseline_m)
+        base = finite_or_none(baseline_m)
         if base is None:
             raise ValueError(f"基準の高さが有限でない: {baseline_m!r}")
         self.baseline_m = base
@@ -102,14 +93,14 @@ class RepDetector:
 
     def update(self, height_m: float, speed_mps: float | None, dt: float) -> RepEvent:
         """1 フレーム進める。``speed_mps`` は上向きの速さ（None なら高さから自前で出す）、``dt`` は前のフレームからの秒。"""
-        height = _finite(height_m)
+        height = finite_or_none(height_m)
         if height is None:
             # 開閉の状態は変えない。自前の速さの窓は、抜けをまたいで傾きを取らないように区切る
             self._recent.clear()
             return RepEvent.NONE
-        step = _finite(dt)
+        step = finite_or_none(dt)
         step = step if step is not None and step > 0.0 else 0.0
-        speed = self._own_speed(height, step) if speed_mps is None else _finite(speed_mps)
+        speed = self._own_speed(height, step) if speed_mps is None else finite_or_none(speed_mps)
         cfg = self.config
         rise = height - self.baseline_m
 

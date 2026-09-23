@@ -11,25 +11,16 @@
 
 from __future__ import annotations
 
-import math
 import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping
 
 from app.gauge import protocol
-from app.gauge.protocol import GaugeFrame, PartReading
+from app.gauge.protocol import GaugeFrame, PartReading, finite_or_none
 
 if TYPE_CHECKING:  # 実行時は読まない（thresholds は重い import を持つ）
     from app.gauge.thresholds import PartBand
-
-
-def _finite(value) -> float | None:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) else None
 
 
 class GaugeTracker:
@@ -60,7 +51,7 @@ class GaugeTracker:
         """今の回の値を置く（計測は ``rep_work`` の W+、デモは置く値）。対象外の部位・非有限の値は無視する。"""
         with self._lock:
             for part, value in values.items():
-                v = _finite(value)
+                v = finite_or_none(value)
                 if part in self._now and v is not None:
                     self._now[part] = v
 
