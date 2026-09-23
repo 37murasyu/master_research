@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.provider.Settings
 import android.os.Looper
 import android.view.WindowManager
 import android.widget.Toast
@@ -24,6 +25,11 @@ import com.murayama.wheelchairsensor.databinding.ActivityMainBinding
 import com.murayama.wheelchairsensor.net.ConnectionTarget
 import com.murayama.wheelchairsensor.net.SensorClient
 import com.murayama.wheelchairsensor.net.TimeSync
+import com.murayama.wheelchairsensor.net.Protocol
+import com.murayama.wheelchairsensor.net.DeviceIdentity
+import com.murayama.wheelchairsensor.capture.CaptureRequests
+import com.murayama.wheelchairsensor.capture.JpegResponder
+import java.util.concurrent.atomic.AtomicLong
 import com.murayama.wheelchairsensor.pose.PoseAnalyzer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -36,7 +42,7 @@ import java.util.concurrent.Executors
  *   2. WebSocket で繋ぎ、往復測定で PC の時計に合わせる
  *   3. カメラを開いて MediaPipe を回し、ランドマークを時刻付きで送り続ける
  *
- * 映像は送らない。33 点で 1 フレーム約 600 バイト、30fps でも 18 KB/s。
+ * ランドマークを連続送信し、PC の要求時だけ解析フレームの JPEG も返す。
  */
 class MainActivity : AppCompatActivity(), SensorClient.Listener {
 
@@ -44,6 +50,14 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
     private lateinit var analysisExecutor: ExecutorService
     private lateinit var cameraSetup: CameraSetup
 
+    private val captureRequests = CaptureRequests()
+    private val jpegExecutor = Executors.newSingleThreadExecutor()
+    private val imagesSent = AtomicLong(0)
+    private val jpegResponder by lazy {
+        JpegResponder(jpegExecutor, send = { req, nanos, w, h, jpeg ->
+            if (client.sendCalibrationFrame(req.id, nanos, w, h, jpeg)) imagesSent.incrementAndGet()
+        })
+    }
     private val timeSync = TimeSync()
     private val client by lazy { SensorClient(timeSync, this) }
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -92,6 +106,8 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         barcodeScanner?.close()
         cameraSetup.stop()
         analysisExecutor.shutdown()
+        captureRequests.clear()
+        jpegExecutor.shutdown()
     }
 
     // -- QR 読み取り --------------------------------------------------------
@@ -150,14 +166,19 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
     private fun connect(target: ConnectionTarget) {
         binding.statusText.text = getString(R.string.status_connecting)
         binding.detailText.text = "${target.role} として ${target.host}:${target.port} へ接続します"
-        client.connect(target, deviceName())
+        client.connect(target, deviceName(), deviceId())
     }
 
     private fun startStreaming() {
         mode = Mode.STREAMING
         poseAnalyzer?.close()
 
-        val analyzer = PoseAnalyzer(this) { detection ->
+        captureRequests.clear()
+        imagesSent.set(0)
+        val analyzer = PoseAnalyzer(this, captureSink = { bitmap, nanos ->
+            val due = captureRequests.takeDue(nanos, timeSync.offsetNanos)
+            if (due.isNotEmpty()) jpegResponder.offer(bitmap, nanos, due)
+        }) { detection ->
             client.sendLandmarks(
                 captureDeviceNanos = detection.captureDeviceNanos,
                 width = detection.width,
@@ -207,6 +228,20 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    /**
+     * 端末 ID（ANDROID_ID のハッシュ）。取れなければ null で、名乗りに ID を付けない。
+     *
+     * 例外にすると接続の瞬間にアプリが落ちる。ID が無くてもライブ表示は使え、
+     * 校正と計測は PC 側が「端末 ID を取得できません」と案内して止める。
+     */
+    private fun deviceId(): String? =
+        Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+            ?.let(DeviceIdentity::hash)
+
+    override fun onCaptureRequested(request: Protocol.CaptureRequest) {
+        captureRequests.add(request, timeSync.deviceNanos())
+    }
+
     private fun deviceName(): String = "${Build.MANUFACTURER} ${Build.MODEL}"
 
     // -- SensorClient.Listener ---------------------------------------------
@@ -243,7 +278,7 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         // 毎フレーム更新すると UI スレッドを圧迫する。間引く。
         if (sent % PROGRESS_EVERY != 0L) return
         runOnUiThread {
-            binding.detailText.text = "送信 $sent フレーム / 破棄 $dropped  " +
+            binding.detailText.text = "送信 $sent フレーム / 画像 ${imagesSent.get()} 枚 / 破棄 $dropped  " +
                 String.format("往復 %.2f ms", timeSync.roundTripNanos / 1_000_000.0)
         }
     }
