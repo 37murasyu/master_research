@@ -199,3 +199,28 @@ class TestCycleEnergy:
         # fc は既定の 1.2 Hz から EMA（β=0.15、1 秒ごと）で推定値 k·f0 の側へ動いていく。短い合成では途中の値
         assert (table.fc_current > 1.2).all() and (table.fc_current <= 6.0).all()
         assert np.isfinite(table.e_pos).all()
+
+
+class TestGaugeEnergy:
+    """ゲージに出した値を毎フレーム残す（USB の ``gauge_energy_*`` に当たる。§6-2 の確認と、朝の再生の検証用）。"""
+
+    def test_the_gauge_values_per_frame(self, tmp_path):
+        session, tracker = _session(tmp_path)
+        table = pd.read_csv(_file(session, "gauge_energy"))
+        assert list(table.columns) == ["frame", "t_ns", "rep", "dyn_active", "elbow_L", "elbow_R", "wrist_L", "wrist_R"]
+        frames = pd.read_csv(_file(session, "frames"))
+        assert len(table) == len(frames)
+        closing = frames.index[frames.cycle_detected == 1][0]
+        assert table.elbow_R.iloc[closing - 1] == pytest.approx(tracker.snapshot().parts["elbow_R"].prev)
+        assert table.elbow_R.iloc[closing] == 0.0, "確定したフレームで 0 に戻る"
+        assert (table.loc[table.dyn_active == 0, "elbow_R"].iloc[:30] == 0.0).all()
+
+    def test_the_sidecar_explains_the_bands(self, tmp_path):
+        session, _ = _session(tmp_path)
+        meta = json.loads(_file(session, "gauge_energy").with_suffix(".json").read_text(encoding="utf-8"))
+        assert meta["unit"] == "J"
+        assert "Σmax(P, 0)·dt" in meta["definition"]
+        assert meta["gauge_bands_j"]["elbow_R"] == pytest.approx(list(session.measurement.bands["elbow_R"].band))
+        assert meta["one_rm_kg"] == ONE_RM and meta["body_mass_kg"] == 65.0
+        assert meta["forearm_len_m"]["L"] == pytest.approx(0.25, abs=0.01)
+        assert meta["reps"] == 1

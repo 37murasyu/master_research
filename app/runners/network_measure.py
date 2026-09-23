@@ -132,6 +132,8 @@ PART_LINKS: dict[str, tuple[int, int]] = {
 
 # 部位キーは config.py が持っている（順序も一致）。
 PART_KEYS = tuple(_PART_KEYS)
+# ゲージに出す部位（肩は出さない。app.gauge.protocol.PART_NAMES と同じ）
+GAUGE_PARTS = ("elbow_L", "elbow_R", "wrist_L", "wrist_R")
 
 
 @dataclass
@@ -213,6 +215,8 @@ class FrameResult:
     # 回を確定したフレームだけ: 部位ごとの W+・W−（app.hybrid.rep_work.PartWork）と W_1RM [J]（帯が無い部位は None）
     cycle_parts: dict[str, PartWork] = field(default_factory=dict)
     cycle_w1rm: dict[str, float | None] = field(default_factory=dict)
+    # このフレームの後のゲージの値（今の回の W+ [J]、部位 → 値）。tracker があればその値（デモなら置いた値）
+    gauge_now: dict[str, float] = field(default_factory=dict)
     # 回を確定したフレームだけ: 肘の濾波 E±（部位 → {"e_pos","e_neg","fc","n_u"}）
     cycle_energy: dict[str, dict] = field(default_factory=dict)
 
@@ -384,6 +388,7 @@ class NetworkMeasurement:
                     WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y), result.arm_ok)
             self._gate(points, velocity, dt, sample, result)
 
+        result.gauge_now = self._gauge_now()
         self.frame_index += 1
         self._append_result(result)
         self._trim_storage()
@@ -747,6 +752,13 @@ class NetworkMeasurement:
             energy[f"elbow_{side}"] = {"e_pos": e_pos, "e_neg": e_neg, "fc": info.get("fc"),
                                        "n_u": int(info.get("n_u", 0))}
         return energy
+
+    def _gauge_now(self) -> dict[str, float]:
+        """ゲージの今の値。tracker があればその値（デモなら置いた値）、無ければ今の回の W+。"""
+        if self.tracker is not None:
+            return self.tracker.values()
+        work = self.rep_work.work()
+        return {part: work[part].pos for part in GAUGE_PARTS}
 
     def _feed_tracker(self, sample: WorkSample) -> None:
         if self.tracker is None:

@@ -102,6 +102,10 @@ class Recorder:
         self.torques = writer("local_torque", ["frame", "t_ns", "joint", "x", "y", "z"])
         # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）
         self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score"])
+        # ゲージに出した値（今の回の W+ [J]）。毎フレーム 1 行。帯と定義は閉じるときに .json へ
+        self._gauge_parts = ("elbow_L", "elbow_R", "wrist_L", "wrist_R")
+        self._gauge_path = self.directory / f"gauge_energy_{stamp}.csv"
+        self.gauge = writer("gauge_energy", ["frame", "t_ns", "rep", "dyn_active", *self._gauge_parts])
         # 肘の濾波 E±（USB の cycle_energy_debug_* と同じ量。回の確定ごとに肘の左右で 1 行ずつ）
         self.energy = writer("cycle_energy", ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u"])
         # EKF の手前の生 3D（EKF の較正 tune_ekf の入力）。1/30 s の格子で、抜けた格子は NaN の行で埋める
@@ -187,6 +191,10 @@ class Recorder:
             [self.frames, result.t_ns, key, value, *_cycle_columns(result, key)]
             for key, value in result.cycle_work_j.items()
         )
+        gauge = getattr(result, "gauge_now", None) or {}
+        self.gauge.writerow([self.frames, result.t_ns, getattr(result, "rep", ""),
+                             int(bool(getattr(result, "dyn_active", False))),
+                             *(gauge.get(part, "") for part in self._gauge_parts)])
         self.energy.writerows(
             [self.frames, result.t_ns, part, e["e_pos"], e["e_neg"], e["fc"], 1.0 / 30.0, e["n_u"]]
             for part, e in (getattr(result, "cycle_energy", None) or {}).items()
@@ -217,4 +225,14 @@ class Recorder:
         )
         self.meta.update(metadata)
         write_json(self.directory / "meta.json", self.meta)
+        write_json(self._gauge_path.with_suffix(".json"), {
+            "unit": "J",
+            "definition": ("今の回の正の仕事 W+ = Σmax(P, 0)·dt（論文 4.5.2 節）。P = τ_y × ω_rel·y。力学の関所が開いている間"
+                           "だけ積み（dyn_active）、回の確定で 0 に戻る。帯は W_0.70・W_0.85 = theoretical_1rm_work("
+                           "部位, 体重, 実測の前腕長, c·1RM)。v < W_0.70 不足、W_0.70 ≤ v < W_0.85 目標帯、v ≥ W_0.85 過負荷"),
+            "dt": "フレームごとの dt（frames の dt_s）。0.1 s を超えるフレームは積まない",
+            **{key: self.meta.get(key) for key in ("subject_id", "one_rm_kg", "body_mass_kg", "forearm_len_m",
+                                                   "w1rm_j", "gauge_bands_j", "gauge_band_reasons", "reps",
+                                                   "discarded_reps", "dyn_gate", "arm_length_guard")},
+        })
         self.closed = True
