@@ -4,7 +4,9 @@ from datetime import datetime
 
 # ファイルパス関連
 absolutepath = os.path.abspath(__file__)
-folder_path = os.path.dirname(absolutepath)
+# 凍結アプリではこのファイルの隣はバンドル内（読み取り専用）なので、ワーカーが用意した
+# ワークスペースを基点にする（app/core/workspace.py）。開発時は未設定でリポジトリルート。
+folder_path = os.environ.get("APP_WORKSPACE") or os.path.dirname(absolutepath)
 
 # 体重（仮）
 w = 60  # 体重60kg

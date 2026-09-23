@@ -21,9 +21,11 @@ import os
 import runpy
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from app.core import resources
-from app.core.settings import Settings
+from app.core import resources, workspace
+from app.core.platform_compat import user_output_dir
+from app.core.settings import APP_NAME, Settings
 from app.core.stop_request import STOP_FILE_ENV
 
 __all__ = [
@@ -33,6 +35,7 @@ __all__ = [
     "worker_command",
     "worker_environment",
     "run_worker",
+    "workspace_dir",
     "ROLES",
     "WORKER_MODULES",
     "SCRIPT_ROLE",
@@ -155,6 +158,25 @@ def worker_environment(
     return env
 
 
+def workspace_dir() -> Path:
+    """凍結時のワークスペース。GUI が「出力先」として表示する場所と同じにする。"""
+    return user_output_dir(APP_NAME)
+
+
+def _enter_workspace() -> None:
+    """凍結時だけ、ワークスペースへ移って ``config.folder_path`` もそこへ向ける。
+
+    開発時は何もしない。研究者はリポジトリルートから起動しており、そこが既に
+    コードとデータの両方の置き場になっている（``app.core.workspace`` を参照）。
+    """
+    if not resources.is_frozen():
+        return
+    seed = resources.resource_root() / workspace.SEED_DIRNAME
+    root = workspace.prepare_workspace(workspace_dir(), seed)
+    os.chdir(root)
+    os.environ[workspace.WORKSPACE_ENV] = str(root)
+
+
 def run_worker(
     role: str, passthrough: list[str] | None = None, module: str | None = None
 ) -> int:
@@ -166,6 +188,7 @@ def run_worker(
     モジュール名で解決する必要がある。
     """
     module = resolve_module(role, module)
+    _enter_workspace()
 
     argv_backup = sys.argv[:]
     sys.argv = [module, *(passthrough or [])]
