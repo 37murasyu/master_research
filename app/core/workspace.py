@@ -34,6 +34,8 @@ SEED_DIRNAME = "seed"
 SEED_FILES: tuple[str, ...] = (
     # config.folder_path から読む係数表
     "rm_method.csv",
+    # 被験者ごとの 1RM。混成のゲージの閾値（app.gauge.thresholds、ONE_RM_CSV が空のとき）が読む
+    "m_max_all_merged.csv",
     "Moment of inertia estimation coefficient boys.csv",
     # master_research_code.py が folder_path から読む（空でも存在が要る）
     "max_value.txt",

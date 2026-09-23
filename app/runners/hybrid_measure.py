@@ -1,11 +1,22 @@
-"""Calibrated Mac + Pixel measurement CLI."""
+"""Calibrated Mac + Pixel measurement CLI.
+
+ゲージ（GUI の Qt 窓）は子の標準出力の ``@@GAUGE {json}`` の行（``app.gauge.protocol``）だけを見て動く。
+メインループの 1 周（``live.step()``、Mac のカメラの約 30 Hz）ごとに 1 行を ``sys.stdout.write`` の 1 回で出す
+（``GaugeTicker``。間引かない）。値は受信スレッド（``MeasurementSession.on_pairs``）が ``GaugeTracker`` に積む。
+重い import とファイルの読み込み（1RM の表・EKF のプロファイル）は、受信が始まる前にメインスレッドで済ませる。
+"""
 
 import argparse
 from contextlib import ExitStack
+import csv
 import os
+from pathlib import Path
 import sys
 import cv2 as cv
+import config
 from app.core.stop_request import StopRequest
+from app.gauge.thresholds import PARTS, load_one_rm, subject_index
+from app.gauge.tracker import GaugeTicker, GaugeTracker
 from app.hybrid.calibration_io import load_calibration
 from app.hybrid.session import stable_session
 from app.hybrid.link import PhoneLink, CaptureMode
@@ -14,7 +25,59 @@ from app.hybrid.mac_camera import MacCamera, default_camera_index
 from app.hybrid.measurement import MeasurementSession
 from app.hybrid.pose_detector import PoseDetector
 from app.runners.hybrid_preview import poll_window
+from app.hybrid.demo_gauge import DemoConfig
+from app.hybrid.ekf import EkfSettings
+from energy_pipeline import EnergyFilterConfig
+from app.hybrid.gravity import candidate_axes
 from app.runners.network_measure import MeasurementConfig
+
+# 真偽の設定は USB と同じ読み方（大文字小文字と前後の空白は問わない）
+_flag = config.env_flag
+
+
+def one_rm_from_env() -> tuple[str | None, dict | None, str | None]:
+    """被験者番号・1RM [kg]・1RM が無い理由。表は ``ONE_RM_CSV``、空なら作業フォルダの ``m_max_all_merged.csv``。
+
+    無ければ帯を出さない（ゲージは値だけ動く）。計測は止めない。
+    """
+    raw = (os.environ.get("SUBJECT_ID") or "").strip() or None
+    subject = subject_index(raw)
+    if subject is None:
+        return raw, None, f"SUBJECT_ID={raw!r} が被験者番号（数字）でない"
+    path = Path((os.environ.get("ONE_RM_CSV") or "").strip() or Path(config.folder_path) / "m_max_all_merged.csv")
+    try:
+        one_rm = load_one_rm(path, subject)
+    except (OSError, ValueError, csv.Error) as exc:
+        # 無い・読めない（OSError）だけでなく、文字コード違い（UnicodeDecodeError）や壊れた CSV でも計測は止めない
+        return raw, None, f"1RM の表を読めない（{path}: {exc}）"
+    missing = [part for part in PARTS if one_rm.get(part) is None]
+    reason = f"1RM の表 {path} に被験者 {subject} の {', '.join(missing)} が無い" if missing else None
+    return raw, one_rm, reason
+
+
+def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementConfig:
+    """環境変数（GUI が子へ全件渡す）から混成の計測の設定を作る。"""
+    subject, one_rm, reason = one_rm_from_env()
+    if reason:
+        print(f"[ゲージ] {reason}。その部位は帯（W_0.70〜W_0.85）を出さない", file=sys.stderr)
+    level_plane = _flag("GRAVITY_LEVEL_PLANE_ON", False)
+    try:
+        ambiguity = float(os.environ.get("GRAVITY_AMBIG_DELTA") or 0.08)
+    except ValueError:
+        ambiguity = 0.08
+    return MeasurementConfig(
+        body_mass_kg=body_mass_kg,
+        gravity_mode=gravity_mode,
+        gravity_candidates=tuple(candidate_axes(level_plane, os.environ.get("GRAVITY_LEVEL_PLANE", "YZ"))),
+        gravity_ambiguity=ambiguity,
+        one_rm=one_rm,
+        subject_id=subject,
+        dyn_gate=_flag("HYBRID_DYN_GATE", True),
+        ekf=EkfSettings.from_env(),
+        energy_filter=EnergyFilterConfig.from_env(),
+        demo=DemoConfig.from_env() if _flag("DEMO_MONO_GAUGE_ON", False) else None,
+        offline_wrist_capture=_flag("OFFLINE_WRIST_CAPTURE", False),
+    )
 
 
 def _default_body_mass(fallback: float = 60.0) -> float:
@@ -30,6 +93,14 @@ def _default_body_mass(fallback: float = 60.0) -> float:
 
 
 def main(argv=None):
+    from app.hybrid.replay import REPLAY_ENV
+
+    if os.environ.get(REPLAY_ENV):
+        # 記録の再生（GUI からは HYBRID_REPLAY を付けて起動する）。GUI は引数を渡さないので、計測フォルダなどは
+        # 環境変数 HYBRID_REPLAY* から読む。Mac のカメラも Pixel も開かない
+        from app.runners.hybrid_replay import main as replay_main
+
+        return replay_main([])
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Mac + Pixel 計測")
@@ -62,15 +133,19 @@ def main(argv=None):
             stack.callback(camera.close)
             detector = PoseDetector()
             stack.callback(detector.close)
+            # 名前を config にすると、main の中ではモジュールの config が隠れる（Python は関数全体で局所とみなす）
+            measure_config = measurement_config(args.body_mass, args.gravity_mode)
+            tracker = GaugeTracker(source="demo" if measure_config.demo is not None else "measure")
+            ticker = GaugeTicker(tracker)
             measurement = MeasurementSession(
                 calibration,
-                config=MeasurementConfig(
-                    body_mass_kg=args.body_mass, gravity_mode=args.gravity_mode
-                ),
+                config=measure_config,
                 metadata={
                     "cam0_offset_ms": args.cam0_offset_ms,
                     "preview_hz": args.preview_hz,
+                    "mac_camera": getattr(camera, "controls", None),
                 },
+                tracker=tracker,
             )
             link = PhoneLink(
                 port=args.port,
@@ -94,6 +169,7 @@ def main(argv=None):
             try:
                 while not stop.requested() and not measurement.failed.is_set():
                     live.step()
+                    ticker.tick()
                     if poll_window() in (27, ord("q")):
                         measurement.stop_reason = "key"
                         break
@@ -108,6 +184,7 @@ def main(argv=None):
             # （GUI の停止ボタンは停止ファイル、端末からは SIGTERM。どちらも stop.requested()）
             if measurement.stop_reason is None:
                 measurement.stop_reason = "stop_request" if stop.requested() else "failed"
+        ticker.tick(force=True)
         if measurement.directory is None:
             print("Pixel から点が届かなかったため、記録はありません")
         else:

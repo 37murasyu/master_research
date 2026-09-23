@@ -159,7 +159,7 @@ def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[s
 
     棄却率は、生の系列を素の KF（``innovation_loglik``）に通した正規化イノベーションが門（gate_std）の
     外に出た割合。実行時の EKF はロバスト更新で状態が変わるので近似である。門が 0 以下なら実行時は門を
-    使わないので、棄却率は出さない。
+    使わないので、棄却率は出さない。USB の生 CSV と kpts3d は 1 行ずつ対応するので、行の番号で合わせる。
     """
     kpts = pd.read_csv(kpts_path)
     n = min(capture.points.shape[0], len(kpts))
@@ -169,12 +169,21 @@ def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[s
     if lookup is None:
         path = (capture.provenance.get("ekf_noise") or {}).get("path")
         note = f"較正プロファイル {path} が見つからないので棄却率は出さない"
+    return _ekf_series(capture, capture.points[:n], kpts.iloc[:n].reset_index(drop=True), origin, lookup, note)
+
+
+def _ekf_series(capture, raw_rows: np.ndarray, kpts: pd.DataFrame, origin: str, lookup, note: str) -> dict[str, Any]:
+    """合わせ済みの行（``raw_rows`` と ``kpts`` の同じ番号が同じ時刻）で、系列ごとの RMS と棄却率を出す。
+
+    棄却率は生の系列の全体（抜けた格子の NaN を含む、dt 一定）で数える。
+    """
+    dt = float(capture.provenance["dt"])
     rows = []
     for i, lid in enumerate(capture.landmark_ids):
         for a, axis in enumerate(AXES):
             raw = capture.points[:, i, a]
             column = f"joint_{i}_{axis}"
-            diff = raw[:n] - (kpts[column].to_numpy(float)[:n] if column in kpts else np.nan)
+            diff = raw_rows[:, i, a] - (kpts[column].to_numpy(float) if column in kpts else np.nan)
             finite = np.isfinite(diff)
             rate, gate = None, None
             if lookup is not None:
@@ -213,8 +222,19 @@ HYBRID_FILES = ("kpts3d", "frames", "landmarks2d", "local_torque", "cycle_work")
 # カメラごとの速さの下限（30 fps の 8 割）。これを下回ると「30 fps を保てていない」（§6-2）
 MIN_CAMERA_FPS = 24.0
 ROLE_NAMES = {"cam0": "Mac", "cam1": "Pixel"}
-HYBRID_EKF_NOTE = ("混成の経路は EKF を使っていない（S9b の対象外）。S6 の雑音の推定は "
-                   "`python -m tools.verify_run hybrid-raw <計測フォルダ>` で生 CSV に直して ekf_estimate / tune_ekf にかける")
+HYBRID_EKF_NOTE = ("この記録は EKF の手前の生 3D（kpts3d_raw_<stamp>.csv）が無い古い版なので、EKF の前後の差と"
+                   "棄却率（S9b）は出さない。S6 の雑音の推定は `python -m tools.verify_run hybrid-raw <計測フォルダ>` で"
+                   "生 CSV に直して ekf_estimate / tune_ekf にかける")
+# 新しい版の記録（app.hybrid.recorder が EKF・1RM・ゲージの帯とともに書く）の目印・ファイル・列。
+# meta に output_schema_version があるときだけ、下の検査を足す（古い記録は合格のまま）
+HYBRID_SCHEMA_KEY = "output_schema_version"
+HYBRID_RAW_PREFIX = "kpts3d_raw"
+# 在りかだけ報告する（合否にしない）ファイル: <名前>_<stamp>*.csv
+HYBRID_EXTRA_FILES = ("cycle_energy", "gauge_energy", "aim_torque_vec")
+HYBRID_WORK_COLUMNS = ("work_pos_j", "work_neg_j", "w1rm_j", "score")
+HYBRID_SUBJECT_KEYS = ("subject_id", "body_mass_kg", "one_rm_kg", "forearm_len_m", "w1rm_j")
+# EKF の後の 3D の行のうち、生 CSV の同じ格子が見つかる割合の下限
+MIN_GRID_MATCH = 0.95
 
 
 def _is_hybrid(folder: Path) -> bool:
@@ -247,6 +267,14 @@ def _hybrid_files(folder: Path) -> tuple[str | None, dict[str, Path | None]]:
     return stamp, {name: (path if path is not None and path.is_file() else None) for name, path in files.items()}
 
 
+def _recorded_raw_path(folder: Path, stamp: str | None) -> Path | None:
+    """記録器が書いた EKF の手前の 3D（``kpts3d_raw_<stamp>.csv`` とサイドカー）。古い版の記録には無い（None）。"""
+    if not stamp:
+        return None
+    path = folder / f"{HYBRID_RAW_PREFIX}_{stamp}.csv"
+    return path if path.is_file() and sidecar_path(path).is_file() else None
+
+
 def _intervals(t_s) -> np.ndarray:
     steps = np.diff(np.asarray(t_s, dtype=float))
     return steps[np.isfinite(steps) & (steps > 0)]
@@ -274,14 +302,23 @@ def _camera_centres(folder: Path) -> list[np.ndarray]:
     return centres
 
 
-def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mapping[str, Any]) -> dict[str, Any] | None:
-    """骨の長さ、肘での 2 本の視線のなす角、肘・手首が各カメラの画面内にある割合。"""
+def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mapping[str, Any],
+                    stamp: str | None = None) -> dict[str, Any] | None:
+    """骨の長さ、肘での 2 本の視線のなす角、肘・手首が各カメラの画面内にある割合。
+
+    三角測量の質を見るので、EKF の手前の 3D（``kpts3d_raw_<stamp>.csv``）があればそれを使う。新しい版の記録の
+    ``kpts3d`` は EKF の後の点で、均されて骨の長さのばらつきが小さく出る（置き方の失敗を見逃す）。
+    """
     if files["kpts3d"] is None:
         return None
     ids = [int(i) for i in meta["pose_keypoints"]]
     slot = {lid: i for i, lid in enumerate(ids)}
-    table = pd.read_csv(files["kpts3d"])
-    points = table.drop(columns="frame").to_numpy(float).reshape(len(table), len(ids), 3)
+    raw_path = _recorded_raw_path(folder, stamp)
+    if raw_path is not None:
+        points = read_raw_capture(raw_path).points
+    else:
+        table = pd.read_csv(files["kpts3d"])
+        points = table.drop(columns="frame").to_numpy(float).reshape(len(table), len(ids), 3)
     segments = {}
     for name, (a, b, low, high) in SEGMENTS.items():
         length = np.linalg.norm(points[:, slot[a]] - points[:, slot[b]], axis=1)
@@ -339,6 +376,96 @@ def _quality_checks(quality: Mapping[str, Any], add) -> None:
         cut = [f"{ROLE_NAMES.get(role, role)} の{name} {share:.0%}" for role, shares in sorted(quality["inside"].items())
                for name, share in shares.items() if share < MIN_INSIDE_SHARE]
         add("配置: 肘・手首が両カメラの画面内にある割合 95% 以上", not cut, "、".join(cut))
+
+
+def _hybrid_ekf_stats(capture, kpts_path: Path, frames: pd.DataFrame, base_dir: Path | None = None) -> dict[str, Any]:
+    """混成の EKF の前後の差と棄却率。行の番号ではなく、時刻を格子に丸めて（round(t/dt)）合わせる。
+
+    生 3D は 1/30 s の格子で抜けた格子は NaN の行、EKF の後の kpts3d は届いた組だけの行なので、行で合わせると
+    抜けの後ろがすべてずれる。時刻はどちらも最初の組からの秒（生 CSV の ``t``、frames の ``t_s``）。
+    """
+    provenance = capture.provenance
+    dt = float(provenance["dt"])
+    enabled = bool(provenance.get("EKF_ENABLE", True))
+    kpts = pd.read_csv(kpts_path)
+    n = min(len(kpts), len(frames))
+    usable = np.isfinite(capture.points).any(axis=(1, 2))
+    index: dict[int, int] = {}
+    for row, key in enumerate(np.rint(np.asarray(capture.t, dtype=float) / dt)):
+        if usable[row] and np.isfinite(key):
+            index.setdefault(int(key), row)
+    keys = np.rint(frames["t_s"].to_numpy(float)[:n] / dt)
+    pairs = [(index[int(k)], j) for j, k in enumerate(keys) if np.isfinite(k) and int(k) in index]
+    note = ""
+    try:
+        origin, lookup = _noise_params(provenance, dt, base_dir)
+    except (KeyError, TypeError, ValueError):
+        origin, lookup = (provenance.get("ekf_noise") or {}).get("origin") or "unknown", None
+        note = "雑音のパラメータが記録に無いので棄却率は出さない"
+    if not enabled:
+        lookup, note = None, "EKF は無効（前後の差は 0 のはず）。棄却率は出さない"
+    elif lookup is None and not note:
+        note = f"較正プロファイル {(provenance.get('ekf_noise') or {}).get('path')} が見つからないので棄却率は出さない"
+    raw_rows = capture.points[[raw for raw, _ in pairs]] if pairs else np.empty((0, *capture.points.shape[1:]))
+    kpts_rows = kpts.iloc[[row for _, row in pairs]].reset_index(drop=True)
+    result = _ekf_series(capture, raw_rows, kpts_rows, origin, lookup, note)
+    result.update(ekf_enabled=enabled, matched_rows=len(pairs), kpts_rows=int(n), alignment="round(t/dt)",
+                  scale_ratio=provenance.get("ekf_scale_ratio"))
+    return result
+
+
+def _hybrid_gauge(work: pd.DataFrame, meta: Mapping[str, Any]) -> dict[str, Any]:
+    """部位ごとの回の W_pos・スコア・帯（W_0.70〜W_0.85）への到達回数（論文 4.5.2 節）。"""
+    bands = meta.get("gauge_bands_j") or {}
+    w1rm = meta.get("w1rm_j") or {}
+    stats = {}
+    for joint in sorted(set(JOINTS) | set(bands)):
+        rows = work.loc[work["joint"] == joint]
+        positive = pd.to_numeric(rows["work_pos_j"], errors="coerce").to_numpy(float)
+        scores = pd.to_numeric(rows["score"], errors="coerce").to_numpy(float)
+        band = bands.get(joint)
+        finite = positive[np.isfinite(positive)]
+        stats[joint] = {
+            "work_pos": [float(v) for v in positive],
+            "scores": [float(v) for v in scores],
+            "band": [float(b) for b in band] if band else None,
+            "w1rm": w1rm.get(joint),
+            "reached_low": int(np.sum(finite >= band[0])) if band else None,
+            "reached_high": int(np.sum(finite >= band[1])) if band else None,
+        }
+    return stats
+
+
+def _hybrid_extended(folder: Path, stamp: str | None, files: Mapping[str, Path | None], frames, meta, report, add) -> None:
+    """新しい版の記録（``output_schema_version`` がある）の検査と値。古い記録では何もしない。"""
+    raw_path = _recorded_raw_path(folder, stamp)
+    has_raw = raw_path is not None
+    report["files"][HYBRID_RAW_PREFIX] = raw_path.name if has_raw else None
+    for name in HYBRID_EXTRA_FILES:
+        found = _one(folder, f"{name}_{stamp}*.csv") if stamp else None
+        report["files"][name] = found.name if found else None
+    if meta.get(HYBRID_SCHEMA_KEY) is None:
+        return
+    add(f"ファイル: {HYBRID_RAW_PREFIX}", has_raw,
+        raw_path.name if has_raw else "無い（EKF の手前の生 3D。tune_ekf の入力）")
+    if not has_raw:
+        report["ekf"]["note"] = (f"{HYBRID_RAW_PREFIX}_{stamp}.csv（とサイドカー）が無いので、EKF の前後の差と棄却率は出さない。"
+                                 "記録が途中で止まったか、書き出しが漏れている")
+    if has_raw and files["kpts3d"] is not None and frames is not None:
+        report["ekf"] = _hybrid_ekf_stats(read_raw_capture(raw_path), files["kpts3d"], frames, base_dir=folder)
+        matched, rows = report["ekf"]["matched_rows"], report["ekf"]["kpts_rows"]
+        add(f"行: kpts3d の各行に生 CSV の同じ格子がある（{MIN_GRID_MATCH:.0%} 以上）",
+            rows > 0 and matched / rows >= MIN_GRID_MATCH, f"{matched} / {rows} 行")
+    if files["cycle_work"] is not None:
+        work = pd.read_csv(files["cycle_work"])
+        if set(HYBRID_WORK_COLUMNS) <= set(work.columns):
+            report["gauge"] = _hybrid_gauge(work, meta)
+    report["subject"] = {key: meta.get(key) for key in HYBRID_SUBJECT_KEYS}
+    board = (meta.get("calibration_meta") or {}).get("checkerboard_short_axis") or {}
+    report["gravity"] = dict(meta.get("gravity") or {}, board_tilt_deg=board.get("tilt_deg"),
+                             board_up_label=board.get("up_label_runtime"))
+    report["timing"] = meta.get("timing")
+    report["hybrid"].update({key: meta.get(key) for key in ("ekf", "dyn_gate", "mac_camera", HYBRID_SCHEMA_KEY)})
 
 
 def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: bool = True) -> dict[str, Any]:
@@ -407,7 +534,8 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
             "role_fps": role_fps, "role_frames": role_frames,
             "file_mode": False,
         }
-    quality = _hybrid_quality(folder, files, meta)
+    _hybrid_extended(folder, stamp, files, frames, meta, report, add)
+    quality = _hybrid_quality(folder, files, meta, stamp)
     if quality is not None:
         report["quality"] = quality
         _quality_checks(quality, add)
@@ -417,15 +545,21 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
     return report
 
 
+# hybrid-raw の出力名の印。計測は EKF の手前の 3D を kpts3d_raw_<stamp>.csv に書くので、道具の出力は
+# kpts3d_raw_<stamp>_retri[_grid][_sN].csv にして分ける
+RETRI_SUFFIX = "_retri"
+
+
 def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: str | Path | None = None, *,
                        grid: bool = False, hz: float | None = None) -> Path:
-    """混成の 3D（EKF なし）を生 CSV（``kpts3d_raw_*``、``app.tuning.raw_capture`` の形）に直す。
+    """混成の 3D（EKF なし）を生 CSV（``kpts3d_raw_<stamp>_retri*``、``app.tuning.raw_capture`` の形）に直す。
 
     S6 の雑音の推定（``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf``）がそのまま使える。
 
     - 既定は、遅い方のカメラ（実機では Pixel、10〜15 Hz）の実際の撮影時刻で記録の 2D から三角測量し直した 3D
       （``app.hybrid.retriangulate``）。計測中の 3D は 30 Hz の格子へ線形補間した点で、補間の区間が直線になり
-      雑音の推定が狂う。``grid=True`` なら記録された格子の 3D をそのまま使う（比べる用）
+      雑音の推定が狂う。``grid=True`` なら記録された格子の 3D をそのまま使う（比べる用）。新しい版の記録は
+      ``kpts3d`` が EKF の後なので、EKF の手前の ``kpts3d_raw_<stamp>.csv`` を使う（古い版の記録は ``kpts3d``）
     - 混成の経路には間引きの設定が無いので、4 Hz 間引きに当たる 2 設定目は間引いて作る。``hz`` を与えると、
       実際の速さから間引き幅（``stride``）を決める（12 Hz で ``hz=4`` なら 3 組おき）
     - 間隔は揺れ、推定は dt 一定を前提にするので、dt は間隔の中央値とし、揺れの幅（5〜95%）も残す
@@ -438,7 +572,15 @@ def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: 
     meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
     stamp, files = _hybrid_files(folder)
     ids = [int(i) for i in meta["pose_keypoints"]]
-    if grid:
+    recorded_raw = _recorded_raw_path(folder, stamp) if grid else None
+    if recorded_raw is not None:
+        # 新しい版の記録は kpts3d が EKF の後の点なので、EKF の手前の格子（kpts3d_raw_<stamp>.csv、抜けは NaN の行）を使う。
+        # EKF で均した点から雑音を推定すると r が小さく出て、その較正を実行時が選んでしまう（dt が 1/30 s で一致する）
+        capture = read_raw_capture(recorded_raw)
+        points, t, frame_no = capture.points, capture.t, capture.frame
+        times, skipped = "grid", 0
+    elif grid:
+        # 古い版の記録（EKF の手前の CSV が無い）は kpts3d がそのまま三角測量の点
         kpts_path, frames_path = files["kpts3d"], files["frames"]
         if kpts_path is None or frames_path is None:
             raise ValueError(f"kpts3d・frames の CSV が無い: {folder}")
@@ -481,7 +623,8 @@ def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: 
     }
     target = Path(out_dir) if out_dir else folder
     target.mkdir(parents=True, exist_ok=True)
-    name = f"kpts3d_raw_{stamp}" + ("_grid" if grid else "") + ("" if stride == 1 else f"_s{stride}") + ".csv"
+    # 計測中の記録（kpts3d_raw_<stamp>.csv、EKF の手前）を上書きしないよう、道具の出力には _retri を付ける
+    name = f"kpts3d_raw_{stamp}{RETRI_SUFFIX}" + ("_grid" if grid else "") + ("" if stride == 1 else f"_s{stride}") + ".csv"
     path = target / name
     writer = RawCaptureWriter(path, ids, provenance)
     try:
@@ -586,6 +729,57 @@ def _fmt(value, spec=".2f") -> str:
     return "—" if value is None else format(value, spec)
 
 
+def _ekf_lines(e: Mapping[str, Any]) -> list[str]:
+    """EKF の前後の差と棄却率の行（USB と混成で共用）。"""
+    lines = []
+    rms = [row["rms_mm"] for row in e["series"] if row["rms_mm"] is not None]
+    rates = [row["rejection_rate"] for row in e["series"] if row["rejection_rate"] is not None]
+    lines.append(f"[§6-3 EKF（S9b の材料）] 雑音の出どころ {e['noise_origin']}、EKF {'有効' if e['ekf_enabled'] else '無効'}")
+    if e.get("note"):
+        lines.append(f"  {e['note']}")
+    if "matched_rows" in e:
+        lines.append(f"  生 CSV と kpts3d を時刻の格子（round(t/dt)）で合わせた行 {e['matched_rows']} / {e['kpts_rows']}、"
+                     f"体格の比 {_fmt(e.get('scale_ratio'), '.3f')}")
+    if rms:
+        lines.append(f"  RMS（前後の差）[mm]: 中央値 {np.median(rms):.2f} / 最大 {max(rms):.2f}")
+    if rates:
+        lines.append(f"  棄却率: 中央値 {np.median(rates):.3f} / 最大 {max(rates):.3f}")
+    worst = sorted((row for row in e["series"] if row["rms_mm"] is not None), key=lambda r: -r["rms_mm"])[:5]
+    for row in worst:
+        lines.append(f"    {row['landmark']}_{row['axis']}: RMS {row['rms_mm']:.2f} mm、棄却率 {_fmt(row['rejection_rate'], '.3f')}")
+    lines.append("  張り付き・n_eff は python -m app.tuning.ekf_estimate <kpts3d_raw の CSV>")
+    return lines
+
+
+def _hybrid_lines(report: Mapping[str, Any]) -> list[str]:
+    """混成の新しい版の記録の節（被験者・ゲージ・重力・処理時間）。"""
+    lines = []
+    if "subject" in report:
+        s = report["subject"]
+        one_rm = "、".join(f"{k} {_fmt(v, '.1f')}" for k, v in (s.get("one_rm_kg") or {}).items()) or "—"
+        forearm = "、".join(f"{k} {_fmt(v, '.3f')}" for k, v in (s.get("forearm_len_m") or {}).items()) or "—"
+        lines.append(f"[被験者] 被験者 {s.get('subject_id')}、体重 {_fmt(s.get('body_mass_kg'), '.1f')} kg、"
+                     f"1RM [kg]: {one_rm}、前腕長 [m]: {forearm}")
+    if "gauge" in report:
+        lines.append("[§6-8 ゲージ] 回ごとの W_pos [J]・スコア S = W_pos / W_1RM・帯 W_0.70〜W_0.85（論文 4.5.2 節）")
+        for joint, g in report["gauge"].items():
+            work = ", ".join(_fmt(v, ".1f") for v in g["work_pos"])
+            scores = ", ".join(_fmt(v, ".2f") for v in g["scores"])
+            band = (f"帯 {g['band'][0]:.1f}〜{g['band'][1]:.1f} J、W_0.70 到達 {g['reached_low']} 回 / W_0.85 到達 "
+                    f"{g['reached_high']} 回、W_1RM {_fmt(g['w1rm'], '.1f')} J") if g["band"] else "帯なし（1RM か前腕長が無い）"
+            lines.append(f"  {joint}: W_pos [{work}] / S [{scores}]（{band}）")
+    if "gravity" in report and report.get("kind") == "hybrid":
+        g = report["gravity"]
+        lines.append(f"[重力] 出どころ {g.get('source')}、向き {g.get('label')}（上 {g.get('up_label')}）、"
+                     f"盤の傾き {_fmt(g.get('board_tilt_deg'), '.1f')}°（盤 {g.get('board_up_label') or 'なし'}）"
+                     + (f"。{g['detail']}" if g.get("detail") else ""))
+    if report.get("timing"):
+        t = report["timing"]
+        lines.append(f"[処理時間] 1 組の処理 中央値 {_fmt(t.get('median_ms'), '.1f')} ms / 95% {_fmt(t.get('p95_ms'), '.1f')} ms / "
+                     f"最大 {_fmt(t.get('max_ms'), '.1f')} ms（30 Hz の予算は 33 ms）")
+    return lines
+
+
 def format_report(report: Mapping[str, Any]) -> str:
     lines = [f"== 検証: {report['out_dir']}（{report.get('timestamp')}） =="]
     lines.append("[構造]")
@@ -596,14 +790,14 @@ def format_report(report: Mapping[str, Any]) -> str:
         lines.append(f"[§6-2 トルク |τ_y| [N·m]]（{EXPECTED_TORQUE}）")
         for joint, s in report["torque"].items():
             lines.append(f"  {joint}: 中央値 {_fmt(s['median_abs'])} / 95% {_fmt(s['p95_abs'])} / 最大 {_fmt(s['max_abs'])}")
-    if "gauge" in report:
+    if "gauge" in report and report.get("kind") != "hybrid":
         lines.append("[§6-2 ゲージ（サイクルごとの最大 [J]。最初と最後は途中のサイクル）]")
         for joint, s in report["gauge"].items():
             peaks = ", ".join(_fmt(p, ".1f") for p in s["cycle_peaks"])
             band = (f"帯 {s['band'][0]:.1f}〜{s['band'][1]:.1f}、E_low 到達 {s['reached_low']} / "
                     f"E_high 到達 {s['reached_high']}") if s["band"] else "帯なし"
             lines.append(f"  {joint}: [{peaks}]（{band}）")
-    if "gravity" in report:
+    if "gravity" in report and report.get("kind") != "hybrid":
         g = report["gravity"]
         lines.append(f"[§6-2 重力] g の向き {g['label']}（{'体幹から推定' if g['estimated'] else '既定のまま'}）")
     if "cycles" in report:
@@ -642,22 +836,13 @@ def format_report(report: Mapping[str, Any]) -> str:
         h = report.get("hybrid", {})
         lines.append(f"[§3-2 記録] status={h.get('status')}、止まった理由 {h.get('stop_reason')}、"
                      f"終了コード {h.get('exit_code')}、解像度違いで捨てた点 {h.get('size_drops')}")
-        lines.append(f"[§6-3 EKF] {report['ekf']['note']}")
+        lines.extend(_hybrid_lines(report))
+        if report["ekf"].get("series"):
+            lines.extend(_ekf_lines(report["ekf"]))
+        else:
+            lines.append(f"[§6-3 EKF] {report['ekf']['note']}")
     elif "ekf" in report:
-        e = report["ekf"]
-        rms = [row["rms_mm"] for row in e["series"] if row["rms_mm"] is not None]
-        rates = [row["rejection_rate"] for row in e["series"] if row["rejection_rate"] is not None]
-        lines.append(f"[§6-3 EKF（S9b の材料）] 雑音の出どころ {e['noise_origin']}、EKF {'有効' if e['ekf_enabled'] else '無効'}")
-        if e.get("note"):
-            lines.append(f"  {e['note']}")
-        if rms:
-            lines.append(f"  RMS（前後の差）[mm]: 中央値 {np.median(rms):.2f} / 最大 {max(rms):.2f}")
-        if rates:
-            lines.append(f"  棄却率: 中央値 {np.median(rates):.3f} / 最大 {max(rates):.3f}")
-        worst = sorted((row for row in e["series"] if row["rms_mm"] is not None), key=lambda r: -r["rms_mm"])[:5]
-        for row in worst:
-            lines.append(f"    {row['landmark']}_{row['axis']}: RMS {row['rms_mm']:.2f} mm、棄却率 {_fmt(row['rejection_rate'], '.3f')}")
-        lines.append("  張り付き・n_eff は python -m app.tuning.ekf_estimate <kpts3d_raw の CSV>")
+        lines.extend(_ekf_lines(report["ekf"]))
     failed = [c for c in report["checks"] if not c["ok"]]
     lines.append("結果: " + ("構造の検査はすべて合格" if not failed else f"不合格 {len(failed)} 件"))
     return "\n".join(lines)

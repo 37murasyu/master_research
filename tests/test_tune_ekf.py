@@ -69,3 +69,64 @@ class TestTuneEkfCommand:
 
         assert main([str(csv_path)]) == 2, "較正に使えない入力を受け付けている"
         assert "pre_ekf" in capsys.readouterr().err, "なぜ使えないかが表示されない"
+
+
+# ---------------------------------------------------------------------------
+# 混成の収録と --out のフォルダ（B7）
+# ---------------------------------------------------------------------------
+#
+# なぜこのテストがあるか: --out にフォルダを渡すと IsADirectoryError で落ちていた（ファイル名を足していなかった）。
+# 混成の計測は EKF の手前の生 3D を 1/30 s の格子で計測フォルダに書く。プロファイルを計測フォルダの隣に置くと、
+# 次の計測の設定（HYBRID_EKF_PROFILE）に何を入れればよいか分からないので、決まった場所（hybrid/ekf_profiles）に
+# 書いて設定の値を案内する。実行時の探索は dt の相対差 5% 以内のプロファイルしか選ばないので、1/30 s から
+# 外れた収録（hybrid-raw の Pixel の時刻など）で作ったものは混成の計測では使われない。それを警告する。
+
+
+def _hybrid_recording(tmp_path, dt=1 / 30):
+    rng = np.random.default_rng(1)
+    t = np.arange(N_FRAMES) * dt
+    points = np.sin(2 * np.pi * 0.5 * t)[:, None, None] * 0.1 + rng.normal(0, 0.003, (N_FRAMES, len(IDS), 3))
+    csv_path = tmp_path / "measure" / "20260924_070000_000000" / "kpts3d_raw_20260924_070000_000000.csv"
+    csv_path.parent.mkdir(parents=True)
+    writer = RawCaptureWriter(csv_path, IDS, provenance={"dt": dt, "src_fps": 30.0, "source": "hybrid", "times": "grid"})
+    for k in range(N_FRAMES):
+        writer.append(k, float(t[k]), points[k])
+    writer.close()
+    return csv_path
+
+
+class TestTuneEkfDestinations:
+    def test_an_existing_folder_gets_the_default_name(self, tmp_path):
+        folder = tmp_path / "profiles"
+        folder.mkdir()
+        assert main([str(_recording(tmp_path)), "--out", str(folder)]) == 0
+        assert read_profile(folder / f"ekf_profile_{DT:.5f}.json")["dt"] == pytest.approx(DT)
+
+    def test_a_new_path_without_suffix_is_a_folder(self, tmp_path):
+        folder = tmp_path / "new_profiles"
+        assert main([str(_recording(tmp_path)), "--out", str(folder)]) == 0
+        assert (folder / f"ekf_profile_{DT:.5f}.json").is_file()
+
+    def test_a_hybrid_recording_goes_to_the_profile_folder(self, tmp_path, monkeypatch, capsys):
+        from app.runners import tune_ekf
+
+        root = tmp_path / "hybrid" / "ekf_profiles"
+        monkeypatch.setattr(tune_ekf, "ekf_profile_root", lambda: root)
+        assert main([str(_hybrid_recording(tmp_path))]) == 0
+        written = root / f"ekf_profile_{1 / 30:.5f}.json"
+        assert written.is_file()
+        out = capsys.readouterr().out
+        assert "HYBRID_EKF_PROFILE" in out and str(written) in out
+        assert "警告" not in out
+
+    def test_a_hybrid_recording_off_the_grid_is_warned(self, tmp_path, monkeypatch, capsys):
+        from app.runners import tune_ekf
+
+        monkeypatch.setattr(tune_ekf, "ekf_profile_root", lambda: tmp_path / "ekf_profiles")
+        assert main([str(_hybrid_recording(tmp_path, dt=1 / 12))]) == 0
+        assert "警告" in capsys.readouterr().out
+
+    def test_the_profile_root_is_under_the_hybrid_root(self):
+        from app.hybrid.paths import ekf_profile_root, hybrid_root
+
+        assert ekf_profile_root() == hybrid_root() / "ekf_profiles"

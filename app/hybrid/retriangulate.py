@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from app.hybrid.calibration_io import load_session_calibration
+from app.hybrid.ekf import EkfSettings
 from app.net.protocol import LandmarkFrame
 from app.net.sync_buffer import InterpolatedFrame, PairedSample
 from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
@@ -96,7 +97,9 @@ def retriangulate(session: str | Path, *, reference: str | None = None,
                   max_gap_ns: int = MAX_GAP_NS) -> Retriangulated:
     """計測フォルダの 2D から、遅い方のカメラの撮影時刻で 3D を作り直す（校正は計測フォルダに写したもの）。"""
     calibration = load_session_calibration(session)
-    measurement = NetworkMeasurement(*calibration.projections, pose_keypoints, MeasurementConfig(),
+    # 使うのは状態を持たない points_3d だけ。既定の EKF（雑音の解決と LandmarkEKF の用意）は要らない
+    measurement = NetworkMeasurement(*calibration.projections, pose_keypoints,
+                                     MeasurementConfig(ekf=EkfSettings(enabled=False)),
                                      lens=dict(zip(ROLES, calibration.intrinsics)))
     reference, pairs, skipped = pairs_at_real_times(read_landmarks(session), reference=reference,
                                                     max_gap_ns=max_gap_ns)

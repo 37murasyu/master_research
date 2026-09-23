@@ -66,10 +66,12 @@ def test_distortion_corrected_3d_and_outside_nan():
     result = m.process(_pair_from_pixels(1, a, b))
     expected = truth[:, [0, 2, 1]] * -0.01
     assert np.max(np.linalg.norm(result.points_3d - expected, axis=1)) < 0.005
-    # 余白（幅・高さの 10%）より遠く外の点は、歪みの多項式の外挿が暴れるので使わない
+    # 余白（幅・高さの 10%）より遠く外の点は、歪みの多項式の外挿が暴れるので使わない。
+    # EKF はその点を予測で埋めるので、三角測量の結果は EKF の手前（points_raw）で見る（T7 で EKF を入れた）
     a[0] = [-400, 30]
     result = m.process(_pair_from_pixels(2, a, b))
-    assert np.isnan(result.points_3d[0]).all()
+    assert np.isnan(result.points_raw[0]).all()
+    assert np.isfinite(result.points_3d[0]).all()
 
 
 def test_edge_points_survive_undistortion():
@@ -136,6 +138,12 @@ def test_identity_and_dimension_rejection(tmp_path):
     session.close()
 
 
+def _kpts3d(folder):
+    """EKF の後の 3D（``kpts3d_<stamp>.csv``）。2026-09-24 から同じフォルダに EKF の手前の ``kpts3d_raw_<stamp>.csv``
+    も書くので、``kpts3d_*`` の glob では取り違える。"""
+    return next(p for p in folder.glob("kpts3d_*.csv") if not p.name.startswith("kpts3d_raw_"))
+
+
 def test_mock_measure_records_during_run_and_closes_after_drain(tmp_path):
     cal = calibration(tmp_path)
     session = MeasurementSession(cal, root=tmp_path / "measure")
@@ -174,7 +182,7 @@ def test_mock_measure_records_during_run_and_closes_after_drain(tmp_path):
             live.step()
             time.sleep(0.025)
             if not checked and time.monotonic() - start > 1.5:
-                csv = next(session.directory.glob("kpts3d_*.csv"))
+                csv = _kpts3d(session.directory)
                 assert len(csv.read_text().splitlines()) > 2
                 checked = True
     finally:
@@ -185,11 +193,11 @@ def test_mock_measure_records_during_run_and_closes_after_drain(tmp_path):
     assert not thread.errors
     meta = json.loads((session.directory / "meta.json").read_text())
     assert meta["status"] == "complete" and meta["frames"] > 40
-    data = np.loadtxt(
-        next(session.directory.glob("kpts3d_*.csv")), delimiter=",", skiprows=1
-    )
+    data = np.loadtxt(_kpts3d(session.directory), delimiter=",", skiprows=1)
     expected = truth[:, [0, 2, 1]] * -0.01
     assert np.max(np.abs(data[:, 1:].reshape(-1, len(truth), 3) - expected)) < 0.01
+    raw = np.loadtxt(next(session.directory.glob("kpts3d_raw_*.csv")), delimiter=",", skiprows=1)
+    assert np.nanmax(np.abs(raw[:, 2:].reshape(-1, len(truth), 3) - expected)) < 0.01
     assert meta["writer_thread"] != "MainThread"
 
 
