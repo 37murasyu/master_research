@@ -117,9 +117,86 @@ CURATED: dict[str, dict[str, Any]] = {
         "ui_visible": True,
         "group": "被験者",
         "description": (
-            "被験者番号（例: S001）。最大保持重量 m_max_part_<番号>.json の"
-            "読み込みに使う。未指定だと既定値で動く。"
+            "被験者番号（例: 00）。Mac＋Pixel は m_max_all_merged.csv の番号（整数）で 1RM を引き、"
+            "ゲージの目標帯（論文の W_0.70〜W_0.85）を決める。USB カメラ 2 台は m_max_part_<番号>.json を読む。"
         ),
+    },
+    # --- 混成（Mac＋Pixel）だけが読む項目 ----------------------------------
+    # スキーマの生成元は master_research_code.py と config.py しか見ないので、ここに足さないと GUI から渡らない。
+    # 名前を HYBRID_ で始めるのは、GUI が全件渡す USB 向けの既定（POSE_ROI_ON=1・EKF_Q_ACC=1e-3 など）を
+    # 混成に漏らさないため（tests/test_hybrid_settings.py）。
+    "HYBRID_EKF_PROFILE": {
+        "type": "str",
+        "code_default": "",
+        "ui_visible": True,
+        "group": "カルマンフィルタ",
+        "description": (
+            "Mac＋Pixel の EKF の較正プロファイル（ファイルかフォルダ）。空なら同梱の既定値。"
+            "解析ページで計測フォルダの kpts3d_raw_*.csv から作れる（処理の間隔 1/30 秒のものだけが選ばれる）。"
+        ),
+    },
+    "HYBRID_GRAVITY_BOARD": {
+        "type": "bool",
+        "code_default": "1",
+        "ui_visible": True,
+        "group": "混成ステレオ",
+        "description": "Mac＋Pixel の校正の最後に、盤を立てて重力の向きを記録する（Enter で省略できる）。",
+    },
+    "HYBRID_GRAVITY_BOARD_TIMEOUT_S": {
+        "type": "float",
+        "code_default": "30",
+        "group": "混成ステレオ",
+        "description": "盤を立てる段階を打ち切るまでの秒数。",
+    },
+    "HYBRID_POSE_MODEL": {
+        "type": "str",
+        "code_default": "",
+        "group": "混成ステレオ",
+        "description": "Mac 側の姿勢推定のモデル（.task）。空なら同梱の lite（Pixel と同じ）。",
+    },
+    "HYBRID_POSE_MIN_DET": {
+        "type": "float",
+        "code_default": "0.5",
+        "group": "混成ステレオ",
+        "description": "Mac 側の姿勢推定の検出の閾値。",
+    },
+    "HYBRID_POSE_MIN_PRESENCE": {
+        "type": "float",
+        "code_default": "0.5",
+        "group": "混成ステレオ",
+        "description": "Mac 側の姿勢推定の存在の閾値。",
+    },
+    "HYBRID_POSE_MIN_TRACK": {
+        "type": "float",
+        "code_default": "0.5",
+        "group": "混成ステレオ",
+        "description": "Mac 側の姿勢推定の追跡の閾値。",
+    },
+    "HYBRID_POSE_INPUT_SCALE": {
+        "type": "float",
+        "code_default": "1.0",
+        "group": "混成ステレオ",
+        "description": "Mac 側の姿勢推定に渡す画像の縮小率（0.25〜1）。",
+    },
+    "HYBRID_POSE_ROI": {
+        "type": "bool",
+        "code_default": "0",
+        "group": "混成ステレオ",
+        "description": "Mac 側の姿勢推定で人の周りだけを切り出して推定する（IMAGE モードになる）。",
+    },
+    "HYBRID_DYN_GATE": {
+        "type": "bool",
+        "code_default": "1",
+        "group": "混成ステレオ",
+        "description": (
+            "押し上げの間だけ仕事とゲージを積む（座っている間の雑音を積まない）。"
+            "トルクは関所によらず記録する。"
+        ),
+    },
+    "ONE_RM_CSV": {
+        "type": "str",
+        "group": "被験者",
+        "description": "1RM の表のパス。空なら作業フォルダの m_max_all_merged.csv。",
     },
     # config.py 側は int(os.environ.get(...)) で読むが、実質は 0/1 の真偽値。
     # UI ではチェックボックスにする。"1"/"0" を渡せば int() は問題なく解釈する。
