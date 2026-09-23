@@ -194,8 +194,9 @@ class FrameResult:
     height_m: float = float("nan")
     # このフレームが属する回の番号（0 始まり＝それまでに確定した回の数）
     rep: int = 0
-    # 回を確定したフレームだけ: 部位ごとの W+・W−（app.hybrid.rep_work.PartWork）
+    # 回を確定したフレームだけ: 部位ごとの W+・W−（app.hybrid.rep_work.PartWork）と W_1RM [J]（帯が無い部位は None）
     cycle_parts: dict[str, PartWork] = field(default_factory=dict)
+    cycle_w1rm: dict[str, float | None] = field(default_factory=dict)
 
 
 class NetworkMeasurement:
@@ -628,6 +629,7 @@ class NetworkMeasurement:
             self.cycle_work[key].append(work.net)
             result.cycle_work_j[key] = work.net
         result.cycle_parts = parts
+        result.cycle_w1rm = {key: (self.bands[key].w1rm if key in self.bands else None) for key in parts}
         self.cycles.append({"frame": self.frame_index, "t_ns": result.t_ns, "parts": parts})
         if self.tracker is not None:
             self.tracker.close_rep()

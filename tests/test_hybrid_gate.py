@@ -127,3 +127,34 @@ class TestTracker:
                 seen.append((pair.t_ns / 1e9, tracker.values()["elbow_R"]))
         during = [v for t, v in seen if motion.rest_s + 0.3 < t < motion.rest_s + motion.rise_s]
         assert during and during[-1] > 5.0, "押し上げの途中でゲージが増えている"
+
+
+class TestCloseRep:
+    """回の確定（計画の T10）: ゲージは回ごとに 0 に戻り、直前の回の W_pos を prev に残す。記録には W±・W+・W−・スコア。"""
+
+    ONE_RM = {"elbow_L": 20.0, "elbow_R": 22.0, "wrist_L": 8.0, "wrist_R": 9.0}
+
+    def _closed_once(self):
+        tracker = GaugeTracker()
+        P0, P1 = _stereo_projections()
+        config = MeasurementConfig(body_mass_kg=65.0, one_rm=self.ONE_RM)
+        measurement = NetworkMeasurement(P0, P1, pose_keypoints, config, tracker=tracker)
+        results = _run(measurement, PushUp(reps=1))
+        return measurement, tracker, results
+
+    def test_the_gauge_moves_now_to_prev(self):
+        measurement, tracker, _ = self._closed_once()
+        frame = tracker.snapshot()
+        assert frame.rep == 1
+        elbow = measurement.cycles[0]["parts"]["elbow_R"]
+        assert frame.parts["elbow_R"].prev == pytest.approx(elbow.pos)
+        assert frame.parts["elbow_R"].now == 0.0, "着座の後は関所が閉じていて積まない"
+        assert frame.parts["wrist_L"].prev == pytest.approx(measurement.cycles[0]["parts"]["wrist_L"].pos)
+
+    def test_the_closing_frame_carries_the_rep_values(self):
+        measurement, _, results = self._closed_once()
+        closing = next(r for r in results if r.cycle_detected)
+        elbow = closing.cycle_parts["elbow_R"]
+        assert closing.cycle_work_j["elbow_R"] == pytest.approx(elbow.pos + elbow.neg)
+        assert closing.cycle_w1rm["elbow_R"] == pytest.approx(measurement.bands["elbow_R"].w1rm)
+        assert closing.cycle_w1rm["shoulder_R"] is None, "肩には 1RM 相当の理論仕事が無い"

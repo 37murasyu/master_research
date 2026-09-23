@@ -10,6 +10,17 @@ from app.hybrid.calibration_io import FILES, write_json
 from app.hybrid.paths import measurement_root
 
 
+def _cycle_columns(result, key):
+    """cycle_work の W+・W−・W_1RM・スコア。無いものは空欄。"""
+    parts = getattr(result, "cycle_parts", None) or {}
+    w1rm = (getattr(result, "cycle_w1rm", None) or {}).get(key)
+    work = parts.get(key)
+    if work is None:
+        return ["", "", "", ""]
+    score = work.pos / w1rm if w1rm else ""
+    return [work.pos, work.neg, "" if w1rm is None else w1rm, score]
+
+
 class Recorder:
     def __init__(
         self,
@@ -81,7 +92,8 @@ class Recorder:
             ],
         )
         self.torques = writer("local_torque", ["frame", "t_ns", "joint", "x", "y", "z"])
-        self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j"])
+        # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）
+        self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score"])
         write_json(self.directory / "meta.json", self.meta)
         self.flush(force=True)
 
@@ -125,7 +137,7 @@ class Recorder:
             for key, value in result.local_torques.items()
         )
         self.work.writerows(
-            [self.frames, result.t_ns, key, value]
+            [self.frames, result.t_ns, key, value, *_cycle_columns(result, key)]
             for key, value in result.cycle_work_j.items()
         )
         self.frames += 1
