@@ -1,5 +1,8 @@
 """Filter pose/torque CSVs with EKF and LPF.
 
+論文当時の前処理（LPF は 2 Hz 固定）。記録として残す。今の前処理は pose_lowpass.py（カットオフを試技ごとに
+f0 から決める。KNOWN_ISSUES §6-1）。
+
 Outputs:
 - output_data/filtered_pose_ekf
 - output_data/filtered_pose_lpf
