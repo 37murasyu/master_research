@@ -21,6 +21,7 @@ import cv2 as cv
 # 日本語表示。同梱の IPAexゴシックを matplotlib に登録する。
 # japanize_matplotlib は distutils.version を import するため Python 3.12 で動かない
 # （distutils が標準ライブラリから削除された）。
+from app.core.camera_controls import apply_camera_controls
 from app.core.resources import configure_matplotlib_japanese
 from app.core.stop_request import StopRequest
 
@@ -2476,105 +2477,16 @@ def _print_cap_props(name: str, cap: 'cv.VideoCapture') -> None:
     except Exception as _e:
         print(f"[CAMDIAG] {name}: prop read failed: {_e}")
 
-def _set_prop(cap: 'cv.VideoCapture', prop: int, value: float) -> bool:
-    try:
-        ok = cap.set(prop, value)
-        # 反映確認（一部backendでは取得できない）
-        _ = cap.get(prop)
-        return bool(ok)
-    except Exception:
-        return False
-
 def _apply_camera_controls(name: str, cap: 'cv.VideoCapture') -> None:
-    """実カメラ時のカメラ設定を固定。オート系OFF＋任意の固定値を環境変数から適用。
+    """実カメラ時のカメラ設定を固定する（オート系オフ＋環境変数 CAM{n}_* / CAM_* の固定値）。
 
-    優先度: CAM{idx}_* > CAM_* > 既定
-    - idx は name が 'cam0'/'cam1' の末尾数字を使用
-    - 例: CAM0_EXPOSURE, CAM_EXPOSURE, CAM0_AUTOFOCUS=0, CAM_AUTO_WB=0
+    本体は app.core.camera_controls（録画ツール tools/record_stereo.py と共有する）。
+    ファイル入力には当てない。name は 'cam0' / 'cam1'（末尾の数字が CAM{n}_* の n）。
     """
     if file_mode:
         return
-    idx = None
-    try:
-        if name.lower().startswith('cam'):
-            idx = int(''.join(ch for ch in name if ch.isdigit()))
-    except Exception:
-        idx = None
-
-    def _env(k: str, default: str | None = None) -> str | None:
-        if idx is not None and (f"CAM{idx}_{k}" in os.environ):
-            return os.getenv(f"CAM{idx}_{k}")
-        return os.getenv(f"CAM_{k}", default)
-
-    # 1) 自動系OFF（既定でOFFを試みる）
-    try:
-        # Auto Exposure（backend差異に配慮して複数パターンを試す）
-        ae_env = _env('AUTO_EXPOSURE', 'off')
-        if ae_env and ae_env.lower() in ('0','off','false'):
-            for v in (0.0, 0.0, 0.25, 0.75):  # MSMF/DSHOW の差へ便宜上複数トライ
-                if _set_prop(cap, cv.CAP_PROP_AUTO_EXPOSURE, v):
-                    break
-        elif ae_env and ae_env.lower() in ('1','on','true'):
-            _set_prop(cap, cv.CAP_PROP_AUTO_EXPOSURE, 1.0)
-    except Exception:
-        pass
-    try:
-        awb_env = _env('AUTO_WB', 'off')
-        if hasattr(cv, 'CAP_PROP_AUTO_WB'):
-            if awb_env and awb_env.lower() in ('0','off','false'):
-                _set_prop(cap, cv.CAP_PROP_AUTO_WB, 0.0)
-            elif awb_env and awb_env.lower() in ('1','on','true'):
-                _set_prop(cap, cv.CAP_PROP_AUTO_WB, 1.0)
-    except Exception:
-        pass
-    try:
-        af_env = _env('AUTOFOCUS', 'off')
-        if hasattr(cv, 'CAP_PROP_AUTOFOCUS'):
-            if af_env and af_env.lower() in ('0','off','false'):
-                _set_prop(cap, cv.CAP_PROP_AUTOFOCUS, 0.0)
-            elif af_env and af_env.lower() in ('1','on','true'):
-                _set_prop(cap, cv.CAP_PROP_AUTOFOCUS, 1.0)
-    except Exception:
-        pass
-
-    # 2) 固定値の適用（指定がある場合）
-    def _env_float(k: str) -> float | None:
-        v = _env(k)
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except Exception:
-            return None
-
-    # 解像度・FPS・FOURCC（設定 → 実値の確認の順で行う）
-    w_set = _env_float('WIDTH'); h_set = _env_float('HEIGHT'); fps_set = _env_float('FPS')
-    if w_set:
-        _set_prop(cap, cv.CAP_PROP_FRAME_WIDTH, w_set)
-    if h_set:
-        _set_prop(cap, cv.CAP_PROP_FRAME_HEIGHT, h_set)
-    if fps_set:
-        _set_prop(cap, cv.CAP_PROP_FPS, fps_set)
-    fourcc_env = _env('FOURCC')
-    if fourcc_env and len(fourcc_env) >= 4:
-        try:
-            cc = cv.VideoWriter_fourcc(*fourcc_env[:4])
-            _set_prop(cap, cv.CAP_PROP_FOURCC, float(cc))
-        except Exception:
-            pass
-
-    exp_set = _env_float('EXPOSURE')
-    if exp_set is not None:
-        _set_prop(cap, cv.CAP_PROP_EXPOSURE, exp_set)
-    gain_set = _env_float('GAIN')
-    if gain_set is not None:
-        _set_prop(cap, cv.CAP_PROP_GAIN, gain_set)
-    wb_set = _env_float('WB_TEMPERATURE')
-    if wb_set is not None and hasattr(cv, 'CAP_PROP_WB_TEMPERATURE'):
-        _set_prop(cap, cv.CAP_PROP_WB_TEMPERATURE, wb_set)
-    focus_set = _env_float('FOCUS')
-    if focus_set is not None and hasattr(cv, 'CAP_PROP_FOCUS'):
-        _set_prop(cap, cv.CAP_PROP_FOCUS, focus_set)
+    digits = ''.join(ch for ch in name if ch.isdigit())
+    apply_camera_controls(cap, int(digits) if name.lower().startswith('cam') and digits else None)
 
 # ライブカメラの設定固定（AE/AWB/AFオフ＋任意設定）→ 反映後のプロパティ出力
 _apply_camera_controls('cam0', cap0)
