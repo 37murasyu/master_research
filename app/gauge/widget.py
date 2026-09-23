@@ -49,6 +49,16 @@ FIGURE_RECT = QtCore.QRectF(0.0, 0.0, DESIGN_W, DESIGN_H)
 
 # 窓の大きさが変わらない限り描き直さない role（constraints.md「速さ」の節。
 # "part" を足した理由はモジュール docstring を参照）。
+#
+# ここに列挙した role（静止層）とそれ以外の role（動く層）は、画面上で
+# 重ならないことを前提にしている。重なる場所ができると、GaugeWidget の
+# 描画経路（静止層の QPixmap の上に動く層を重ねる。動く層が必ず上）と、
+# paint_scene（scene.arcs→lines→labels の元の順で 1 回に描く。role に
+# よらず元の重ね順のまま）とで重ね順が変わってしまい、キャッシュの
+# 有無で見た目が変わる（GaugeWidget.paintEvent と paint_scene/render_image
+# の画素がずれる）。今の役割の組み合わせ（溝・部位名・凡例・見出しの
+# タイトルは背景寄りの飾り、動く層は弧の色や文字で溝の上に重ねて描く
+# もの）では重ならないが、新しい role を足すときはこの前提を崩さないこと。
 _STATIC_ROLES = frozenset(
     {
         "groove",

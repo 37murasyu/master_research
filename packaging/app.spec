@@ -29,7 +29,17 @@ VERSION = "0.1.0"
 BUNDLE_ID = os.environ.get("APP_BUNDLE_ID", "local.masterresearch.WheelchairTorque")
 ICON = Path(os.environ.get("APP_ICON", ROOT / "build" / "icon" / "AppIcon.icns"))
 
-hiddenimports = sorted({*WORKER_MODULES.values(), *(task.module for task in TASKS)})
+hiddenimports = sorted(
+    {
+        *WORKER_MODULES.values(),
+        *(task.module for task in TASKS),
+        # app.gauge.demo は ``python -m app.gauge.demo`` でしか呼ばれず、WORKER_MODULES
+        # にも TASKS にも載らない（runpy のワーカーでも解析画面のタスクでもない）ので
+        # 静的解析では見つからない。手で足す（本体はまだ別の作業ツリーで作成中だが、
+        # この一覧はビルド時にしか読まれないので先に足してよい）。
+        "app.gauge.demo",
+    }
+)
 
 datas = [
     # 読み取り専用の同梱資産（app.core.resources が解決する）
