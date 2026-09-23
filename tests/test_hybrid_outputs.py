@@ -242,3 +242,23 @@ class TestTorqueVectors:
         assert set(wide.frame) == set(elbow.index), "frame は kpts3d・local_torque と同じ番号"
         row = wide.iloc[10]
         assert row.elbow_R_y == pytest.approx(elbow.loc[int(row.frame), "y"])
+
+
+class TestOfflineWrist:
+    """``OFFLINE_WRIST_CAPTURE=1`` のとき、USB と同じ npy（前腕＝肘→手首 (N,3)、手首の局所 τ_y (N,)）を残す。"""
+
+    def test_the_npy_files(self, tmp_path):
+        session, _ = _session(tmp_path, offline_wrist_capture=True)
+        stamp = _file(session, "frames").stem[len("frames_"):]
+        torques = pd.read_csv(_file(session, "local_torque"))
+        for side in ("R", "L"):
+            forearm = np.load(session.directory / f"forearm_{side}_{stamp}_s2.npy")
+            tau = np.load(session.directory / f"tau_wrist_{side}_{stamp}_s2.npy")
+            wrist = torques[torques.joint == f"wrist_{side}"]
+            assert forearm.shape == (len(wrist), 3) and tau.shape == (len(wrist),)
+            np.testing.assert_allclose(tau, wrist.y.to_numpy(), rtol=1e-9)
+            np.testing.assert_allclose(np.linalg.norm(forearm, axis=1), 0.25, atol=0.02)
+
+    def test_off_by_default(self, tmp_path):
+        session, _ = _session(tmp_path)
+        assert not list(session.directory.glob("*.npy"))

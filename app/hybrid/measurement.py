@@ -87,6 +87,7 @@ class MeasurementSession:
                     dyn_gate=self.config.dyn_gate,
                 ),
                 raw_provenance=self._raw_provenance(measurement),
+                offline_wrist=self.config.offline_wrist_capture,
             )
             self.measurement = measurement
             self.recorder.meta["ekf"] = self.measurement.ekf_provenance()

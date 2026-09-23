@@ -83,6 +83,7 @@ def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementCon
         ekf=EkfSettings.from_env(),
         energy_filter=EnergyFilterConfig.from_env(),
         demo=DemoConfig.from_env() if _flag("DEMO_MONO_GAUGE_ON", False) else None,
+        offline_wrist_capture=_flag("OFFLINE_WRIST_CAPTURE", False),
     )
 
 
