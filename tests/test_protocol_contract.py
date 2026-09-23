@@ -139,6 +139,8 @@ def _pc_samples() -> list[str]:
         p.encode(p.SyncResponse(t1=1_000_000_000, t2=1_000_500_000, t3=1_000_600_000)),
         p.encode(p.CaptureRequest(id=7, at_ns=1_725_699_123_456_789_000)),
         p.encode(p.CaptureRequest(id=8)),
+        # ライブ表示用。縮小と画質の指定が付く。
+        p.encode(p.CaptureRequest(id=9, max_width=640, quality=70)),
     ]
 
 

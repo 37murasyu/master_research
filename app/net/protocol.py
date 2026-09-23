@@ -150,10 +150,16 @@ class CaptureRequest:
     ネットワークの遅延差に関係なく、ほぼ同時のフレームが揃う
     （端末は時刻同期済みなので、自分の時計へ換算できる）。
     省略時は「次のフレーム」。
+
+    ``max_width`` と ``quality`` はライブ表示用。向き合わせを見るだけなら 640 px・画質 70 で
+    足り、全解像度の 1/5 程度の大きさで済む。省略時は全解像度・端末の既定画質（校正用）。
+    古い端末は知らない項目を無視するので、省略時は電文に含めない。
     """
 
     id: int
     at_ns: int | None = None
+    max_width: int | None = None
+    quality: int | None = None
 
 
 @dataclass(frozen=True)
@@ -213,8 +219,10 @@ def encode(message: Message) -> str:
             payload["device_id"] = message.device_id
     elif isinstance(message, CaptureRequest):
         payload = {"type": "capture_req", "id": message.id}
-        if message.at_ns is not None:
-            payload["at_ns"] = message.at_ns
+        for key in ("at_ns", "max_width", "quality"):
+            value = getattr(message, key)
+            if value is not None:
+                payload[key] = value
     elif isinstance(message, CalibrationFrame):
         payload = {
             "type": "calib_frame",
@@ -263,10 +271,16 @@ def decode(raw: str | bytes) -> Message:
             device_id=device_id,
         )
     if kind == "capture_req":
-        at_ns = payload.get("at_ns")
-        if at_ns is not None and (isinstance(at_ns, bool) or not isinstance(at_ns, int)):
-            raise ProtocolError(f"at_ns は整数である必要があります: {at_ns!r}")
-        return CaptureRequest(id=_require_int(payload, "id"), at_ns=at_ns)
+        at_ns = _optional_int(payload, "at_ns")
+        max_width = _optional_int(payload, "max_width")
+        if max_width is not None and max_width <= 0:
+            raise ProtocolError(f"max_width は正の整数である必要があります: {max_width}")
+        quality = _optional_int(payload, "quality")
+        if quality is not None and not 1 <= quality <= 100:
+            raise ProtocolError(f"quality は 1〜100 である必要があります: {quality}")
+        return CaptureRequest(
+            id=_require_int(payload, "id"), at_ns=at_ns, max_width=max_width, quality=quality
+        )
     if kind == "calib_frame":
         return _decode_calibration_frame(payload)
 
@@ -347,6 +361,12 @@ def _require_int(payload: dict[str, Any], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ProtocolError(f"{key} は整数である必要があります: {value!r}")
     return value
+
+
+def _optional_int(payload: dict[str, Any], key: str) -> int | None:
+    if payload.get(key) is None:
+        return None
+    return _require_int(payload, key)
 
 
 def _require_str(payload: dict[str, Any], key: str) -> str:

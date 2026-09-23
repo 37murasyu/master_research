@@ -175,6 +175,30 @@ class TestOutOfOrderAndBounds:
         assert buf.buffered_count("cam0") < 100
         assert buf.buffered_count("cam1") < 100
 
+    def test_one_role_alone_does_not_grow_without_bound(self):
+        """片方がまだ来ていない間も、時間窓より古いものは捨てること。
+
+        混成構成では PC のカメラが先に流れ始め、スマホが QR を読むまで何分も
+        片側だけになる。組めないまま溜め続けると、30fps で 10 分に 18,000 フレーム残る。
+        """
+        buf = SyncBuffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0)
+        for i in range(300):  # 10 秒相当
+            buf.push(_frame("cam0", i, i * 33.3, 0.1))
+            buf.drain()
+        assert buf.buffered_count("cam0") <= 2 * 30 + 2
+
+    def test_pairs_form_once_the_late_role_arrives(self):
+        """捨てたあとでも、遅れて来たロールと直近のフレームで組めること。"""
+        buf = SyncBuffer(target_hz=10.0, window_sec=1.0, max_gap_ms=250.0)
+        for i in range(50):  # cam0 だけ 5 秒
+            buf.push(_frame("cam0", i, i * 100, 0.1))
+            buf.drain()
+        for i in range(45, 50):  # cam1 は最後の 0.5 秒ぶんから
+            buf.push(_frame("cam1", i, i * 100, 0.2))
+        pairs = buf.drain()
+        assert pairs, "遅れて来たロールと組めていない"
+        assert pairs[0].t_ns == 4_500 * MS
+
     def test_frames_older_than_the_window_are_discarded(self):
         buf = SyncBuffer(target_hz=10.0, window_sec=0.5, max_gap_ms=250.0)
         for i in range(20):

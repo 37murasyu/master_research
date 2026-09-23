@@ -155,6 +155,34 @@ class TestCaptureRequest:
         decoded = p.decode('{"type": "capture_req", "id": 7}')
         assert decoded == p.CaptureRequest(id=7, at_ns=None)
 
+    def test_size_and_quality_round_trip(self):
+        """ライブ表示用に小さく軽い JPEG を頼めること。校正は全解像度のまま。"""
+        original = p.CaptureRequest(id=9, max_width=640, quality=70)
+        assert p.decode(p.encode(original)) == original
+
+    def test_size_and_quality_are_omitted_when_unset(self):
+        """古い端末が知らない項目を送らない。"""
+        encoded = p.encode(p.CaptureRequest(id=1))
+        assert "max_width" not in encoded
+        assert "quality" not in encoded
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("max_width", 0),
+            ("max_width", -640),
+            ("max_width", True),
+            ("max_width", 640.5),
+            ("quality", 0),
+            ("quality", 101),
+            ("quality", "90"),
+        ],
+    )
+    def test_rejects_invalid_size_or_quality(self, field, value):
+        payload = {"type": "capture_req", "id": 1, field: value}
+        with pytest.raises(p.ProtocolError):
+            p.decode(json.dumps(payload))
+
 
 class TestCalibrationFrame:
     """端末 → PC の校正用画像。姿勢推定と同じフレームを JPEG で送る。"""

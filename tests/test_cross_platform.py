@@ -38,6 +38,7 @@ IMPORT_SAFE_MODULES = [
     "app.tuning.ekf_likelihood",
     "app.tuning.ekf_estimate",
     "app.tuning.ekf_profile",
+    "app.hybrid.link",
 ]
 
 # Windows でしか存在しないモジュール。使うなら関数内 import か try で囲むこと。

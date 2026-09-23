@@ -335,3 +335,269 @@ class TestHelloScreening:
 
         assert handler.role == "cam0"
         assert handler.rejection is None
+
+
+class TestCloseReason:
+    """close の理由は UTF-8 で 123 バイトまで。超えると相手に 1011 が届き、理由が消える。"""
+
+    def test_long_japanese_reason_fits_in_123_bytes(self):
+        from app.net.server import close_reason
+
+        reason = close_reason("あ" * 60)
+        assert len(reason.encode("utf-8")) <= 123
+        assert reason == "あ" * 41, "文字の途中で切らないこと"
+
+    def test_short_reason_is_unchanged(self):
+        from app.net.server import close_reason
+
+        assert close_reason("QR を読み直してください") == "QR を読み直してください"
+
+
+async def _silent_client(port: int, hello: p.Hello):
+    """名乗った後は何も読まず、close にも応えない端末（電源が落ちた端末の代わり）。
+
+    websockets のクライアントは裏で close に応えてしまうので、生のソケットで
+    ハンドシェイクと 1 通だけを送る。
+    """
+    import base64
+    import os
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    key = base64.b64encode(os.urandom(16)).decode()
+    writer.write(
+        (
+            f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode()
+    )
+    await reader.readuntil(b"\r\n\r\n")
+
+    payload = p.encode(hello).encode()
+    assert len(payload) < 126
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    writer.write(bytes([0x81, 0x80 | len(payload)]) + mask + masked)
+    await writer.drain()
+    return reader, writer
+
+
+async def _closed_code(ws) -> int | None:
+    """相手に閉じられるまで読み捨て、閉じたときのコードを返す。"""
+    import websockets
+
+    try:
+        while True:
+            await asyncio.wait_for(ws.recv(), timeout=5)
+    except websockets.exceptions.ConnectionClosed as exc:
+        return exc.rcvd.code if exc.rcvd is not None else None
+
+
+class TestRemoteRoles:
+    """混成構成では cam0 を PC のカメラが受け持つ。端末には cam1 だけを許す。
+
+    端末が誤って cam0 を名乗ると、PC のカメラと同じ役割の点が 1 つのバッファに
+    混ざり、補間が 2 台のカメラの間を行き来する。値は出るが意味が無い。
+    """
+
+    def test_hello_for_a_local_role_is_rejected(self):
+        handler = SessionHandler(SyncBuffer(), remote_roles=("cam1",))
+
+        handler.handle(p.encode(p.Hello("cam0", "Pixel 7a", "s", "id-0")))
+
+        assert handler.role is None
+        assert handler.rejection is not None and "cam0" in handler.rejection
+
+    def test_frames_for_a_local_role_are_dropped(self):
+        buffer = SyncBuffer(target_hz=10.0)
+        handler = SessionHandler(buffer, remote_roles=("cam1",))
+
+        handler.handle(_landmarks_message("cam0", 0, 0))
+
+        assert buffer.buffered_count("cam0") == 0
+        assert handler.rejected == 1
+
+    def test_frames_must_match_the_announced_role(self):
+        """cam1 と名乗った接続から cam0 の点が来たら使わない。"""
+        buffer = SyncBuffer(target_hz=10.0)
+        handler = SessionHandler(buffer)
+        handler.handle(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
+
+        handler.handle(_landmarks_message("cam0", 0, 0))
+
+        assert buffer.buffered_count("cam0") == 0
+        assert handler.rejected == 1
+
+    def test_local_role_is_closed_with_policy_violation(self):
+        """端末側で理由を表示できるよう、1008 と理由を付けて閉じる。"""
+
+        async def scenario():
+            server = LandmarkServer(
+                host="127.0.0.1", port=0, buffer=SyncBuffer(), remote_roles=("cam1",)
+            )
+            await server.start()
+            try:
+                import websockets
+
+                async with websockets.connect(f"ws://127.0.0.1:{server.port}") as ws:
+                    await ws.send(p.encode(p.Hello("cam0", "Pixel 7a", "s", "id-0")))
+                    return await _closed_code(ws)
+            finally:
+                await server.stop()
+
+        assert asyncio.run(asyncio.wait_for(scenario(), timeout=15)) == 1008
+
+    def test_newer_connection_takes_over_the_role(self):
+        """アプリを入れ直して QR を読み直したとき、古い接続の切断を待たずに使える。"""
+
+        async def scenario():
+            server = LandmarkServer(host="127.0.0.1", port=0, buffer=SyncBuffer())
+            await server.start()
+            try:
+                import websockets
+
+                url = f"ws://127.0.0.1:{server.port}"
+                async with websockets.connect(url) as old, websockets.connect(url) as new:
+                    await old.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-old")))
+                    for _ in range(50):
+                        if server.devices:
+                            break
+                        await asyncio.sleep(0.02)
+                    await new.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-new")))
+                    old_code = await _closed_code(old)
+                    for _ in range(50):
+                        if len(server.stats["roles"]) == 1 and server.stats["clients"] == 1:
+                            break
+                        await asyncio.sleep(0.02)
+                    return old_code, server.devices["cam1"].device_id
+            finally:
+                await server.stop()
+
+        old_code, device_id = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+        assert old_code == 4000
+        assert device_id == "id-new"
+
+    def test_takeover_does_not_wait_for_an_unresponsive_old_phone(self):
+        """後勝ちが要るのは、古い接続の相手がもう応答しないとき（アプリの再起動など）。
+
+        古い接続を閉じ終わるのを待つと、websockets の close_timeout（10 秒）の間、
+        新しい端末の時刻同期が止まる。
+        """
+
+        async def scenario():
+            server = LandmarkServer(host="127.0.0.1", port=0, buffer=SyncBuffer())
+            await server.start()
+            silent = None
+            try:
+                import websockets
+
+                silent = await _silent_client(server.port, p.Hello("cam1", "Pixel 7a", "s", "old"))
+                for _ in range(50):
+                    if server.devices:
+                        break
+                    await asyncio.sleep(0.02)
+
+                async with websockets.connect(f"ws://127.0.0.1:{server.port}") as new:
+                    await new.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "new")))
+                    started = asyncio.get_running_loop().time()
+                    await new.send(p.encode(p.SyncRequest(t1=1)))
+                    await asyncio.wait_for(new.recv(), timeout=8)
+                    return asyncio.get_running_loop().time() - started
+            finally:
+                if silent is not None:
+                    silent[1].close()
+                await server.stop()
+
+        elapsed = asyncio.run(asyncio.wait_for(scenario(), timeout=30))
+        assert elapsed < 1.0, f"時刻同期の応答に {elapsed:.1f} 秒かかった"
+
+
+def _local_frame(t_ns: int, role: str = "cam0") -> p.LandmarkFrame:
+    return p.LandmarkFrame(
+        role=role,
+        seq=0,
+        t_capture_ns=t_ns,
+        width=1280,
+        height=720,
+        landmarks=[(0.5, 0.5, 0.0, 1.0)] * p.LANDMARK_COUNT,
+    )
+
+
+class TestInject:
+    """PC 自身のカメラの点を、端末の点と同じバッファへ入れる口。
+
+    ループのスレッドから呼ぶ前提（同期バッファにロックが無いため）。
+    """
+
+    def test_injected_frames_pair_with_remote_frames(self):
+        async def scenario():
+            pairs: list = []
+            seen: list = []
+            server = LandmarkServer(
+                host="127.0.0.1",
+                port=0,
+                buffer=SyncBuffer(target_hz=10.0, max_gap_ms=250.0),
+                on_pairs=pairs.extend,
+                on_landmarks=seen.append,
+                remote_roles=("cam1",),
+            )
+            await server.start()
+            try:
+                import websockets
+
+                async with websockets.connect(f"ws://127.0.0.1:{server.port}") as cam1:
+                    await cam1.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
+                    for i in range(6):
+                        await cam1.send(_landmarks_message("cam1", i, i * 100_000_000))
+                    for _ in range(50):
+                        if server.stats["frames_received"] == 6:
+                            break
+                        await asyncio.sleep(0.02)
+                    # 端末からはもう何も来ない。注入だけでペアが出ること
+                    for i in range(6):
+                        server.inject(_local_frame(i * 100_000_000))
+                    return pairs, seen
+            finally:
+                await server.stop()
+
+        pairs, seen = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+        assert pairs, "注入したフレームと端末のフレームが組めていない"
+        assert all(set(pair.frames) == {"cam0", "cam1"} for pair in pairs)
+        assert {frame.role for frame in seen} == {"cam0", "cam1"}, "受信も注入も横から見えること"
+
+    def test_inject_refuses_a_remote_role(self):
+        """同じ役割を端末と PC の両方から入れると、補間が 2 台の間を行き来する。"""
+        server = LandmarkServer(buffer=SyncBuffer(), remote_roles=("cam1",))
+        with pytest.raises(ValueError):
+            server.inject(_local_frame(0, role="cam1"))
+
+    def test_inject_refuses_a_malformed_frame(self):
+        """注入は電文の検証を通らない。点数が違えば三角測量の索引がずれる。"""
+        server = LandmarkServer(buffer=SyncBuffer(), remote_roles=("cam1",))
+        frame = p.LandmarkFrame(
+            role="cam0", seq=0, t_capture_ns=0, width=1280, height=720,
+            landmarks=[(0.5, 0.5, 0.0, 1.0)] * 12,
+        )
+        with pytest.raises(ValueError):
+            server.inject(frame)
+
+    def test_capture_request_carries_size_and_quality(self):
+        async def scenario():
+            server = LandmarkServer(host="127.0.0.1", port=0, buffer=SyncBuffer())
+            await server.start()
+            try:
+                import websockets
+
+                async with websockets.connect(f"ws://127.0.0.1:{server.port}") as ws:
+                    await ws.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
+                    for _ in range(50):
+                        if server.devices:
+                            break
+                        await asyncio.sleep(0.02)
+                    await server.request_capture(5, max_width=640, quality=70)
+                    return p.decode(await asyncio.wait_for(ws.recv(), timeout=5))
+            finally:
+                await server.stop()
+
+        request = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+        assert request == p.CaptureRequest(id=5, max_width=640, quality=70)
