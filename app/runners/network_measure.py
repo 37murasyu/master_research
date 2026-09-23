@@ -43,7 +43,9 @@
 from __future__ import annotations
 
 import math
+import time
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
@@ -119,6 +121,8 @@ DEFAULT_GRAVITY = np.asarray(_CONFIG_GRAVITY, dtype=np.float64)
 # 腕の長さの安全策で、長さがずれたフレームの後に積まないフレーム数を含めた幅（そのフレーム＋差分で速度・
 # 加速度にそれを使う後の 2 フレーム）
 _ARM_HISTORY = 3
+# process の時間を中央値・95% の計算に残すフレーム数（30 Hz で 5 分）
+_TIMING_WINDOW = 9000
 
 # リンク定義は config.part_calculations が正本（USB 経路と共通）。
 # ここでは (start, end) のタプル形式に落として使う。
@@ -254,6 +258,11 @@ class NetworkMeasurement:
         # 100 ms を超える抜けで速度の計算をやり直した回数
         self.dynamics_restarts = 0
 
+        # process の時間 [s]（直近 _TIMING_WINDOW フレームと、全体の最大）。meta の timing に残す
+        self._durations: deque[float] = deque(maxlen=_TIMING_WINDOW)
+        self._duration_max = 0.0
+        self._timed = 0
+
         # EKF（app.hybrid.ekf）。無効なら None
         self.ekf = GridEkf(self.config.ekf, self.pose_keypoints) if self.config.ekf.enabled else None
 
@@ -307,6 +316,25 @@ class NetworkMeasurement:
 
     def process(self, pair: PairedSample) -> FrameResult | None:
         """1 ペアを処理する。まだ計算できない段階では None を返す。"""
+        start = time.perf_counter()
+        try:
+            return self._process(pair)
+        finally:
+            elapsed = time.perf_counter() - start
+            self._durations.append(elapsed)
+            self._duration_max = max(self._duration_max, elapsed)
+            self._timed += 1
+
+    def timing(self) -> dict:
+        """process の時間 [ms]（直近の中央値・95%・全体の最大）。受信スレッドの予算は 30 Hz で 33 ms。"""
+        if not self._durations:
+            return {"frames": 0, "median_ms": None, "p95_ms": None, "max_ms": None}
+        recent = np.asarray(self._durations) * 1e3
+        return {"frames": self._timed, "median_ms": float(np.median(recent)),
+                "p95_ms": float(np.percentile(recent, 95)), "max_ms": self._duration_max * 1e3,
+                "window": len(recent)}
+
+    def _process(self, pair: PairedSample) -> FrameResult | None:
         raw = self.points_3d(pair)
         if raw is None:
             return None
@@ -443,6 +471,7 @@ class NetworkMeasurement:
             "dynamics_restarts": self.dynamics_restarts,
             "arm_length_guard": {"tolerance": self.config.arm_length_tolerance,
                                  "rejected_frames": dict(self.arm_guard_rejected)},
+            "timing": self.timing(),
         }
 
     def ekf_provenance(self) -> dict:

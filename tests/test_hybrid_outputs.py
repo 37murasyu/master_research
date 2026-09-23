@@ -143,3 +143,14 @@ class TestRawCapture:
         assert raw.shape == kpts.shape
         assert not np.allclose(raw, kpts, atol=1e-9), "EKF の後の値と同じになっている"
         assert np.nanmax(np.abs(raw - kpts)) < 0.05
+
+
+class TestTiming:
+    """受信スレッドの ``process`` の時間（計画の「速さの予算」）。再生の検証で 95% < 10 ms を確かめるため meta に残す。"""
+
+    def test_the_process_time_is_kept_in_the_meta(self, tmp_path):
+        session, _ = _session(tmp_path)
+        timing = json.loads((session.directory / "meta.json").read_text(encoding="utf-8"))["timing"]
+        assert timing["frames"] == int(round(PushUp(reps=1).duration_s * 30))
+        assert 0.0 < timing["median_ms"] <= timing["p95_ms"] <= timing["max_ms"]
+        assert timing["p95_ms"] < 50.0
