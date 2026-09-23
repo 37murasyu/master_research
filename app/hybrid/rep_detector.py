@@ -72,8 +72,6 @@ class RepDetector:
             raise ValueError(f"基準の高さが有限でない: {baseline_m!r}")
         self.baseline_m = base
         self.config = config or RepConfig()
-        self.reps = 0
-        self.discarded = 0
         self._open = False
         self._elapsed = 0.0
         self._max_lift = 0.0
@@ -86,15 +84,6 @@ class RepDetector:
     @property
     def is_open(self) -> bool:
         return self._open
-
-    @property
-    def open_elapsed_s(self) -> float:
-        return self._elapsed if self._open else 0.0
-
-    @property
-    def max_lift_m(self) -> float:
-        """開いている回の最大の持ち上げ [m]（閉じていれば 0）。"""
-        return self._max_lift if self._open else 0.0
 
     def _own_speed(self, height: float, dt: float) -> float | None:
         """直近の窓の高さの最小二乗の傾き [m/s]。3 点に満たなければ None（速さの条件を使わない）。"""
@@ -153,8 +142,4 @@ class RepDetector:
         self._max_lift = 0.0
         self._in_band = 0
         self._fast = 0
-        if lifted:
-            self.reps += 1
-            return RepEvent.CLOSED
-        self.discarded += 1
-        return RepEvent.DISCARDED
+        return RepEvent.CLOSED if lifted else RepEvent.DISCARDED

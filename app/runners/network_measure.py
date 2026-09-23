@@ -62,7 +62,7 @@ from body_part_storage_module import BodyPartDataStorage
 from config import G_SCALAR, INERTIA_LENGTH_FRAMES, SEGMENT_MASS_FRACTIONS
 from config import part_calculations
 from config import part_keys as _PART_KEYS
-from config import slot_of
+from config import MP_LANDMARK, slot_of
 from link_vector_calculator_module import LinkVectorCalculator
 from push_up_model import (
     ARM_PARTS,
@@ -102,6 +102,13 @@ def _translate_image(P: np.ndarray, shift: np.ndarray) -> np.ndarray:
     S = np.array([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]], [0.0, 0.0, 1.0]])
     return S @ P
 
+def _median_segment(frames: np.ndarray, ia: int, ib: int) -> float:
+    """点列 (フレーム, 点, 3) の点 ``ia``–``ib`` の距離の中央値（有限のフレームだけ）。1 つも無ければ NaN。"""
+    lengths = np.linalg.norm(frames[:, ia] - frames[:, ib], axis=1)
+    lengths = lengths[np.isfinite(lengths)]
+    return float(np.median(lengths)) if lengths.size else float("nan")
+
+
 __all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig", "ImplausibleBodyScale", "EXIT_IMPLAUSIBLE_SCALE"]
 
 # 体格の検査で止めたときの終了コード（USB 経路の EXIT_IMPLAUSIBLE_SCALE と同じ。解像度の不一致と共用し、meta の error で見分ける）
@@ -132,6 +139,14 @@ PART_LINKS: dict[str, tuple[int, int]] = {
 PART_KEYS = tuple(_PART_KEYS)
 # ゲージに出す部位（肩は出さない）。ゲージの行の書式が正本
 GAUGE_PARTS = PART_NAMES
+
+# 毎フレーム引き直さない位置索引と部位名
+# 腕の力学に要る部位データ（どれかが無ければ _dynamics は None）
+_DYN_NEEDED = tuple(part for parts in ARM_PARTS.values() for part in parts.values()) + ("both_shoulder",)
+# 側 → (肩, 肘, 手首) の位置索引
+_ARM_SLOTS = {side: tuple(slot_of(f"{side}_{n}") for n in ("SHOULDER", "ELBOW", "WRIST")) for side in ("L", "R")}
+# 左右の肩の位置索引（高さ = 肩の中点）
+_SHOULDER_SLOTS = (slot_of("L_SHOULDER"), slot_of("R_SHOULDER"))
 
 
 @dataclass
@@ -392,9 +407,10 @@ class NetworkMeasurement:
             result.arm_ok = self._arm_ok(points)
             if dynamics is not None:
                 result.local_torques, result.powers, theta, tau_y = dynamics
-                angles = [v for v in theta.values() if math.isfinite(v)]
-                if angles:
-                    self._cutoff.step(float(np.mean(angles)))
+                if self.config.energy_filter.fc_adaptive_on:   # 適応がオフなら fc は固定（step は何もしない）
+                    angles = [v for v in theta.values() if math.isfinite(v)]
+                    if angles:
+                        self._cutoff.step(float(np.mean(angles)))
                 sample = self._guarded_sample(
                     WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y), result.arm_ok)
             self._gate(points, velocity, dt, sample, result)
@@ -571,15 +587,12 @@ class NetworkMeasurement:
         points = np.stack(point_frames)
 
         def ref_length(pair) -> float:
-            first, second = (self._keypoints_in_id_order.index(i) for i in pair)
-            lengths = np.linalg.norm(raw[:, first] - raw[:, second], axis=1)
-            lengths = lengths[np.isfinite(lengths)]
-            return float(np.median(lengths)) if lengths.size else float("nan")
+            return _median_segment(raw, *(self._keypoints_in_id_order.index(i) for i in pair))
 
         # 右の肩–肘（SCALE_REF_PAIR）が見えないときは左の肩–肘で確かめる（窓の予備で閉じたとき）
         run_length = ref_length(SCALE_REF_PAIR)
         if not math.isfinite(run_length):
-            run_length = ref_length((11, 13))
+            run_length = ref_length((MP_LANDMARK["L_SHOULDER"], MP_LANDMARK["L_ELBOW"]))
         noise = None if self.ekf is None else self.ekf.noise
         scale_ref = noise.resolution.scale_ref if noise is not None and noise.origin == "profile" else None
         try:
@@ -595,9 +608,8 @@ class NetworkMeasurement:
         self.baseline_height_m = float(np.nanmedian(shoulders @ self.up))
 
         def median_length(a: str, b: str) -> float | None:
-            lengths = np.linalg.norm(points[:, slot_of(a)] - points[:, slot_of(b)], axis=1)
-            lengths = lengths[np.isfinite(lengths)]
-            return float(np.median(lengths)) if lengths.size else None
+            length = _median_segment(points, slot_of(a), slot_of(b))
+            return length if math.isfinite(length) else None
 
         self.forearm_m = {side: median_length(f"{side}_ELBOW", f"{side}_WRIST") for side in ("L", "R")}
         self.upper_arm_m = {side: median_length(f"{side}_SHOULDER", f"{side}_ELBOW") for side in ("L", "R")}
@@ -634,8 +646,7 @@ class NetworkMeasurement:
         mass = self.config.body_mass_kg
 
         def length(a: str, b: str) -> float:
-            ia, ib = slot_of(a), slot_of(b)
-            return float(np.nanmedian(np.linalg.norm(samples[:, ia] - samples[:, ib], axis=1)))
+            return _median_segment(samples, slot_of(a), slot_of(b))
 
         self._inertia = {
             "upper_arm_R": calculate_inertia_tensor(3, mass, length("R_SHOULDER", "R_ELBOW")),
@@ -659,8 +670,7 @@ class NetworkMeasurement:
     def _dynamics(self, points: np.ndarray):
         """局所トルク・仕事率・肘角 θ・肘の τ_y。部位データが揃わなければ None。"""
         data = {name: self.storage.get_data(name) for name in PART_LINKS}
-        needed = [part for parts in ARM_PARTS.values() for part in parts.values()] + ["both_shoulder"]
-        if any(not data[name] for name in needed):
+        if any(not data[name] for name in _DYN_NEEDED):
             return None
 
         mass = self.config.body_mass_kg
@@ -674,15 +684,13 @@ class NetworkMeasurement:
         theta: dict[str, float] = {}
         tau_y: dict[str, float] = {}
         for side, parts in ARM_PARTS.items():
+            shoulder, elbow, wrist = (points[i] for i in _ARM_SLOTS[side])
             forearm = segment_from_storage(
                 data[parts["forearm"]][-1], self._inertia[f"forearm_{side}"], mass * SEGMENT_MASS_FRACTIONS["forearm"])
             upper_arm = segment_from_storage(
                 data[parts["upper_arm"]][-1], self._inertia[f"upper_arm_{side}"],
                 mass * SEGMENT_MASS_FRACTIONS["upper_arm"])
-            torques = push_up_torques(
-                forearm, upper_arm,
-                points[slot_of(f"{side}_WRIST")], points[slot_of(f"{side}_ELBOW")],
-                points[slot_of(f"{side}_SHOULDER")], gravity, load, hand)
+            torques = push_up_torques(forearm, upper_arm, wrist, elbow, shoulder, gravity, load, hand)
             axes = arm_axes(points, side)
             for joint, torque in torques.items():
                 key = f"{joint}_{side}"
@@ -694,7 +702,6 @@ class NetworkMeasurement:
             for joint, power in powers.items():
                 powers_by_key[f"{joint}_{side}"] = float(power)
             # 肘の濾波 E± の材料（USB と同じ θ = 肩→肘 と 肘→手首 のなす角、τ_y は肘の局所トルクの y）
-            shoulder, elbow, wrist = (points[slot_of(f"{side}_{n}")] for n in ("SHOULDER", "ELBOW", "WRIST"))
             theta[f"elbow_{side}"] = angle_between(elbow - shoulder, wrist - elbow)
             tau_y[f"elbow_{side}"] = float(local[f"elbow_{side}"][1])
         return {key: local[key] for key in PART_KEYS}, powers_by_key, theta, tau_y
@@ -708,13 +715,13 @@ class NetworkMeasurement:
         if tolerance <= 0 or not self.window_closed:
             return {"L": True, "R": True}
         ok = {}
-        for side in ("L", "R"):
+        for side, (shoulder, elbow, wrist) in _ARM_SLOTS.items():
             good = True
-            for (a, b), reference in (((f"{side}_SHOULDER", f"{side}_ELBOW"), self.upper_arm_m.get(side)),
-                                      ((f"{side}_ELBOW", f"{side}_WRIST"), self.forearm_m.get(side))):
+            for (a, b), reference in (((shoulder, elbow), self.upper_arm_m.get(side)),
+                                      ((elbow, wrist), self.forearm_m.get(side))):
                 if reference is None or not math.isfinite(reference) or reference <= 0:
                     continue   # 窓で長さを決められなかった腕は検査しない
-                length = float(np.linalg.norm(points[slot_of(a)] - points[slot_of(b)]))
+                length = float(np.linalg.norm(points[a] - points[b]))
                 if not (math.isfinite(length) and abs(length / reference - 1.0) <= tolerance):
                     good = False
             self._arm_clean[side] = self._arm_clean[side] + 1 if good else 0
@@ -743,7 +750,7 @@ class NetworkMeasurement:
         """肩の中点の上向き成分（位置なら高さ [m]、速度なら上向きの速さ [m/s]）。"""
         if vectors is None or self.up is None:
             return float("nan")
-        mid = 0.5 * (vectors[slot_of("L_SHOULDER")] + vectors[slot_of("R_SHOULDER")])
+        mid = 0.5 * (vectors[_SHOULDER_SLOTS[0]] + vectors[_SHOULDER_SLOTS[1]])
         return float(mid @ self.up)
 
     def _gate(self, points: np.ndarray, velocity: np.ndarray | None, dt: float,
@@ -758,17 +765,16 @@ class NetworkMeasurement:
             speed = self._height(velocity) if velocity is not None else None
             event = detector.update(result.height_m, speed, dt)
         if event is RepEvent.OPENED and gate:
-            for held in self.rep_work.release():
-                self._feed_tracker(held)
+            self.rep_work.release()
         is_open = (not gate) or (detector is not None and detector.is_open) \
             or event in (RepEvent.CLOSED, RepEvent.DISCARDED)
         result.dyn_active = is_open
         if sample is not None:
             if is_open:
-                if self.rep_work.add(sample):
-                    self._feed_tracker(sample)
+                self.rep_work.add(sample)
             else:
                 self.rep_work.hold(sample)
+        self._sync_tracker()
         if event is RepEvent.CLOSED:
             self._close_rep(result)
         elif event is RepEvent.DISCARDED and gate:
@@ -797,13 +803,12 @@ class NetworkMeasurement:
         work = self.rep_work.work()
         return {part: work[part].pos for part in GAUGE_PARTS}
 
-    def _feed_tracker(self, sample: WorkSample) -> None:
+    def _sync_tracker(self) -> None:
+        """ゲージの now に今の回の W+ を置く。積むのは ``rep_work`` だけ（同じフレーム・同じ順で積むので値は同じ）。"""
         if self.tracker is None or self._demo is not None:
             return
-        for part in self.tracker.parts:
-            power = sample.powers.get(part)
-            if power is not None:
-                self.tracker.add(part, power, sample.dt)
+        work = self.rep_work.work()
+        self.tracker.set_now({part: work[part].pos for part in self.tracker.parts if part in work})
 
     def _close_rep(self, result: FrameResult) -> None:
         """今の回を確定する。仕事はフレームごとの dt で積んだ値（``rep_work``）。"""

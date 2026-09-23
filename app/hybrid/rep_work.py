@@ -23,12 +23,14 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
+from app.hybrid.rep_detector import RepConfig
+
 __all__ = ["MAX_STEP_S", "LOOKAHEAD_FRAMES", "MAX_SERIES", "WorkSample", "PartWork", "RepAccumulator"]
 
 # これより長い dt のフレームは積まない [s]。同期バッファが補間で埋める穴の上限（max_gap_ms=100）と同じ
 MAX_STEP_S = 0.1
-# 関所が開く前の輪の長さ（フレーム）
-LOOKAHEAD_FRAMES = 5
+# 関所が開く前の輪の長さ（フレーム）。回の区切りの先読みの幅（RepConfig.lookback_frames）が正本
+LOOKAHEAD_FRAMES = RepConfig().lookback_frames
 # θ・τ_y の列の上限（30 Hz で 60 秒）
 MAX_SERIES = 30 * 60
 
@@ -108,7 +110,7 @@ class RepAccumulator:
             self._held.append(sample)
 
     def release(self) -> list[WorkSample]:
-        """輪のフレームを積み、実際に積んだものを返す（呼び出し側がゲージにも同じものを足す）。"""
+        """輪のフレームを積み、実際に積んだものを返す。"""
         held = list(self._held)
         self._held.clear()
         return [sample for sample in held if self.add(sample)]

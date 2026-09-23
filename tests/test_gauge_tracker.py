@@ -3,7 +3,7 @@
 **なぜこのテストがあるか。**
 
 ゲージの値は今の回の正の仕事 W_pos = Σmax(P, 0)·dt（論文の定義、設計書 §6.4）。受信スレッド
-（PhoneLink の on_pairs）が仕事を積み、メインスレッド（LiveSession.step の周回）が行を書くので、
+（PhoneLink の on_pairs）が計測の積んだ仕事を置き、メインスレッド（LiveSession.step の周回）が行を書くので、
 状態はロック 1 つで守り、snapshot は中身の写しを返す（書いている途中の辞書を encode しない）。
 
 行は ``sys.stdout.write`` の 1 回で書く。``print`` は本体と改行を別々に書くので、受信スレッドの
@@ -35,38 +35,37 @@ def _bands():
     )
 
 
-class TestAccumulate:
-    def test_only_the_positive_power_is_integrated(self):
-        """W_pos = Σmax(P, 0)·dt。下ろす局面の負の仕事で値が減らない。"""
+class TestSetNow:
+    """now は計測（``rep_work`` の W+ = Σmax(P, 0)·dt）かデモが置く。積むのは tracker ではない。"""
+
+    def test_set_now_places_the_values(self):
         t = GaugeTracker()
-        t.add("elbow_L", 30.0, 0.1)
-        t.add("elbow_L", -50.0, 0.1)
-        t.add("elbow_L", 10.0, 0.05)
-        assert t.values()["elbow_L"] == pytest.approx(3.5)
+        t.set_now({"elbow_L": 3.5})
+        assert t.values()["elbow_L"] == 3.5
         assert t.values()["elbow_R"] == 0.0
 
-    @pytest.mark.parametrize("power, dt", [(math.nan, 0.1), (10.0, 0.0), (10.0, -0.1), (10.0, math.nan), (math.inf, 0.1)])
-    def test_bad_samples_are_ignored(self, power, dt):
-        """NaN のトルク・逆行や 0 の dt は積まない（1 回の NaN で回全体が NaN にならない）。"""
+    @pytest.mark.parametrize("value", [math.nan, math.inf, None, "x"])
+    def test_bad_values_are_ignored(self, value):
+        """NaN・非有限の値は置かない（1 回の NaN で now が NaN にならない）。"""
         t = GaugeTracker()
-        t.add("wrist_R", 5.0, 0.1)
-        t.add("wrist_R", power, dt)
+        t.set_now({"wrist_R": 0.5})
+        t.set_now({"wrist_R": value})
         assert t.values()["wrist_R"] == pytest.approx(0.5)
 
     def test_an_unknown_part_is_ignored(self):
         t = GaugeTracker()
-        t.add("shoulder_L", 100.0, 1.0)
+        t.set_now({"shoulder_L": 100.0})
         assert set(t.values()) == set(PARTS)
         assert all(v == 0.0 for v in t.values().values())
 
     def test_a_subset_of_parts(self):
         t = GaugeTracker(parts=("elbow_L",))
-        t.add("elbow_R", 10.0, 1.0)
+        t.set_now({"elbow_R": 10.0})
         assert t.values() == {"elbow_L": 0.0}
 
     def test_set_now_overwrites_the_values_for_the_demo(self):
         t = GaugeTracker(source="demo")
-        t.add("elbow_L", 10.0, 1.0)
+        t.set_now({"elbow_L": 10.0})
         t.set_now({"elbow_L": 42.0, "wrist_L": 3.0, "unknown": 1.0})
         assert t.values() == {"elbow_L": 42.0, "elbow_R": 0.0, "wrist_L": 3.0, "wrist_R": 0.0}
 
@@ -74,12 +73,12 @@ class TestAccumulate:
 class TestReps:
     def test_close_rep_moves_now_to_prev(self):
         t = GaugeTracker()
-        t.add("elbow_L", 20.0, 1.0)
+        t.set_now({"elbow_L": 20.0})
         t.close_rep()
         frame = t.snapshot()
         assert frame.rep == 1
         assert frame.parts["elbow_L"] == PartReading(now=0.0, prev=20.0, band=None, w1rm=None)
-        t.add("elbow_L", 5.0, 1.0)
+        t.set_now({"elbow_L": 5.0})
         t.close_rep()
         assert t.snapshot().parts["elbow_L"].prev == 5.0
         assert t.snapshot().rep == 2
@@ -87,9 +86,9 @@ class TestReps:
     def test_discard_rep_keeps_prev_and_the_count(self):
         """押し上げでなかった回は数えない。直前の回の値（prev）も消さない。"""
         t = GaugeTracker()
-        t.add("elbow_L", 20.0, 1.0)
+        t.set_now({"elbow_L": 20.0})
         t.close_rep()
-        t.add("elbow_L", 7.0, 1.0)
+        t.set_now({"elbow_L": 7.0})
         t.discard_rep()
         frame = t.snapshot()
         assert frame.rep == 1
@@ -132,7 +131,7 @@ class TestSnapshot:
     def test_the_snapshot_is_a_copy(self):
         t = GaugeTracker()
         frame = t.snapshot()
-        t.add("elbow_L", 10.0, 1.0)
+        t.set_now({"elbow_L": 10.0})
         assert frame.parts["elbow_L"].now == 0.0
 
     def test_link_accepts_a_bool_or_a_state(self):
@@ -156,15 +155,15 @@ class TestSnapshot:
 
 
 class TestThreads:
-    def test_adds_from_another_thread_are_not_lost(self):
-        """受信スレッドが 1 万回積む間にメインスレッドが snapshot しても、合計が合う。"""
+    def test_updates_from_another_thread_are_not_lost(self):
+        """受信スレッドが 1 万回置く間にメインスレッドが snapshot しても、合計が合う。"""
         t = GaugeTracker()
         n = 10_000
 
         def worker():
-            for _ in range(n):
-                t.add("elbow_L", 3.0, 0.01)
-                t.add("wrist_R", 1.0, 0.01)
+            for k in range(1, n + 1):
+                t.set_now({"elbow_L": 0.03 * k})
+                t.set_now({"wrist_R": 0.01 * k})
 
         th = threading.Thread(target=worker)
         th.start()
@@ -231,11 +230,11 @@ class TestTicker:
         t.set_bands(_bands())
         t.set_link("connected")
         for part in PARTS:
-            t.add(part, 123456.789, 1.0)
+            t.set_now({part: 123456.789})
         for _ in range(9999):
             t.close_rep()
         for part in PARTS:
-            t.add(part, 98765.4321, 1.0)
+            t.set_now({part: 98765.4321})
         written: list[str] = []
         GaugeTicker(t, write=written.append, flush=lambda: None).tick()
         assert len(written[0].encode("utf-8")) < 512
@@ -247,9 +246,9 @@ class TestContract:
         t = GaugeTracker()
         t.set_bands(_bands())
         t.set_link("connected")
-        t.add("elbow_L", 50.0, 1.0)
+        t.set_now({"elbow_L": 50.0})
         t.close_rep()
-        t.add("elbow_L", 12.34, 1.0)
+        t.set_now({"elbow_L": 12.34})
         frame = protocol.decode(protocol.encode(t.snapshot()))
         assert frame is not None
         assert tuple(frame.parts) == PARTS

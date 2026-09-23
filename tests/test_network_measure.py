@@ -445,3 +445,32 @@ class TestWorkUsesEachFramesDt:
         assert result.cycle_work_j["wrist_L"] == pytest.approx(expected)
         assert measurement.cycle_work["wrist_L"] == [pytest.approx(expected)]
         assert measurement.rep_work.work()["wrist_L"].net == 0.0, "確定したら 0 から積み直す"
+
+
+class TestGaugeFollowsRepWork:
+    """ゲージの now は ``rep_work`` の W+ を置いたもの（積むのは rep_work だけ）。
+
+    かつては tracker も同じフレームを同じ順で Σmax(P, 0)·dt に積んでいた（二重の積算）。置くだけにしても値が
+    変わらないことを、押し上げ 2 回（関所の先読みの流し込みを含む）で毎フレーム確かめる。
+    """
+
+    def test_now_equals_the_positive_work_and_prev_the_closed_rep(self):
+        import warnings
+
+        from app.gauge.tracker import GaugeTracker
+        from hybrid_pushup import PushUp, pushup_pairs
+
+        tracker = GaugeTracker()
+        P0, P1 = _stereo_projections()
+        measurement = NetworkMeasurement(P0, P1, POSE_KEYPOINTS, MeasurementConfig(body_mass_kg=65.0),
+                                         tracker=tracker)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for pair in pushup_pairs(measurement, PushUp(reps=2)):
+                result = measurement.process(pair)
+                work = measurement.rep_work.work()
+                assert tracker.values() == {part: work[part].pos for part in tracker.parts}
+                if result is not None and result.cycle_detected:
+                    prev = tracker.snapshot().parts
+                    assert all(prev[p].prev == result.cycle_parts[p].pos for p in tracker.parts)
+        assert measurement.cycle_count == 2

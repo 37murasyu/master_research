@@ -72,12 +72,12 @@ class TestPushUps:
         assert _count(events, RepEvent.OPENED) == 3
         assert _count(events, RepEvent.CLOSED) == 3
         assert _count(events, RepEvent.DISCARDED) == 0
-        assert det.reps == 3 and not det.is_open
+        assert not det.is_open
 
     def test_the_detector_can_estimate_the_speed_itself(self):
         """速さを渡さなければ（None）、高さの差分を平滑して使う。回の数は変わらない。"""
-        det, events, _ = _run(_pushups(3, 0.13), speed=None, noise=0.001)
-        assert _count(events, RepEvent.CLOSED) == 3 and det.reps == 3
+        _, events, _ = _run(_pushups(3, 0.13), speed=None, noise=0.001)
+        assert _count(events, RepEvent.CLOSED) == 3
 
     def test_a_fast_lift_opens_before_two_centimetres(self):
         """速い持ち上げは高さの条件（+2 cm）より前に速さで開く（押し上げの出だしの仕事を落とさない）。"""
@@ -111,8 +111,8 @@ class TestPushUps:
 class TestNotAPushUp:
     def test_sitting_with_3mm_noise_for_60_seconds_is_no_rep(self):
         """座ったまま σ 3 mm の雑音（生の差分の速さは σ≈0.13 m/s）でも回は 1 つも閉じない。"""
-        det, events, _ = _run(_rest(60.0), noise=0.003)
-        assert _count(events, RepEvent.CLOSED) == 0 and det.reps == 0
+        _, events, _ = _run(_rest(60.0), noise=0.003)
+        assert _count(events, RepEvent.CLOSED) == 0
 
     def test_sitting_with_the_detectors_own_speed_does_not_even_open(self):
         """検出器が平滑した速さなら、雑音で開きもしない（ゲージの now がちらつかない）。"""
@@ -122,10 +122,10 @@ class TestNotAPushUp:
     def test_a_quick_15mm_bob_is_discarded(self):
         """速い 1.5 cm の揺れは速さで開くが、持ち上げが 3 cm に届かないので捨てる。"""
         rise = np.concatenate([_rest(1.0), _ramp(0.015, 0.12), _ramp(0.015, 0.12, up=False), _rest(1.0)])
-        det, events, _ = _run(rise)
+        _, events, _ = _run(rise)
         assert _count(events, RepEvent.OPENED) == 1
         assert _count(events, RepEvent.DISCARDED) == 1
-        assert _count(events, RepEvent.CLOSED) == 0 and det.reps == 0 and det.discarded == 1
+        assert _count(events, RepEvent.CLOSED) == 0
 
     def test_a_slow_15mm_sway_does_not_open(self):
         rise = np.concatenate([_rest(1.0), _ramp(0.015, 1.5), _ramp(0.015, 1.5, up=False), _rest(1.0)])
@@ -162,7 +162,6 @@ class TestRobustness:
         det = RepDetector(BASE)
         det.update(BASE + 0.05, 0.0, DT)
         assert det.update(BASE + 0.05, 0.0, 31.0) is RepEvent.CLOSED
-        assert det.reps == 1
 
     def test_an_open_rep_closes_after_30_seconds(self):
         """持ち上げたまま戻らなくても 30 s で閉じる（ゲージが永久に開いたままにならない）。"""
@@ -170,7 +169,6 @@ class TestRobustness:
         events = [det.update(BASE + 0.06, 0.0, DT) for _ in range(int(35.0 / DT))]
         closed = events.index(RepEvent.CLOSED)
         assert closed * DT == pytest.approx(30.0, abs=0.1)
-        assert det.reps >= 1
 
     def test_min_open_time(self):
         """開いてから 0.3 s は閉じない（押し上げの出だしで高さがまだ基準の近くにあるため）。"""

@@ -1,7 +1,8 @@
 """子プロセス側のゲージの状態と、@@GAUGE の行の書き出し。
 
-値は今の回の正の仕事 W_pos = Σmax(P, 0)·dt [J]（論文の定義、設計書 §6.4）。受信スレッド（PhoneLink の
-on_pairs）が ``add`` で積み、メインスレッド（子のメインループ）が ``GaugeTicker.tick`` で行を書く。
+値は今の回の正の仕事 W_pos = Σmax(P, 0)·dt [J]（論文の定義、設計書 §6.4）。積むのは計測の
+``app.hybrid.rep_work.RepAccumulator`` で、受信スレッド（PhoneLink の on_pairs）がその値を ``set_now`` で置き、
+メインスレッド（子のメインループ）が ``GaugeTicker.tick`` で行を書く。
 状態はロック 1 つで守り、``snapshot`` は写し（``protocol.GaugeFrame``）を返す。
 
 行は ``sys.stdout.write`` の 1 回で書く。``print`` は本体と改行を別々に書くので、受信スレッドの
@@ -55,19 +56,8 @@ class GaugeTracker:
         with self._lock:
             return self._rep
 
-    def add(self, part: str, power_w: float, dt_s: float) -> None:
-        """now += max(P, 0)·dt。NaN・非有限・dt ≤ 0・対象外の部位は無視する。"""
-        p = _finite(power_w)
-        dt = _finite(dt_s)
-        if p is None or dt is None or dt <= 0.0 or part not in self._now:
-            return
-        if p <= 0.0:
-            return
-        with self._lock:
-            self._now[part] += p * dt
-
     def set_now(self, values: Mapping[str, float]) -> None:
-        """今の回の値を直接置く（デモ用）。対象外の部位・非有限の値は無視する。"""
+        """今の回の値を置く（計測は ``rep_work`` の W+、デモは置く値）。対象外の部位・非有限の値は無視する。"""
         with self._lock:
             for part, value in values.items():
                 v = _finite(value)
