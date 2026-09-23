@@ -123,3 +123,9 @@ Task 13: cloud DONE（e445ffe..151e5a4: 6468499 本体、151e5a4 修正）、rev
 Task 13: complete（cloud 6468499+151e5a4）— review Approved。Minor parked: J スイッチは窓が閉じていても set_show_joules を呼ぶ（安全）／開始後の役割切替の試験なし（実行中はラジオが無効なので経路が無い）
 Task 14: cloud DONE（4dab0ed..c35623f）、review dispatched
 Minor（Task 12）解消: d5e1754 worker.py の docstring
+Task 15: cloud DONE（e472725）— murayama/gauge-measure-page を subject-gauge へ merge
+Task 16: cloud で仕上げ。校正の日時と「変更」リンク（2165f45、止まった実装担当の WIP をそのまま採用）に、件数バッジ・ログの「未実行」・J スイッチの即時保存を足した
+- Ruling 17: 件数バッジは「実験者用の詳細設定」と入れ子の「開発・診断用」の両方の見出しに出す — 設計書 §5.2 は外側の開示の見出しを指すが、該当の設定は入れ子の中にあり、入れ子が閉じていても場所がわかるように — 誤りなら _refresh_broken_flags の 1 行を消すだけ
+- Ruling 18: 即時保存は計画どおり J スイッチだけ（ほかの欄は従来どおり窓を閉じるときに保存）— 計画書 Task 16 の範囲 — 誤りなら他の欄の変更で settings_edited を出す数行
+Test（cloud・Linux）: 1400 passed / 12 failed。12 件は変更前の HEAD でも同じく落ちる環境差（mediapipe 無し、GUI 無しの cv2、フォント差での widget の画素比較）
+残り: Task 18（.app の確認）は Mac で controller が行う

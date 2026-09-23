@@ -56,6 +56,8 @@ class MainWindow(QtWidgets.QMainWindow):
         measure.calibration_requested.connect(
             lambda: self._nav.setCurrentRow(self._pages.index(calibrate))
         )
+        # スイッチの切り替えは、窓を閉じるのを待たずにその場で保存する
+        measure.settings_edited.connect(self._save_settings)
         self._nav.currentRowChanged.connect(self._stack.setCurrentIndex)
         self._nav.setCurrentRow(0)
 
@@ -95,12 +97,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for page in self._pages:
             page.shutdown()
 
+        self._save_settings()  # 保存できなくても終了は妨げない
+        event.accept()
+
+    def _save_settings(self) -> None:
         try:
             self._settings.save(self._settings_path)
         except OSError:
-            pass  # 設定が保存できなくても終了は妨げない
-
-        event.accept()
+            pass
 
 
 def run_gui(argv: list[str] | None = None) -> int:

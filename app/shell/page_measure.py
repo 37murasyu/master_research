@@ -12,6 +12,8 @@
 設定は「実験者用の詳細設定」の開示（既定で閉じる。R11-03）にしまう。中身は入力のラジオ、被験者番号、
 体重、使う校正の日時と「変更」リンク（混成のときだけ）、「開発・診断用」の入れ子の開示（残りの
 設定フォーム）。画面に説明文は置かない。出力先は、終わった後の「出力フォルダ」リンクで開く。
+計算を壊す設定（``app_default`` で既定を無効にした 4 つ）が有効なら、その件数を開示の見出しに出す
+（R20-03）。ログは、まだ何も流れていないうちは「未実行」と出す（R19-01）。
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import json
 from datetime import datetime
 
 from app.core.qt import QtCore, QtGui, QtWidgets
-from app.core.settings import Settings, measurement_output_dir
+from app.core.settings import SCHEMA, Settings, measurement_output_dir
 from app.gauge.protocol import GaugeFrame
 from app.gauge.window import GaugeWindow
 from app.hybrid import paths as hybrid_paths
@@ -52,12 +54,27 @@ def calibration_time_text() -> str:
     return taken.strftime("%Y-%m-%d %H:%M")
 
 
+def broken_flag_count(settings: Settings) -> int:
+    """アプリが既定で無効にした設定（``app_default`` を持つもの）のうち、有効になっている数。
+
+    どれも有効だと計算が壊れる（``settings.CURATED`` の (a)）。
+    """
+    return sum(
+        1 for setting in SCHEMA.values()
+        if setting.app_default is not None
+        and settings.get(setting.name)
+        and setting.name in settings.overrides
+    )
+
+
 class MeasurePage(RunnerPage):
     TITLE = "リアルタイム計測"
     LOG_LABEL = "計測ログ"
 
     # 「変更」リンク（校正）。MainWindow がキャリブレーション画面へ移る
     calibration_requested = QtCore.Signal()
+    # その場で保存したい設定の変更（「J の数値」スイッチ）。MainWindow が設定を保存する
+    settings_edited = QtCore.Signal()
 
     def __init__(self, settings: Settings, parent: QtWidgets.QWidget | None = None):
         # RunnerPage.__init__ が _on_state を呼ぶので、そこで触るものは先に作っておく。
@@ -73,6 +90,8 @@ class MeasurePage(RunnerPage):
         # 見せるかどうかは、ページに入ってから決める（親の無いうちに見せると独立の窓になる）。
         self._sync_input_widgets()
         self._badge.hide()  # 色だけで状態を示すバッジ。代わりに _run_status を出す
+        self._log.setPlaceholderText("未実行")
+        self._refresh_broken_flags()
 
         self._runner.gauge_frame.connect(self._gauge_window.set_frame)
         self._runner.gauge_frame.connect(self._on_gauge_frame)
@@ -184,6 +203,7 @@ class MeasurePage(RunnerPage):
         self._rows.addRow("校正", self._calibration_row)
 
         self._form = SettingsForm(self._settings, exclude=_DEDICATED_SETTINGS)
+        self._form.changed.connect(self._refresh_broken_flags)
         self._dev = Disclosure("開発・診断用", self._form)
 
         content = QtWidgets.QWidget()
@@ -238,6 +258,7 @@ class MeasurePage(RunnerPage):
     def _on_joules_toggled(self, checked: bool) -> None:
         self._settings.set("GAUGE_SHOW_JOULES", checked)
         self._gauge_window.set_show_joules(checked)
+        self.settings_edited.emit()
 
     def _on_input_toggled(self, button_id: int, checked: bool) -> None:
         if not checked:
@@ -257,6 +278,12 @@ class MeasurePage(RunnerPage):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
 
     # -- 表示更新 ----------------------------------------------------------
+    def _refresh_broken_flags(self) -> None:
+        # 計算を壊す設定は入れ子の「開発・診断用」にあるので、閉じていても見えるよう両方の見出しに出す
+        n = broken_flag_count(self._settings)
+        self._advanced.set_badge(n)
+        self._dev.set_badge(n)
+
     def _on_state(self, state: str) -> None:
         super()._on_state(state)
         running = state in ("starting", "running")
