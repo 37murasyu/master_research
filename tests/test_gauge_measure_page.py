@@ -56,8 +56,8 @@ def page(qt_app, settings):
 
 
 def _choose_input(page, role: str) -> None:
-    """入力（USB カメラ 2 台／Mac＋Pixel）を選ぶ。"""
-    page._input_mode.setCurrentIndex(1 if role == HYBRID else 0)
+    """入力（USB カメラ 2 台／Mac＋Pixel）のラジオを押す。"""
+    (page._input_hybrid if role == HYBRID else page._input_usb).click()
     assert page._runner.role == role
 
 
@@ -328,3 +328,156 @@ class TestHeaderStatus:
             assert not page._badge.isHidden()
         finally:
             page.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# 実験者用の詳細設定（開示）と、説明文の削除
+# ---------------------------------------------------------------------------
+
+
+def _row_names(form) -> set[str]:
+    from app.core.qt import QtWidgets
+
+    return {label.text() for label in form.findChildren(QtWidgets.QLabel)}
+
+
+def _folder_link_url(page, monkeypatch):
+    """「出力フォルダ」リンクを押し、開こうとした URL を返す（実際には開かない）。"""
+    from app.core.qt import QtGui
+
+    opened = []
+    monkeypatch.setattr(QtGui.QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
+    page._output_link.linkActivated.emit("#")
+    assert len(opened) == 1
+    return opened[0]
+
+
+class TestAdvancedSettings:
+    def test_input_is_a_pair_of_radio_buttons(self, page):
+        from app.core.qt import QtWidgets
+
+        radios = page.findChildren(QtWidgets.QRadioButton)
+        assert [r.text() for r in radios] == ["USB カメラ 2 台", "Mac＋Pixel"]
+        group = radios[0].group()
+        assert group is not None and group is radios[1].group() and group.exclusive()
+        assert page._input_usb.isChecked() and page._runner.role == USB
+        assert not page.findChildren(QtWidgets.QComboBox), "入力のコンボボックスが残っている（n=2 は R2-03）"
+
+    def test_radio_switches_role(self, page):
+        page._input_hybrid.click()
+        assert page._runner.role == HYBRID
+        assert not page._joules_switch.isHidden()
+        page._input_usb.click()
+        assert page._runner.role == USB
+        assert page._joules_switch.isHidden()
+
+    def test_advanced_settings_are_in_a_closed_disclosure(self, page):
+        from app.shell.controls import Disclosure
+
+        advanced = page._advanced
+        assert isinstance(advanced, Disclosure)
+        assert advanced._button.text() == "実験者用の詳細設定"
+        assert not advanced.is_open(), "既定で閉じていない"
+        for widget in (page._input_usb, page._input_hybrid, page._subject_edit, page._body_mass):
+            assert advanced.isAncestorOf(widget)
+
+        dev = page._dev
+        assert isinstance(dev, Disclosure) and advanced.isAncestorOf(dev)
+        assert dev._button.text() == "開発・診断用"
+        assert not dev.is_open()
+        assert dev.isAncestorOf(page._form)
+
+        advanced.set_open(True)
+        assert page._subject_edit.isVisibleTo(page)
+
+    def test_subject_and_body_mass_rows_edit_settings(self, qt_app):
+        from app.core.qt import QtWidgets
+        from app.shell.page_measure import MeasurePage
+
+        settings = Settings({"SUBJECT_ID": "3", "BODY_MASS_KG": "70"})
+        page = MeasurePage(settings)
+        try:
+            assert page._subject_edit.text() == "3"
+            mass = page._body_mass
+            assert isinstance(mass, QtWidgets.QDoubleSpinBox)
+            assert mass.value() == pytest.approx(70.0)
+            assert (mass.decimals(), mass.minimum(), mass.maximum()) == (1, 20.0, 200.0)
+
+            # 欄の直後に単位（R9-08）
+            row = mass.parentWidget().layout()
+            unit = row.itemAt(row.indexOf(mass) + 1).widget()
+            assert isinstance(unit, QtWidgets.QLabel) and unit.text() == "kg"
+
+            page._subject_edit.setText("7")
+            assert settings.get("SUBJECT_ID") == "7"
+            mass.setValue(72.5)
+            assert settings.get("BODY_MASS_KG") == pytest.approx(72.5)
+        finally:
+            page.shutdown()
+
+    def test_nested_form_excludes_dedicated_rows(self, page):
+        from app.core.settings import SCHEMA
+        from app.shell.widgets import SettingsForm
+
+        names = _row_names(page._form)
+        assert "SUBJECT_ID" not in names and "BODY_MASS_KG" not in names
+        assert "DEMO_MONO_GAUGE_ON" in names
+
+        visible = {s.name for s in SCHEMA.values() if s.ui_visible}
+        form = SettingsForm(Settings(), exclude=frozenset({"SUBJECT_ID"}))
+        assert _row_names(form) & visible == visible - {"SUBJECT_ID"}
+
+    def test_settings_disabled_while_running_with_reason(self, page):
+        editors = (page._input_usb, page._input_hybrid, page._subject_edit, page._body_mass, page._form)
+        assert page._locked_reason.isHidden()
+
+        page._runner.state_changed.emit("running")
+        for widget in editors:
+            assert not widget.isEnabled(), widget
+        assert not page._locked_reason.isHidden()
+        assert page._locked_reason.text() == "計測中は変更できません"
+        assert page._advanced.isAncestorOf(page._locked_reason), "理由が詳細設定の中に無い"
+        assert page._advanced._button.isEnabled(), "計測中も中身は見られる"
+
+        page._runner.state_changed.emit("stopped")
+        for widget in editors:
+            assert widget.isEnabled(), widget
+        assert page._locked_reason.isHidden()
+
+    def test_no_explanatory_text_left(self, page):
+        from app.core.qt import QtWidgets
+
+        page._advanced.set_open(True)
+        page._dev.set_open(True)
+        texts = [label.text() for label in page.findChildren(QtWidgets.QLabel)]
+        for text in texts:
+            for phrase in ("デモ用", "出力先", "既定から変更", "カーソル"):
+                assert phrase not in text, f"説明文が残っている: {text!r}"
+            assert "。" not in text, f"文になっている（説明文）: {text!r}"
+        assert not hasattr(page, "_output_label")
+
+    def test_output_folder_link_after_finish(self, page, monkeypatch):
+        from app.core.qt import QtCore
+        from app.core.settings import measurement_output_dir
+        from app.hybrid import paths as hybrid_paths
+
+        assert page._output_link.isHidden(), "実行前にリンクを出している"
+
+        _choose_input(page, USB)
+        _fake_start(monkeypatch, page)
+        page._main_button.click()
+        assert page._output_link.isHidden()
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(0)
+        assert not page._output_link.isHidden()
+        assert "出力フォルダ" in page._output_link.text()
+        url = _folder_link_url(page, monkeypatch)
+        assert url == QtCore.QUrl.fromLocalFile(str(measurement_output_dir()))
+
+        _start_hybrid(monkeypatch, page)
+        assert page._output_link.isHidden(), "次の実行が始まってもリンクが残っている"
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(1)
+        assert not page._output_link.isHidden(), "異常終了でも途中までの出力はある"
+        url = _folder_link_url(page, monkeypatch)
+        assert url == QtCore.QUrl.fromLocalFile(str(hybrid_paths.measurement_root()))

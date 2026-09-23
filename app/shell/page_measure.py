@@ -8,21 +8,29 @@
 見出しの状態は、骨格の色付きバッジ（緑を含む）を隠し、点と文字の組（``StatusText``）で出す。
 1 つめは実行の状態（混成なら回数も）、2 つめは混成の実行中だけの Pixel 接続。回数と接続は
 ゲージの行から取る。
+
+設定は「実験者用の詳細設定」の開示（既定で閉じる。R11-03）にしまう。中身は入力のラジオ、被験者番号、
+体重、「開発・診断用」の入れ子の開示（残りの設定フォーム）。画面に説明文は置かない。出力先は、
+終わった後の「出力フォルダ」リンクで開く。
 """
 
 from __future__ import annotations
 
-from app.core.qt import QtWidgets
+from app.core.qt import QtCore, QtGui, QtWidgets
 from app.core.settings import Settings, measurement_output_dir
 from app.gauge.protocol import GaugeFrame
 from app.gauge.window import GaugeWindow
 from app.hybrid import paths as hybrid_paths
-from app.shell.controls import StatusText, ToggleSwitch
+from app.shell.controls import Disclosure, StatusText, ToggleSwitch
 from app.shell.widgets import RunnerPage, SettingsForm
 
 __all__ = ["MeasurePage"]
 
 _HYBRID_ROLE = "hybrid_measure"
+# 入力のラジオの id と role の対応（id は並びの順）
+_INPUT_ROLES = ("realtime", _HYBRID_ROLE)
+# 専用の欄を置くので、入れ子の設定フォームには並べない項目
+_DEDICATED_SETTINGS = frozenset({"SUBJECT_ID", "BODY_MASS_KG"})
 
 
 class MeasurePage(RunnerPage):
@@ -62,42 +70,91 @@ class MeasurePage(RunnerPage):
         return [self._run_status, self._link_status, self._joules_switch, self._main_button]
 
     def widgets_disabled_while_running(self) -> list[QtWidgets.QWidget]:
-        # 計測中に設定を変えても子プロセスには届かない。誤解を招くので触れなくする。
-        return [self._form, self._input_mode]
+        # 計測中に設定を変えても子プロセスには届かない。誤解を招くので触れなくする
+        # （開示そのものは開閉でき、値は見られる）。理由は _locked_reason に出す。
+        return [self._editors, self._form]
 
     def build_side_panel(self) -> QtWidgets.QWidget:
-        panel = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self._advanced = Disclosure("実験者用の詳細設定", self._build_advanced())
 
-        self._input_mode = QtWidgets.QComboBox()
-        self._input_mode.addItems(["入力: USB カメラ 2 台", "入力: Mac＋Pixel（混成）"])
-        self._input_mode.currentIndexChanged.connect(self._change_input)
-        layout.addWidget(self._input_mode)
-
-        note = QtWidgets.QLabel(
-            "「デモ用」の項目はアプリ側で無効にしてあります。"
-            "有効にすると計算結果が意味を失うことがあります（項目にカーソルを合わせると説明が出ます）。"
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #6b7280;")
-        layout.addWidget(note)
+        inner = QtWidgets.QWidget()
+        inner_layout = QtWidgets.QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.addWidget(self._advanced)
+        inner_layout.addStretch(1)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self._form = SettingsForm(self._settings)
-        self._form.changed.connect(self._refresh_output_label)
-        scroll.setWidget(self._form)
+        scroll.setWidget(inner)
+
+        self._output_link = QtWidgets.QLabel('<a href="#">出力フォルダ</a>')
+        self._output_link.setTextFormat(QtCore.Qt.RichText)
+        self._output_link.setTextInteractionFlags(
+            QtCore.Qt.LinksAccessibleByMouse | QtCore.Qt.LinksAccessibleByKeyboard
+        )
+        self._output_link.linkActivated.connect(self._open_output_folder)
+        self._output_link.setVisible(False)  # 終わった後に出す
+
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(scroll, 1)
-
-        self._output_label = QtWidgets.QLabel()
-        self._output_label.setWordWrap(True)
-        self._output_label.setStyleSheet("color: #6b7280;")
-        layout.addWidget(self._output_label)
-        self._refresh_output_label()
-
+        layout.addWidget(self._output_link)
         return panel
+
+    def _build_advanced(self) -> QtWidgets.QWidget:
+        """詳細設定の開示の中身。入力・被験者番号・体重の欄と、入れ子の「開発・診断用」。"""
+        self._locked_reason = QtWidgets.QLabel("計測中は変更できません")
+        self._locked_reason.setVisible(False)
+
+        # 入力（R2-01）。n=2 なのでコンボボックスではなくラジオ
+        self._input_usb = QtWidgets.QRadioButton("USB カメラ 2 台")
+        self._input_hybrid = QtWidgets.QRadioButton("Mac＋Pixel")
+        self._input_group = QtWidgets.QButtonGroup(self)
+        for button_id, button in enumerate((self._input_usb, self._input_hybrid)):
+            self._input_group.addButton(button, button_id)
+        self._input_group.button(_INPUT_ROLES.index(self._runner.role)).setChecked(True)
+        self._input_group.idToggled.connect(self._on_input_toggled)
+        inputs = QtWidgets.QWidget()
+        inputs_layout = QtWidgets.QHBoxLayout(inputs)
+        inputs_layout.setContentsMargins(0, 0, 0, 0)
+        inputs_layout.addWidget(self._input_usb)
+        inputs_layout.addWidget(self._input_hybrid)
+        inputs_layout.addStretch(1)
+
+        self._subject_edit = QtWidgets.QLineEdit(str(self._settings.get("SUBJECT_ID") or ""))
+        self._subject_edit.textChanged.connect(lambda text: self._settings.set("SUBJECT_ID", text))
+
+        self._body_mass = QtWidgets.QDoubleSpinBox()
+        self._body_mass.setDecimals(1)
+        self._body_mass.setRange(20.0, 200.0)
+        self._body_mass.setValue(float(self._settings.get("BODY_MASS_KG")))
+        self._body_mass.valueChanged.connect(lambda value: self._settings.set("BODY_MASS_KG", value))
+        mass = QtWidgets.QWidget()
+        mass_layout = QtWidgets.QHBoxLayout(mass)
+        mass_layout.setContentsMargins(0, 0, 0, 0)
+        mass_layout.addWidget(self._body_mass)
+        mass_layout.addWidget(QtWidgets.QLabel("kg"))  # 単位は欄の直後（R9-08）
+        mass_layout.addStretch(1)
+
+        self._editors = QtWidgets.QWidget()
+        rows = QtWidgets.QFormLayout(self._editors)
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.addRow("入力", inputs)
+        rows.addRow("被験者番号", self._subject_edit)
+        rows.addRow("体重", mass)
+
+        self._form = SettingsForm(self._settings, exclude=_DEDICATED_SETTINGS)
+        self._dev = Disclosure("開発・診断用", self._form)
+
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(16, 4, 0, 0)
+        layout.addWidget(self._locked_reason)
+        layout.addWidget(self._editors)
+        layout.addWidget(self._dev)
+        return content
 
     def shutdown(self) -> None:
         super().shutdown()
@@ -129,6 +186,7 @@ class MeasurePage(RunnerPage):
             self._gauge_window.finish(exit_code)
         self._header_phase = "success" if exit_code == 0 else "error"
         self._refresh_header()
+        self._output_link.setVisible(True)  # 異常終了でも、途中までの出力はある
 
     def _on_gauge_frame(self, frame: GaugeFrame) -> None:
         self._last_frame = frame
@@ -138,11 +196,25 @@ class MeasurePage(RunnerPage):
         self._settings.set("GAUGE_SHOW_JOULES", checked)
         self._gauge_window.set_show_joules(checked)
 
+    def _on_input_toggled(self, button_id: int, checked: bool) -> None:
+        if not checked:
+            return  # 外れた側の通知。入った側の通知で切り替える
+        self._runner.role = _INPUT_ROLES[button_id]
+        self._joules_switch.setVisible(self._runner.role == _HYBRID_ROLE)
+
+    def _open_output_folder(self, _href: str) -> None:
+        folder = (hybrid_paths.measurement_root()
+                  if self._run_role == _HYBRID_ROLE else measurement_output_dir())
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
+
     # -- 表示更新 ----------------------------------------------------------
     def _on_state(self, state: str) -> None:
         super()._on_state(state)
         running = state in ("starting", "running")
         self._main_button.setText("停止" if running else "計測を開始")
+        self._locked_reason.setVisible(running)
+        if running:
+            self._output_link.setVisible(False)
         # 終了の結果（✓／✕）は、この後に届く finished で上書きする
         self._header_phase = "running" if running else "stopped"
         self._refresh_header()
@@ -157,17 +229,3 @@ class MeasurePage(RunnerPage):
         self._link_status.setVisible(hybrid_running)
         if hybrid_running:
             self._link_status.set_link(connected)
-
-    def _change_input(self, index: int) -> None:
-        self._runner.role = _HYBRID_ROLE if index else "realtime"
-        self._joules_switch.setVisible(self._runner.role == _HYBRID_ROLE)
-        self._refresh_output_label()
-
-    def _refresh_output_label(self) -> None:
-        destination = (hybrid_paths.measurement_root()
-                       if self._runner.role == _HYBRID_ROLE else measurement_output_dir())
-        text = f"出力先: {destination}"
-        changed = self._settings.overrides
-        if changed:
-            text += "\n既定から変更: " + ", ".join(sorted(changed))
-        self._output_label.setText(text)
