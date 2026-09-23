@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -12,8 +11,8 @@ from compute_torque_from_pose import (
     WRIST_BASE_SEGMENTS_RIGHT,
     compute_segment_kinematics,
 )
-from config import COM_FRACTIONS, SEGMENT_MASS_FRACTIONS, THEORETICAL_WORK_COEFF
-from push_up_model import hand_point, joint_axes
+from config import COM_FRACTIONS, INERTIA_LENGTH_FRAMES, SEGMENT_MASS_FRACTIONS, THEORETICAL_WORK_COEFF
+from push_up_model import estimate_gravity, hand_point, joint_axes, trunk_up_vectors
 from utils import compute_local_torque
 
 # 理論 1RM 仕事量（分母）の体節パラメータ。値は config に集約してある（Winter）
@@ -112,7 +111,7 @@ def _hand_series(pose_df: pd.DataFrame, side_name: str) -> np.ndarray | None:
 
 
 def _joint_projections(
-    pose_df: pd.DataFrame, torque_df: pd.DataFrame, side_name: str, dt: float
+    pose_df: pd.DataFrame, torque_df: pd.DataFrame, side_name: str, dt: float, up_axis=None
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """肘と手首について、局所 y 軸に射影したトルクと相対角速度 (τ_y, ω_y) を返す。仕事率はこの積。
 
@@ -124,7 +123,8 @@ def _joint_projections(
     - 肘: 上腕の角速度 − 前腕の角速度
 
     局所軸はトルク CSV と同じ ``push_up_model.joint_axes`` で作り、τ と ω を同じ軸に射影する。
-    手首の軸は手の点があれば手のひらから、無ければ肘と同じ屈曲軸（§5-1）。
+    手首の軸は手の点があれば手のひらから、無ければ肘と同じ屈曲軸（§5-1）。``up_axis`` は腕がまっすぐで
+    親との外積が潰れるフレームの基準軸で、トルク CSV と同じく重力の逆向きを渡す（``_pose_up``）。
     角度を経由しないので、fps の掛け戻し（§1-1）も ±π の折り返し（§1-2）も起きない。
 
     かつて ``*_local_y`` に「+Y まわりの肘角」「水平面からの前腕の傾き」の微分を掛けていた。
@@ -146,17 +146,30 @@ def _joint_projections(
     for joint in ("elbow", "wrist"):
         tau = torque_df[[f"{joint}_{side_name}_{ax}" for ax in "xyz"]].to_numpy(float)
         link, parent = axes[joint]
-        tau_y = np.array([compute_local_torque(tau[t], link[t], parent[t])[1] for t in range(n)])
-        omega_y = np.array([compute_local_torque(relative[joint][t], link[t], parent[t])[1] for t in range(n)])
+        tau_y = np.array([compute_local_torque(tau[t], link[t], parent[t], up_axis)[1] for t in range(n)])
+        omega_y = np.array([compute_local_torque(relative[joint][t], link[t], parent[t], up_axis)[1]
+                            for t in range(n)])
         out[joint] = (tau_y, omega_y)
     return out
 
 
+def _pose_up(pose_df: pd.DataFrame):
+    """姿勢 CSV の先頭フレームの体幹から上向きを決める（compute_torque_from_pose と同じ）。腰が無ければ None。"""
+    ids = (11, 12, 23, 24)
+    if not all(c in pose_df.columns for i in ids for c in _col_triplet(i)):
+        return None
+    head = pose_df.iloc[:INERTIA_LENGTH_FRAMES]
+    try:
+        return estimate_gravity(trunk_up_vectors(*(head[_col_triplet(i)].to_numpy(float) for i in ids)), 1.0).up
+    except ValueError:
+        return None
+
+
 def _joint_powers(
-    pose_df: pd.DataFrame, torque_df: pd.DataFrame, side_name: str, dt: float
+    pose_df: pd.DataFrame, torque_df: pd.DataFrame, side_name: str, dt: float, up_axis=None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """肘と手首の仕事率 [W] を (肘, 手首) で返す。P = τ_y × ω_y（``_joint_projections``）。"""
-    proj = _joint_projections(pose_df, torque_df, side_name, dt)
+    proj = _joint_projections(pose_df, torque_df, side_name, dt, up_axis)
     return proj["elbow"][0] * proj["elbow"][1], proj["wrist"][0] * proj["wrist"][1]
 
 
@@ -251,7 +264,6 @@ def main() -> int:
 
         cycle_map = _prepare_cycle_map(cycles_df)
         torque_cycle = _merge_by_frame(torque_df, cycle_map)
-        pose_cycle = _merge_by_frame(pose_df, cycle_map)
 
         dt = 1.0 / (args.fps if args.fps > 0 else DEFAULT_FPS)
 
@@ -276,7 +288,7 @@ def main() -> int:
             if any(col not in torque_df.columns for col in needed):
                 print(f"[SKIP] missing torque columns for {stem} {side_name}")
                 continue
-            elbow_power, wrist_power = _joint_powers(pose_scaled, torque_df, side_name, dt)
+            elbow_power, wrist_power = _joint_powers(pose_scaled, torque_df, side_name, dt, _pose_up(pose_scaled))
             n = len(elbow_power)
             elbow_power = elbow_power * args.torque_scale
             wrist_power = wrist_power * args.torque_scale

@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -48,6 +49,7 @@ from body_part_storage_module import BodyPartDataStorage
 # 部位キーと重力の大きさは config.py が持っている。utils 経由で既に読み込まれているので
 # 追加コストなしで再利用できる。
 from config import G_SCALAR, INERTIA_LENGTH_FRAMES, SEGMENT_MASS_FRACTIONS
+from config import g as _CONFIG_GRAVITY
 from config import part_calculations
 from config import part_keys as _PART_KEYS
 from config import slot_of
@@ -69,6 +71,9 @@ from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transfor
 from app.net.sync_buffer import PairedSample
 
 __all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig"]
+
+# 体幹から重力を決められないときの既定（三角測量の変換で z が上になる。カメラが水平という前提）
+DEFAULT_GRAVITY = np.asarray(_CONFIG_GRAVITY, dtype=np.float64)
 
 
 # リンク定義は config.part_calculations が正本（USB 経路と共通）。
@@ -322,7 +327,13 @@ class NetworkMeasurement:
             "forearm_L": calculate_inertia_tensor(4, mass, length("L_ELBOW", "L_WRIST")),
         }
         ups = trunk_up_vectors(*(samples[:, slot_of(n)] for n in ("L_SHOULDER", "R_SHOULDER", "L_HIP", "R_HIP")))
-        self.gravity = estimate_gravity(ups, G_SCALAR, self.config.gravity_mode).vector
+        try:
+            self.gravity = estimate_gravity(ups, G_SCALAR, self.config.gravity_mode).vector
+        except ValueError as error:
+            # 腰が一度も取れなかった。受信ループを止めないよう、z が上（カメラが水平）の既定で続ける
+            warnings.warn(f"初期フレームの体幹から重力を決められない（{error}）。既定の {DEFAULT_GRAVITY.tolist()} を使う",
+                          RuntimeWarning, stacklevel=2)
+            self.gravity = DEFAULT_GRAVITY.copy()
 
     def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:
         data = {name: self.storage.get_data(name) for name in PART_LINKS}

@@ -14,7 +14,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from compute_cycle_energy_elbow_wrist import HAND, _joint_projections
+from compute_cycle_energy_elbow_wrist import HAND, _joint_projections, _pose_up
 
 DEFAULT_FPS = 30.0
 
@@ -176,7 +176,7 @@ def side_noise_contrib(
     torque_scale: float = 1.0,
 ) -> Dict[str, pd.DataFrame]:
     """片側の肘・手首について、サイクルごとの仕事の分解を返す（キーは elbow_R など）。"""
-    proj = _joint_projections(pose_df, torque_df, side_name, dt)
+    proj = _joint_projections(pose_df, torque_df, side_name, dt, _pose_up(pose_df))
     out: Dict[str, pd.DataFrame] = {}
     for joint in ("elbow", "wrist"):
         tau, omg = proj[joint]

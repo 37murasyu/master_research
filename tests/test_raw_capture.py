@@ -66,6 +66,22 @@ class TestSidecar:
         assert git_commit(tmp_path) is None
 
 
+class TestLateNotes:
+    """起動の後で決まる値（重力、EKF の体格比）を、サイドカーに書き足せる。
+
+    サイドカーは起動時に書くので、実行中に決まる値が残らず、使った q・r や g を後から追えなかった。
+    """
+
+    def test_a_note_adds_fields_and_keeps_the_rest(self, tmp_path):
+        csv_path = tmp_path / "raw.csv"
+        writer = RawCaptureWriter(csv_path, IDS, provenance={"dt": 1 / 30})
+        writer.note(gravity=[0.0, 0.0, -9.81], ekf_scale_ratio=1.1)
+        writer.close()
+        meta = json.loads(sidecar_path(csv_path).read_text(encoding="utf-8"))
+        assert meta["gravity"] == [0.0, 0.0, -9.81] and meta["ekf_scale_ratio"] == 1.1
+        assert meta["dt"] == 1 / 30 and meta["stage"] == "pre_ekf"
+
+
 class TestStreaming:
     """途中で強制終了されても、それまでの行が読めること。"""
 

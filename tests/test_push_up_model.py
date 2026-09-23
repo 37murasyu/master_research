@@ -192,6 +192,17 @@ class TestJointAxes:
         np.testing.assert_allclose(parent[0], WRIST - HAND)
         np.testing.assert_allclose(parent[1], ELBOW - SHOULDER)
 
+    @pytest.mark.parametrize("hand", [HAND, np.array([-0.08, 0.0, 0.0])], ids=["前へ", "後ろへ"])
+    def test_the_palm_axis_points_like_the_elbow_axis(self, hand):
+        """手のひらの軸と肘の屈曲軸を同じ向きに揃える。
+
+        手のひらの軸は「手 × 前腕」なので、手が腕の面の前にあるか後ろにあるかで向きが反転する。
+        手の点の有無や手首の曲がり具合でフレームごとに軸が切り替わると、τ_y に段差が入り、
+        ノイズの分解（§1-6）では段差が「ノイズ」に化ける。仕事率は τ と ω を同じ軸に射影するので変わらない。
+        """
+        axes = joint_axes(SHOULDER, ELBOW, WRIST, hand=hand)
+        assert self._local_y(axes, "wrist") == pytest.approx(self._local_y(axes, "elbow"))
+
     def test_elbow_axis_is_the_arm_plane_normal(self):
         axes = joint_axes(SHOULDER, ELBOW, WRIST)
         assert abs(self._local_y(axes, "elbow")) == pytest.approx(1.0)
@@ -234,3 +245,92 @@ class TestInertiaAboutLink:
 
     def test_a_degenerate_link_leaves_the_tensor_unrotated(self):
         np.testing.assert_allclose(inertia_about_link(self.INERTIA, np.zeros(3)), self.INERTIA)
+
+
+class TestNearestAxis:
+    """上向きのベクトルに最も近い座標軸を、**符号つき**で選ぶ（USB 経路の重力の自動検出）。
+
+    かつて ``master_research_code._pick_axis_from_vector`` は |cos| で比べていたので、同じ軸の + と − が
+    必ず同点になり、同点のときの「優先ラベル」で常に 'Y+' が上になっていた。実行時の座標（−X, −Z, −Y）では
+    y は奥行きなので、検出が終わると重力が水平に切り替わっていた。
+    """
+
+    @pytest.mark.parametrize("vector, label", [
+        ([0.0, 0.1, 1.0], "Z+"),
+        ([0.0, 0.1, -1.0], "Z-"),
+        ([0.0, -1.0, 0.1], "Y-"),
+        ([1.0, 0.0, 0.2], "X+"),
+    ])
+    def test_the_sign_is_kept(self, vector, label):
+        from push_up_model import nearest_axis
+
+        assert nearest_axis(np.array(vector))[0] == label
+
+    def test_candidates_restrict_the_axes(self):
+        from push_up_model import nearest_axis
+
+        # x が最大でも、候補が Y と Z だけなら Z+
+        assert nearest_axis(np.array([1.0, 0.0, 0.5]), candidates=("Y+", "Y-", "Z+", "Z-"))[0] == "Z+"
+
+    def test_a_near_tie_prefers_the_given_label_only_among_the_tied(self):
+        from push_up_model import nearest_axis
+
+        v = np.array([0.0, 0.70, 0.72])
+        assert nearest_axis(v, preferred="Y+", ambiguity=0.08)[0] == "Y+"
+        # 優先ラベルが同点の組に入っていなければ、最も近い軸のまま
+        assert nearest_axis(v, preferred="X+", ambiguity=0.08)[0] == "Z+"
+
+    def test_the_result_matches_estimate_gravity(self):
+        from push_up_model import nearest_axis
+
+        for v in ([0.10, -0.98, -0.15], [0.11, -0.31, 0.95]):
+            label, unit, _ = nearest_axis(np.array(v))
+            np.testing.assert_allclose(estimate_gravity(np.tile(v, (3, 1)), magnitude=G).up, unit)
+
+
+class TestPositiveWorkWhenLifting:
+    """荷重を持ち上げる（肘を伸ばす）と肘は正の仕事をし、P = τ_y·dθ/dt になる（USB 経路の τ·dθ と同じ）。
+
+    θ は上腕（肩→肘）と前腕（肘→手首）のなす角。伸ばすと θ が減る。
+    """
+
+    def test_extending_under_load_is_positive_work(self):
+        from push_up_model import joint_axes, push_up_joint_powers
+
+        theta = np.radians(60.0)
+        wrist = np.zeros(3)
+        elbow = np.array([0.0, 0.0, 0.25])
+        # 上腕の向き u（肘→肩）は、前腕の延長（上向き）から θ だけ後ろ（−x）へ倒した方向
+        u = np.array([-np.sin(theta), 0.0, np.cos(theta)])
+        shoulder = elbow + 0.30 * u
+        # 肘を伸ばす: θ が減る。前腕は固定なので上腕が +y まわりに回る（−x → +z へ起き上がる）
+        # u(θ) の θ 微分 = (−cos θ, 0, −sin θ)、dθ/dt = −1 rad/s なら du/dt = (cos θ, 0, sin θ)
+        # ω_上腕 = u × du/dt = (0, sin²θ + cos²θ, 0) → 上腕は +y まわりに 1 rad/s
+        omega_upper = np.array([0.0, 1.0, 0.0])
+        upper = SegmentState(np.diag([1e-3, 1e-3, 5e-4]), M_UPPER_ARM, omega_upper, np.zeros(3), np.zeros(3),
+                             elbow + 0.564 * (shoulder - elbow), shoulder - elbow)
+        forearm = _still(M_FOREARM, elbow + 0.430 * (wrist - elbow), wrist - elbow)
+        tau = push_up_torques(forearm, upper, wrist, elbow, shoulder, GRAVITY, 17.34, 0.36)
+        axes = joint_axes(shoulder, elbow, wrist)
+        power = push_up_joint_powers(tau, axes, forearm, upper, None)
+
+        assert power["elbow"] > 0, f"荷重を持ち上げているのに肘の仕事率が {power['elbow']:.2f} W"
+        # USB 経路は τ_y·dθ で肘のエネルギーを積む（dθ/dt = −1）
+        tau_y = compute_local_torque(tau["elbow"], *axes["elbow"])[1]
+        assert power["elbow"] == pytest.approx(tau_y * -1.0)
+        # 大きさ: 荷重と上腕の重さ × 肘からの水平距離 × 角速度
+        lever = 0.30 * np.sin(theta)
+        assert power["elbow"] == pytest.approx((17.34 * lever + M_UPPER_ARM * 0.564 * lever) * G, rel=1e-3)
+
+    def test_flexing_under_load_is_negative_work(self):
+        from push_up_model import joint_axes, push_up_joint_powers
+
+        theta = np.radians(60.0)
+        wrist, elbow = np.zeros(3), np.array([0.0, 0.0, 0.25])
+        shoulder = elbow + 0.30 * np.array([-np.sin(theta), 0.0, np.cos(theta)])
+        upper = SegmentState(np.diag([1e-3, 1e-3, 5e-4]), M_UPPER_ARM, np.array([0.0, -1.0, 0.0]), np.zeros(3),
+                             np.zeros(3), elbow + 0.564 * (shoulder - elbow), shoulder - elbow)
+        forearm = _still(M_FOREARM, elbow + 0.430 * (wrist - elbow), wrist - elbow)
+        tau = push_up_torques(forearm, upper, wrist, elbow, shoulder, GRAVITY, 17.34, 0.36)
+        power = push_up_joint_powers(tau, joint_axes(shoulder, elbow, wrist), forearm, upper, None)
+        assert power["elbow"] < 0

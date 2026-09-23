@@ -61,8 +61,8 @@ def estimate_gravity(trunk_up, magnitude: float, mode: str = "axis") -> GravityE
     magnitude : float
         重力加速度の大きさ。
     mode : {"axis", "trunk"}
-        "axis"（既定）は体幹の向きに最も近い座標軸を上とする。USB 経路の
-        ``GRAVITY_AUTO_DETECT`` と同じ考え方で、カメラが水平に置かれていることを前提にする。
+        "axis"（既定）は体幹の向きに最も近い座標軸を上とする。カメラが水平に置かれていることを前提にする。
+        オフライン・USB（``GRAVITY_AUTO_DETECT``）・スマホの 3 経路ともこの関数で決める。
         座位の体幹は 10° 前後傾いており（入力 CSV の実測）、体幹そのものを鉛直とみなすと
         重力が同じだけ傾くため、こちらを既定にした。
         "trunk" は体幹の向きそのものを上とする（カメラが傾いている場合向け）。
@@ -93,6 +93,36 @@ def estimate_gravity(trunk_up, magnitude: float, mode: str = "axis") -> GravityE
     return GravityEstimate(
         vector=-float(magnitude) * up + 0.0, up=up + 0.0, trunk_up=trunk,
         lean_deg=lean, mode=mode, samples=int(usable.sum()))
+
+
+_AXIS_LABELS = ("X+", "X-", "Y+", "Y-", "Z+", "Z-")
+
+
+def _axis_unit(label: str) -> np.ndarray:
+    unit = np.zeros(3)
+    unit["XYZ".index(label[0])] = 1.0 if label[1] == "+" else -1.0
+    return unit
+
+
+def nearest_axis(vector, candidates=_AXIS_LABELS, preferred: str | None = None, ambiguity: float = 0.0):
+    """ベクトルに最も近い座標軸を**符号つき**で選ぶ。戻り値は (ラベル 'Z+' など, 単位ベクトル, cos)。
+
+    上位 2 候補の cos の差が ``ambiguity`` 未満で、``preferred`` がその 2 つに入っていればそれを選ぶ
+    （軸ラベルを試技の間で揃えるため）。かつて USB 経路はここで |cos| を比べており、同じ軸の + と − が
+    必ず同点になって、常に優先ラベルの側が上になっていた（重力が水平を向いた）。
+    """
+    v = np.asarray(vector, dtype=np.float64)
+    norm = np.linalg.norm(v)
+    if not np.all(np.isfinite(v)) or norm < 1e-12:
+        raise ValueError("向きを決められないベクトル")
+    v = v / norm
+    scored = sorted(((float(np.dot(v, _axis_unit(lab))), lab) for lab in candidates), reverse=True)
+    best_cos, best = scored[0]
+    if preferred is not None and len(scored) > 1 and best_cos - scored[1][0] < ambiguity:
+        if preferred in (best, scored[1][1]):
+            best = preferred
+            best_cos = float(np.dot(v, _axis_unit(best)))
+    return best, _axis_unit(best), best_cos
 
 
 def trunk_up_vectors(l_shoulder, r_shoulder, l_hip, r_hip):
@@ -167,6 +197,10 @@ def joint_axes(shoulder, elbow, wrist, hand=None, other_shoulder=None):
     else:
         palm = wrist - np.asarray(hand, dtype=np.float64)
         usable = wrist_hand_mask(elbow, wrist, hand)
+        # 手のひらの軸（手 × 前腕）は、手が腕の面の前か後ろかで向きが反転する。肘の屈曲軸と同じ向きに
+        # 揃え、フレームごとに軸を切り替えても τ_y の符号が跳ばないようにする（仕事率は変わらない）
+        same_way = np.sum(np.cross(palm, forearm) * np.cross(fallback, forearm), axis=-1)
+        palm = np.where(np.expand_dims(same_way < 0, -1), -palm, palm)
         wrist_parent = np.where(np.expand_dims(usable, -1), palm, fallback)
 
     shoulder_parent = None

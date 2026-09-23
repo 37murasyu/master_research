@@ -43,6 +43,8 @@ class StopRequest:
 
     def _on_signal(self, signum, frame) -> None:
         self._signalled = True
+        # 2 回目は既定の動作（即死）に戻す。終了時処理が固まっても、端末から kill すれば止まる
+        signal.signal(signum, signal.SIG_DFL)
 
     def requested(self) -> bool:
         return self._signalled or (self.path is not None and self.path.exists())

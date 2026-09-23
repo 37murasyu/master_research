@@ -69,7 +69,6 @@ from config import (
     w,
     SKIP_FRAMES,
     WHILE_COUNT,
-    z_value,
     part_keys,
     impulse_records,
     current_torque_history,
@@ -103,11 +102,14 @@ from utils_dynamic import (
 from push_up_model import (
     ARM_PARTS,
     arm_axes,
+    estimate_gravity,
     hand_mass,
+    nearest_axis,
     push_up_joint_powers,
     push_up_torques,
     segment_from_storage,
     torso_load_mass,
+    trunk_up_vectors,
 )
 try:
     from Gauge_display import GaugeDisplay
@@ -150,7 +152,6 @@ TRIANG_NATIVE_ON = env_flag('TRIANG_NATIVE_ON', True)
 GRAVITY_AUTO_DETECT = env_flag('GRAVITY_AUTO_DETECT', True)
 GRAVITY_FROM_CHECKERBOARD_SHORT = env_flag('GRAVITY_FROM_CHECKERBOARD_SHORT', True)
 GRAVITY_CHECKERBOARD_AXIS_FILE = os.getenv('GRAVITY_CHECKERBOARD_AXIS_FILE', 'camera_parameters/checkerboard_short_axis.json')
-GRAVITY_DETECT_FRAMES = int(os.getenv('GRAVITY_DETECT_FRAMES', '90'))  # 3秒@30fps目安
 GRAVITY_PREFERRED = os.getenv('GRAVITY_PREFERRED', 'Y-')  # フォールバック表示用
 GRAVITY_TAG_IN_CSV = env_flag('GRAVITY_TAG_IN_CSV', True)
 # Webカメラは必ずしも水平でないため、平面拘束は既定OFF（必要時のみON）
@@ -208,7 +209,6 @@ _lpf_fps_ema = None  # 実効fps推定（loop_dt由来EMA）
 _e_dt_sec_current = 1.0 / 30.0  # ループ開始前に実 fps から上書きされる（後段参照）
 
 # ===================== 重力推定のグローバル状態 =====================
-_grav_up_samples = collections.deque(maxlen=max(10, GRAVITY_DETECT_FRAMES))
 _gravity_label = GRAVITY_PREFERRED  # 重力向きラベル（例: Y-）
 _gravity_set = False
 _gravity_level_plane_on_runtime = GRAVITY_LEVEL_PLANE_ON
@@ -357,35 +357,20 @@ def _candidate_axis_labels() -> list[str]:
 
 
 def _pick_axis_from_vector(v: np.ndarray) -> tuple[str, np.ndarray, float]:
-    """肩→腰ベクトル(=上方向)から最も近い軸と符号を選ぶ。
+    """上方向のベクトルに最も近い軸を**符号つき**で選ぶ（push_up_model.nearest_axis）。
     GRAVITY_LEVEL_PLANE_ON=1 のとき、候補軸を指定平面に制限する。
-    Returns: (up_label like 'Y+', up_axis_unit_vec, cosine_abs)
+    Returns: (up_label like 'Y+', up_axis_unit_vec, cosine)
+
+    かつてここは |cos| で比べており、同じ軸の + と − が必ず同点になって、同点のときの優先ラベル
+    （GRAVITY_PREFERRED の逆）が常に選ばれていた。入力に依らず 'Y+' が上になり、実行時の座標
+    （−X, −Z, −Y）では重力が奥行き方向を向いていた。
     """
     pref_up_label = _opposite_axis_label(GRAVITY_PREFERRED)
-    pref_up_axis = _axis_vec_from_label(pref_up_label)
-    if v is None or not np.all(np.isfinite(v)):
-        return pref_up_label, pref_up_axis, 0.0
-    vn = np.array(v, dtype=float)
-    n = float(np.linalg.norm(vn))
-    if n < 1e-9:
-        return pref_up_label, pref_up_axis, 0.0
-    vn /= n
-
-    candidates = _candidate_axis_labels()
-    scored = []
-    for lab in candidates:
-        ax = _axis_vec_from_label(lab)
-        cabs = abs(float(np.dot(vn, ax)))
-        scored.append((cabs, lab, ax))
-    scored.sort(key=lambda t: t[0], reverse=True)
-
-    best_val, best_label, best_axis = scored[0]
-    # 上位2候補が近い場合は preferred を優先（軸ラベル一貫性を維持）
-    if len(scored) > 1 and (best_val - scored[1][0]) < GRAVITY_AMBIG_DELTA:
-        for _, lab, ax in scored:
-            if lab == pref_up_label:
-                return lab, ax, abs(float(np.dot(vn, ax)))
-    return best_label, best_axis, best_val
+    try:
+        return nearest_axis(v, candidates=_candidate_axis_labels(), preferred=pref_up_label,
+                            ambiguity=GRAVITY_AMBIG_DELTA)
+    except ValueError:
+        return pref_up_label, _axis_vec_from_label(pref_up_label), 0.0
 
 
 def _load_checkerboard_short_axis_runtime(path: str) -> np.ndarray | None:
@@ -2733,6 +2718,13 @@ _dyn_start_frame = None
 _stop_request = StopRequest.from_environment()
 _stop_request.install_signal_handlers()
 
+# ループの後で返す終了コード。EKF の体格比がありえない（座標の単位の誤り）ときは非 0 で終え、
+# GUI の「終了コード」で分かるようにする（ループの後の CSV の書き出しは行う）
+EXIT_IMPLAUSIBLE_SCALE = 3
+_exit_code = 0
+# サイクル検出の基準値（フレーム 5〜14 の平均）。欠測のフレームは数えない
+_z_sum, _z_n = 0.0, 0
+
 while True:
     # ループの先頭で見る。途中に continue が多く（間引き・慣性テンソルの暖機・姿勢が取れない間）、
     # 末尾の 'q' 判定まで届かない周回がある。
@@ -3032,17 +3024,22 @@ while True:
     if _ekf_scale_pending:
         # 体格の比で較正値を掛け直す（設計メモ 欠陥 5）。人体としてありえない長さなら座標の単位が
         # 違うので計測を止める。r が大きすぎると静かに素通りするため、黙って使わない
+        # 肩と肘が三角測量できたフレームだけで判定する（人が映っていないだけで止めない）
         _ref_a, _ref_b = (sorted(pose_keypoints).index(i) for i in SCALE_REF_PAIR)
-        _ekf_ref_lengths.append(float(np.linalg.norm(transformed_p3ds[_ref_a] - transformed_p3ds[_ref_b])))
+        _ref_len = float(np.linalg.norm(transformed_p3ds[_ref_a] - transformed_p3ds[_ref_b]))
+        if np.isfinite(_ref_len):
+            _ekf_ref_lengths.append(_ref_len)
         if len(_ekf_ref_lengths) >= INERTIA_LENGTH_FRAMES:
-            _run_len = float(np.nanmedian(_ekf_ref_lengths))
+            _run_len = float(np.median(_ekf_ref_lengths))
             try:
                 _ratio = body_scale_ratio(_ekf_noise.resolution.scale_ref, _run_len)
             except ValueError as _scale_e:
-                print(f"[EKF] {_scale_e}。計測を止めます", flush=True)
+                print(f"[EKF] {_scale_e}。計測を止めます（終了コード {EXIT_IMPLAUSIBLE_SCALE}）", flush=True)
+                _exit_code = EXIT_IMPLAUSIBLE_SCALE
                 break
             landmark_ekf.set_noise(_ekf_noise.scaled(_ratio))
             _ekf_scale_pending = False
+            _raw_capture.note(ekf_scale_ratio=_ratio, ekf_run_length_m=_run_len)
             print(f"[EKF] 体格の比 L_run/L_cal = {_ratio:.3f}（L_run={_run_len:.3f} m）で較正値を掛け直した")
     if landmark_ekf is not None:
         # 数値の破綻だけを拾う。形の不整合などバグ由来の例外は握りつぶさない（設計メモ 実装 2）
@@ -3062,9 +3059,12 @@ while True:
     _cycle_axis_idx = 1 if RT_CYCLE_AXIS == 'y' else (2 if RT_CYCLE_AXIS == 'z' else 0)
     _cycle_value_now = transformed_p3ds[0][_cycle_axis_idx]
     if 4 < WHILE_COUNT < 15 and np.isfinite(_cycle_value_now):
-        # 欠測（EKF の欠測上限を超えた NaN を含む）で基準値が NaN になると、以後サイクルが検出されない
-        z_value += _cycle_value_now / 10
+        # 欠測（EKF の欠測上限を超えた NaN を含む）は数えない。NaN を足すと以後サイクルが検出されず、
+        # 欠測を 0 とみなして 10 で割ると基準値が縮む。スマホ経路の _update_baseline と同じく集まった数で割る
+        _z_sum += float(_cycle_value_now)
+        _z_n += 1
     elif WHILE_COUNT == 15:
+        z_value = _z_sum / _z_n if _z_n else float(_cycle_value_now)
         detector = PushCycleDetector(
             z_value,
             threshold=0.015,
@@ -3208,6 +3208,28 @@ while True:
               f"上腕 R/L={_len_upper_arm_R:.3f}/{_len_upper_arm_L:.3f} "
               f"前腕 R/L={_len_forearm_R:.3f}/{_len_forearm_L:.3f} [m]")
 
+        # 重力も同じ先頭フレームの体幹（腰中点 → 肩中点）から決める（KNOWN_ISSUES §1-5）。スマホ経路・
+        # オフラインと同じ push_up_model.estimate_gravity。力学はここを通るまで回らないので、決まる前の
+        # 重力で計算することは無い。チェッカーボードで決めてあれば（GRAVITY_FROM_CHECKERBOARD_SHORT）そちらを使う。
+        if GRAVITY_AUTO_DETECT and not _gravity_set:
+            _ups = trunk_up_vectors(*(_lead[:, slot_of(n)] for n in ("L_SHOULDER", "R_SHOULDER", "L_HIP", "R_HIP")))
+            try:
+                _grav = estimate_gravity(_ups, float(np.linalg.norm(g)), "axis")
+            except ValueError as _ge:
+                print(f"[GRAVITY] 先頭 {INERTIA_LENGTH_FRAMES} フレームで体幹が取れず重力を決められない"
+                      f"（{_ge}）。既定の {np.asarray(g).tolist()} のまま")
+            else:
+                _up_label, _up_unit, _ = (nearest_axis(_grav.trunk_up, candidates=_candidate_axis_labels())
+                                          if _gravity_level_plane_on_runtime
+                                          else nearest_axis(_grav.up))
+                g = -_up_unit * float(np.linalg.norm(g)) + 0.0
+                _gravity_label = _opposite_axis_label(_up_label)
+                _gravity_set = True
+                print(f"[GRAVITY] 体幹から推定: up={_up_label} g={g.tolist()} "
+                      f"（体幹の傾き {_grav.lean_deg:.1f}°、{_grav.samples} フレーム）")
+        _raw_capture.note(gravity=np.asarray(g, dtype=float).tolist(), gravity_label=_gravity_label,
+                          gravity_set=bool(_gravity_set))
+
     # 計算とデータの格納をループで行う
     if len(kpts_3d) < 7:
         continue
@@ -3221,32 +3243,6 @@ while True:
         part_data["both_shoulder"],
     ]
 
-    # ======== 重力向きの自動検出（初期フレーム） ========
-    if GRAVITY_AUTO_DETECT and not _gravity_set:
-        try:
-            if part_data["both_shoulder"] and part_data["both_hip"]:
-                c_sh = np.array(part_data["both_shoulder"][-1]["centroid"], dtype=float)
-                c_hp = np.array(part_data["both_hip"][-1]["centroid"], dtype=float)
-                v_up = c_sh - c_hp  # 上方向推定
-                if np.all(np.isfinite(v_up)):
-                    _grav_up_samples.append(v_up)
-            if len(_grav_up_samples) >= GRAVITY_DETECT_FRAMES:
-                v_med = np.median(np.stack(_grav_up_samples, axis=0), axis=0)
-                up_label, axis_unit, cosabs = _pick_axis_from_vector(v_med)
-                g_label = _opposite_axis_label(up_label)
-                # gの大きさは既存gのノルムを保持
-                g_mag = float(np.linalg.norm(g)) if np.all(np.isfinite(g)) else 9.80665
-                # 上方向axis_unitに対して、重力は下向き
-                new_g = -axis_unit * g_mag
-                # ランタイムの g を更新
-                globals()['g'] = np.array(new_g, dtype=float)
-                globals()['_gravity_label'] = g_label
-                globals()['_gravity_set'] = True
-                if E_DEBUG:
-                    print(f"[GRAVITY] up={up_label} g={g_label} vec={new_g.tolist()} cos={cosabs:.3f} plane={GRAVITY_LEVEL_PLANE if GRAVITY_LEVEL_PLANE_ON else 'ANY'}")
-        except Exception as _ge:
-            if E_DEBUG:
-                print(f"[GRAVITY] detect failed: {_ge}")
     if any((lst is None) or (len(lst) == 0) for lst in required_lists):
         continue
     # 座位プッシュアップのモデル（push_up_model、KNOWN_ISSUES §2-1）で左右の腕を解く。
@@ -3303,7 +3299,8 @@ while True:
     if env_flag('OFFLINE_WRIST_CAPTURE', False):
         try:
             # Right side
-            _fw_vec_R = links.get('wrist_R')
+            # 手首の局所軸の link は手首→肘。読み手の規約（肘→手首）に合わせて反転して残す
+            _fw_vec_R = None if links.get('wrist_R') is None else -np.asarray(links['wrist_R'])
             _tau_wrist_R = locals_map.get('wrist_R')
             if '_offline_wrist_vectors' not in globals():
                 globals()['_offline_wrist_vectors'] = []  # type: ignore
@@ -3316,8 +3313,8 @@ while True:
                 globals()['_offline_wrist_vectors'].append(np.asarray(_fw_vec_R, dtype=float))  # type: ignore
                 tyR = float(_tau_wrist_R[1]) if (_tau_wrist_R is not None and np.all(np.isfinite(_tau_wrist_R))) else 0.0
                 globals()['_offline_wrist_tau_y'].append(tyR)  # type: ignore
-            # 左前腕（手首→肘。手首の局所軸の z と同じ向き）
-            _fw_vec_L = links.get('wrist_L')
+            # 左前腕（肘→手首）
+            _fw_vec_L = None if links.get('wrist_L') is None else -np.asarray(links['wrist_L'])
             _tau_wrist_L = locals_map.get('wrist_L')
             if _fw_vec_L is not None and np.all(np.isfinite(_fw_vec_L)):
                 globals()['_offline_wrist_vectors_L'].append(np.asarray(_fw_vec_L, dtype=float))  # type: ignore
@@ -3964,7 +3961,7 @@ if env_flag('OFFLINE_WRIST_CAPTURE', False):
             wt_arr = np.asarray(_wt, dtype=float)
             np.save(os.path.join(save_dir, f"forearm_R_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wv_arr)
             np.save(os.path.join(save_dir, f"tau_wrist_R_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wt_arr)
-            print(f"✅ OFFLINE_WRIST_CAPTURE: 保存 forearm_R_{timestamp}.npy / tau_wrist_R_{timestamp}.npy (N={len(wv_arr)})")
+            print(f"✅ OFFLINE_WRIST_CAPTURE: 保存 forearm_R_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy / tau_wrist_R_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy (N={len(wv_arr)})")
         else:
             print('[OFFLINE_WRIST_CAPTURE] データ不足のため保存スキップ')
         # Left side save
@@ -3975,7 +3972,7 @@ if env_flag('OFFLINE_WRIST_CAPTURE', False):
             wt_arr_L = np.asarray(_wtL, dtype=float)
             np.save(os.path.join(save_dir, f"forearm_L_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wv_arr_L)
             np.save(os.path.join(save_dir, f"tau_wrist_L_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy"), wt_arr_L)
-            print(f"✅ OFFLINE_WRIST_CAPTURE: 保存 forearm_L_{timestamp}.npy / tau_wrist_L_{timestamp}.npy (N={len(wv_arr_L)})")
+            print(f"✅ OFFLINE_WRIST_CAPTURE: 保存 forearm_L_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy / tau_wrist_L_{timestamp}_s{OUTPUT_SCHEMA_VERSION}.npy (N={len(wv_arr_L)})")
     except Exception as _sv_e:  # noqa: BLE001
         print(f"[OFFLINE_WRIST_CAPTURE] 保存失敗: {_sv_e}")
 # %%
@@ -3989,3 +3986,7 @@ try:
         print('[INFO] m_max_part を編集したい場合は ./m_max_part_SXXX.json の形式で作成してください (例: m_max_part_S001.json)。')
 except Exception:
     pass
+
+# EKF の体格比がありえなかったなど、途中で止めた理由を終了コードで返す（CSV の書き出しは済んでいる）
+if _exit_code:
+    raise SystemExit(_exit_code)

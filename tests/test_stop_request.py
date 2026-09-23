@@ -96,6 +96,40 @@ class TestTheLoopEndsCleanly:
         assert marker.exists(), "SIGTERM で終了時の書き出しが走らなかった"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM を送れるのは POSIX")
+class TestSecondSignal:
+    """停止要求の後にループが固まっても、2 回目の SIGTERM では止まる（端末から kill できる）。"""
+
+    def test_a_second_sigterm_terminates(self, tmp_path):
+        child = textwrap.dedent(
+            f"""
+            import sys, time
+            sys.path.insert(0, {str(REPO_ROOT)!r})
+            from app.core.stop_request import StopRequest
+
+            stop = StopRequest()
+            stop.install_signal_handlers()
+            print("ready", flush=True)
+            while not stop.requested():
+                time.sleep(0.01)
+            print("requested", flush=True)
+            time.sleep(60)   # 終了時処理が固まったつもり
+            """
+        )
+        proc = subprocess.Popen([sys.executable, "-c", child], stdout=subprocess.PIPE, text=True)
+        try:
+            assert proc.stdout.readline().strip() == "ready"
+            proc.send_signal(signal.SIGTERM)
+            assert proc.stdout.readline().strip() == "requested"
+            proc.send_signal(signal.SIGTERM)
+            code = proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdout.close()
+        assert code == -signal.SIGTERM, "2 回目の SIGTERM でも止まらない"
+
+
 class TestWiring:
     """ランナーが停止ファイルを渡し、計測スクリプトがループの先頭でそれを見る。"""
 

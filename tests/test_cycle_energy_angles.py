@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from compute_cycle_energy_elbow_wrist import LEFT, RIGHT, _joint_powers
+from compute_cycle_energy_elbow_wrist import LEFT, RIGHT, _joint_powers, _joint_projections
 
 DT = 1.0 / 30.0
 UPPER_ARM = 0.30
@@ -218,6 +218,29 @@ class TestWristAxis:
         power = _wrist_power_with_hand([0.06, 0.06, 0.0])
         assert float(np.median(power[2:-2])) == pytest.approx(0.3, rel=0.03), (
             "手の点があるのに手のひら（前腕と手に直交する軸）から軸を作っていない")
+
+
+class TestUpAxis:
+    """腕がまっすぐで親との外積が潰れるフレームでは、基準軸（上向き）で局所軸を作る。
+
+    トルク CSV の局所列は重力の逆向きを基準軸にしているので、スコアも同じ上向きを渡す。
+    渡さないと、そのフレームだけ局所軸が全体座標の z を基準にした別の軸になる。
+    """
+
+    def test_a_straight_arm_uses_the_given_up_direction(self):
+        from utils import compute_local_torque
+
+        n = 12
+        wrist = np.zeros((n, 3))
+        elbow = np.tile([0.25, 0.0, 0.0], (n, 1))     # 腕はまっすぐ水平（x 方向）
+        shoulder = np.tile([0.55, 0.0, 0.0], (n, 1))
+        pose = _pose_df(RIGHT, wrist, elbow, shoulder)
+        tau = np.tile([1.0, 2.0, 3.0], (n, 1))
+        torque = _torque_df("R", tau, np.zeros((n, 3)))
+        up = np.array([0.0, -1.0, 0.0])               # カメラ座標: y が下
+        proj = _joint_projections(pose, torque, "R", DT, up_axis=up)
+        expected = compute_local_torque(tau[0], shoulder[0] - elbow[0], elbow[0] - wrist[0], up)[1]
+        np.testing.assert_allclose(proj["elbow"][0], expected)
 
 
 class TestMirrorSymmetry:

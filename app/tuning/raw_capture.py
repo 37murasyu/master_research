@@ -73,12 +73,21 @@ class RawCaptureWriter:
             landmark_ids=self.landmark_ids,
             created=datetime.now().isoformat(timespec="seconds"),
         )
-        sidecar_path(self.path).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._meta = meta
+        self._write_sidecar()
 
         self._fh = self.path.open("w", encoding="utf-8", newline="")
         self._writer = csv.writer(self._fh, lineterminator="\n")
         self._writer.writerow(_header(self.landmark_ids))
         self._fh.flush()
+
+    def _write_sidecar(self) -> None:
+        sidecar_path(self.path).write_text(json.dumps(self._meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def note(self, **fields: Any) -> None:
+        """起動の後で決まった値（重力、EKF の体格比など）をサイドカーに書き足す。"""
+        self._meta.update(fields)
+        self._write_sidecar()
 
     def append(self, frame: int, t: float, points: np.ndarray) -> None:
         arr = np.asarray(points, dtype=float)

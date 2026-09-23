@@ -370,3 +370,23 @@ class TestRobustness:
         assert set(measurement.latest_cycle_work) == {
             "wrist_R", "elbow_R", "shoulder_R", "wrist_L", "elbow_L", "shoulder_L",
         }
+
+
+class TestGravity:
+    """重力は慣性テンソルを確定する初期フレームの体幹から決める（KNOWN_ISSUES §1-5）。"""
+
+    def test_level_cameras_give_minus_z(self):
+        measurement = TestPipeline()._run(frames=40)
+        np.testing.assert_allclose(measurement.gravity, [0.0, 0.0, -9.81], atol=1e-9)
+
+    def test_without_the_hips_the_default_is_kept_with_a_warning(self):
+        """腰が一度も取れないときに落ちない（phone-path に配線したとき受信ループが止まる）。"""
+        from config import g as default_gravity
+        from config import slot_of
+
+        measurement = _measurement()
+        samples = np.stack([_body_points(k / 30.0) * 0.01 for k in range(measurement.config.inertia_ready_frames)])
+        samples[:, [slot_of("L_HIP"), slot_of("R_HIP")]] = np.nan
+        with pytest.warns(RuntimeWarning, match="重力"):
+            measurement._build_inertia(samples)
+        np.testing.assert_allclose(measurement.gravity, default_gravity)

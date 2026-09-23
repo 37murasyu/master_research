@@ -95,6 +95,12 @@ SEGMENT_TO_OUTPUT = {
 
 JOINTS = ("wrist", "elbow", "shoulder")
 
+# どの部位がどの部位に加えるトルクか（config.OUTPUT_SCHEMA_VERSION の v2 の説明と同じ）
+TORQUE_CONVENTION = (
+    "wrist: hand->forearm, elbow: forearm->upper_arm (hand is the fixed end), "
+    "shoulder: trunk->hanging arm; local y = parent x link (push_up_model.joint_axes)"
+)
+
 OUTPUT_PART_ORDER = [
     "wrist_R",
     "elbow_R",
@@ -734,8 +740,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
 
     if args.wrist_base:
+        if args.dumbbell_mass_right or args.dumbbell_mass_left:
+            warnings.warn(
+                "--dumbbell-mass-* は腕を肩から吊る鎖（--no-wrist-base）でだけ使う。座位プッシュアップの"
+                "モデルでは無視する（dumbbell mass is ignored with --wrist-base）", UserWarning, stacklevel=1)
         load = torso_load_mass(body_mass, args.support_share, args.torso_mass)
         meta["model"] = "wrist_base"
+        meta["torque_convention"] = TORQUE_CONVENTION
         meta["torso_load_mass_per_arm"] = load
         meta["local_frame_fallbacks"] = {}
         meta["wrist_axis"] = {}

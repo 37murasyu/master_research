@@ -102,18 +102,20 @@ class TestSameTorqueFromTheSamePose:
         assert 5.0 < np.linalg.norm(phone["wrist_R"]) < 40.0
 
 
+@pytest.fixture(scope="module")
+def called():
+    """master_research_code.py で呼ばれている関数名。"""
+    tree = ast.parse(io.open(MAIN_SCRIPT, encoding="utf-8").read())
+    return {
+        node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+        for node in ast.walk(tree) if isinstance(node, ast.Call)
+    }
+
+
 class TestRealtimeWiring:
     """USB 経路（import できない）が同じ関数を呼んでいることを AST で確かめる。"""
 
-    @pytest.fixture(scope="class")
-    def called(self):
-        tree = ast.parse(io.open(MAIN_SCRIPT, encoding="utf-8").read())
-        return {
-            node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
-            for node in ast.walk(tree) if isinstance(node, ast.Call)
-        }
-
-    @pytest.mark.parametrize("name", ["push_up_torques", "arm_axes", "segment_from_storage"])
+    @pytest.mark.parametrize("name", ["push_up_torques", "arm_axes", "segment_from_storage", "estimate_gravity"])
     def test_uses_the_shared_model(self, called, name):
         assert name in called, f"master_research_code.py が {name} を呼んでいない"
 

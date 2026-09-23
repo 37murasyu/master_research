@@ -142,3 +142,37 @@ class TestEkfCalibrationTask:
         from app import entry
 
         assert entry.resolve_module("script", "app.runners.tune_ekf") == "app.runners.tune_ekf"
+
+
+class TestStopDirectory:
+    """停止ファイル（§3-2）を置く一時ディレクトリは、計測のときだけ作り、残さない。"""
+
+    def test_only_the_measurement_gets_a_stop_directory(self, qt_app, monkeypatch):
+        import sys
+        import tempfile
+
+        from app import entry
+        from app.runners.worker import WorkerRunner
+
+        made = []
+        real_mkdtemp = tempfile.mkdtemp
+        monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix="": made.append(prefix) or real_mkdtemp(prefix=prefix))
+        monkeypatch.setattr(entry, "worker_command", lambda role, passthrough=None, module=None: [sys.executable, "-c", "pass"])
+        runner = WorkerRunner("script")
+        assert runner.start(Settings(), module="dummy")
+        runner._process.waitForFinished(5000)
+        assert made == [], "停止ファイルを見ない役割にも停止用のディレクトリを作っている"
+
+    def test_a_failed_start_leaves_no_directory(self, qt_app, monkeypatch, tmp_path):
+        import tempfile
+
+        from app import entry
+        from app.runners.worker import WorkerRunner
+
+        real_mkdtemp = tempfile.mkdtemp
+        monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix="": real_mkdtemp(prefix=prefix, dir=tmp_path))
+        monkeypatch.setattr(entry, "worker_command",
+                            lambda role, passthrough=None, module=None: [str(tmp_path / "no_such_program")])
+        runner = WorkerRunner("realtime")
+        assert runner.start(Settings()) is False
+        assert not list(tmp_path.glob("wt_stop_*")), "起動に失敗したのに停止用のディレクトリが残った"

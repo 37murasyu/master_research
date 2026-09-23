@@ -78,7 +78,8 @@ class WorkerRunner(QtCore.QObject):
             return False
 
         command = entry.worker_command(self.role, passthrough, module=module)
-        self._stop_dir = tempfile.mkdtemp(prefix="wt_stop_")
+        # 停止ファイルを見るのは計測（master_research_code.py）だけ。ほかの役割には作らない
+        self._stop_dir = tempfile.mkdtemp(prefix="wt_stop_") if self.role == "realtime" else None
         environment = entry.worker_environment(settings, role=self.role, stop_file=self._stop_file())
 
         process_env = QtCore.QProcessEnvironment()
@@ -92,6 +93,8 @@ class WorkerRunner(QtCore.QObject):
 
         if not self._process.waitForStarted(5000):
             self.output.emit(f"[エラー] 起動できませんでした: {self._process.errorString()}\n")
+            # 起動に失敗すると finished が来ないので、ここで片付ける
+            self._remove_stop_dir()
             self.state_changed.emit("stopped")
             return False
 
@@ -136,6 +139,11 @@ class WorkerRunner(QtCore.QObject):
     def _stop_file(self) -> str | None:
         return None if self._stop_dir is None else str(Path(self._stop_dir) / "stop")
 
+    def _remove_stop_dir(self) -> None:
+        if self._stop_dir is not None:
+            shutil.rmtree(self._stop_dir, ignore_errors=True)
+            self._stop_dir = None
+
     def _drain_output(self) -> None:
         data = self._process.readAllStandardOutput()
         text = bytes(data).decode("utf-8", errors="replace")
@@ -144,9 +152,7 @@ class WorkerRunner(QtCore.QObject):
 
     def _on_finished(self, exit_code: int, _status) -> None:
         self._drain_output()
-        if self._stop_dir is not None:
-            shutil.rmtree(self._stop_dir, ignore_errors=True)
-            self._stop_dir = None
+        self._remove_stop_dir()
         self.output.emit(f"[終了] 終了コード {exit_code}\n")
         self.state_changed.emit("stopped")
         self.finished.emit(exit_code)

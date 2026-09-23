@@ -127,6 +127,14 @@ class TestDefaults:
         assert np.all(_norms(torque, "wrist_R") == 0.0)
 
 
+class TestIgnoredOptions:
+    def test_a_dumbbell_with_the_push_up_model_is_warned(self, tmp_path):
+        """ダンベルは腕を肩から吊る鎖（--no-wrist-base）でしか使わない。黙って捨てない。"""
+        csv = _write_csv(tmp_path / "s.csv", _frames(BODY_Z_UP, 40, False))
+        with pytest.warns(UserWarning, match="dumbbell"):
+            _run(tmp_path, csv, "--dumbbell-mass-right", "5")
+
+
 class TestElbowRecalculation:
     """``recalc_elbow_local_torque.py`` は肘の局所列を同じ軸で作り直すだけで、値を変えない。
 

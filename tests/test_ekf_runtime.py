@@ -130,12 +130,13 @@ class TestBodyScale:
             body_scale_ratio({"pair": [12, 14], "median_len": 0.30}, length)
 
 
+@pytest.fixture(scope="module")
+def module():
+    return ast.parse((REPO_ROOT / "master_research_code.py").read_text(encoding="utf-8"))
+
+
 class TestRuntimeWiring:
     """``master_research_code.py``（import できない）の配線を AST で確かめる。"""
-
-    @pytest.fixture(scope="class")
-    def module(self):
-        return ast.parse((REPO_ROOT / "master_research_code.py").read_text(encoding="utf-8"))
 
     @staticmethod
     def _first_line(module, predicate):
