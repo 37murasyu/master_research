@@ -35,19 +35,37 @@ class MeasurementSession:
     def directory(self):
         return self.recorder.directory if self.recorder else None
 
+    def _raw_provenance(self, measurement):
+        """生 3D（kpts3d_raw）のサイドカー。USB の kpts3d_raw と同じ鍵に、混成の出どころを足す。"""
+        ekf = self.config.ekf
+        noise = None if measurement.ekf is None else measurement.ekf.noise
+        return {
+            "unit": "m",
+            "frame": "runtime",
+            "dt": 1.0 / 30.0,
+            "dt_source": "混成ステレオの同期バッファの 30 Hz の格子（抜けた格子は NaN の行）",
+            "src_fps": 30.0,
+            "source": "hybrid",
+            "times": "grid",
+            "file_mode": False,
+            "RT_POSE_FIXED_HZ_ON": False,
+            "EKF_ENABLE": bool(ekf.enabled),
+            "EKF_GATE_STD": ekf.gate_std,
+            "EKF_ROBUST_GATE": bool(ekf.robust_gate),
+            "EKF_MAX_GAP_S": ekf.max_gap_s,
+            "EKF_BPF_LOW": ekf.bpf_low,
+            "EKF_BPF_HIGH": ekf.bpf_high,
+            "EKF_BPF_ORDER": ekf.bpf_order,
+            "EKF_VECTORIZED": True,
+            "HYBRID_EKF_PROFILE": ekf.profile,
+            "ekf_noise": None if noise is None else noise.provenance(),
+            "coordinates": "(-camera_x, -camera_z, -camera_y)",
+            "calibration": str(self.calibration.directory),
+        }
+
     def _ensure(self):
         if self.recorder is None:
-            self.recorder = Recorder(
-                self.calibration,
-                pose_keypoints,
-                root=self.root,
-                metadata=dict(
-                    self.metadata,
-                    body_mass_kg=self.config.body_mass_kg,
-                    gravity_mode=self.config.gravity_mode,
-                ),
-            )
-            self.measurement = NetworkMeasurement(
+            measurement = NetworkMeasurement(
                 *self.calibration.projections,
                 pose_keypoints,
                 self.config,
@@ -56,6 +74,22 @@ class MeasurementSession:
                 # 校正の最後に盤を立てた向き（無ければ None で、重力は体幹から決める）
                 board_up=read_board_up(self.calibration.meta),
             )
+            self.recorder = Recorder(
+                self.calibration,
+                pose_keypoints,
+                root=self.root,
+                metadata=dict(
+                    self.metadata,
+                    body_mass_kg=self.config.body_mass_kg,
+                    gravity_mode=self.config.gravity_mode,
+                    subject_id=self.config.subject_id,
+                    one_rm_kg=None if self.config.one_rm is None else dict(self.config.one_rm),
+                    dyn_gate=self.config.dyn_gate,
+                ),
+                raw_provenance=self._raw_provenance(measurement),
+            )
+            self.measurement = measurement
+            self.recorder.meta["ekf"] = self.measurement.ekf_provenance()
             if self.tracker is not None:
                 # 記録を始めた＝Pixel の点が届いた
                 self.tracker.set_link("connected")
@@ -104,6 +138,12 @@ class MeasurementSession:
             for pair in pairs:
                 result = self.measurement.process(pair)
                 if result is not None:
+                    if result.window_closed:
+                        # 先頭の窓で重力が決まった。窓を閉じたこのフレームから横長のトルクを書く
+                        self.recorder.note_raw(**self.measurement.window)
+                        label = self.measurement.window.get("gravity_label")
+                        if label:
+                            self.recorder.open_torque_vectors(label)
                     self.recorder.record(result)
         except ImplausibleBodyScale as exc:
             # 座標の単位か校正が壊れている。トルクが桁違いになるので止める（終了コード 3、理由は meta.json の error）
@@ -126,7 +166,9 @@ class MeasurementSession:
         if self.recorder is None:
             return  # Pixel の点が一度も届かなかった。残すものは無い
         try:
+            summary = self.measurement.summary() if self.measurement is not None else {}
             self.recorder.close(
+                **summary,
                 status="failed" if self.exit_code else "complete",
                 exit_code=self.exit_code,
                 error=self.error,

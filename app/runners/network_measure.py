@@ -11,7 +11,7 @@
 再利用しているもの:
     push_up_model（座位プッシュアップのモデル。USB・オフライン経路と共有）
         estimate_gravity / joint_axes / push_up_torques / segment_from_storage
-    utils.compute_local_torque / compute_joint_power / PushCycleDetector
+    utils.compute_local_torque / compute_joint_power
     utils_dynamic.calculate_inertia_tensor
     link_vector_calculator_module.LinkVectorCalculator
     body_part_storage_module.BodyPartDataStorage
@@ -25,7 +25,14 @@
     - キーポイントの並び順（config.pose_keypoints の昇順）
     - リンク定義（part_calculations）と、関節ごとの局所軸（push_up_model.joint_axes）
     - 慣性テンソルの部位行と長さの取り方
-    - サイクル検出の軸（既定 y）、閾値、mode='rise_to_rise'
+
+混成だけのもの（2026-09-24、USB 経路は触らない）:
+    - 回の区切りと力学の関所は ``app.hybrid.rep_detector.RepDetector``（肩の中点の重力の上向きへの射影＝高さ）。
+      USB と同じ ``PushCycleDetector``（左肩の y の往復）は、実行時の座標の y が奥行きなので、手を固定して体幹が
+      上下するだけの押し上げで 1 回も閉じなかった
+    - トルクと仕事率は関所によらず毎フレーム計算して記録し、仕事とゲージには関所が開いている間だけ積む
+      （座っている間の雑音の仕事を積まない。``MeasurementConfig.dyn_gate``）
+    - 仕事はフレームごとの dt で積む（``app.hybrid.rep_work``）
 
 **揃っていない点（重要）**:
     サイクルごとの量は仕事率 P = τ_y × (ω_リンク − ω_親)·y を積分した**仕事 [J]** で、既存の
@@ -36,7 +43,9 @@
 from __future__ import annotations
 
 import math
+import time
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
@@ -66,17 +75,18 @@ from push_up_model import (
     torso_load_mass,
     trunk_up_vectors,
 )
-from utils import PushCycleDetector, compute_local_torque
+from utils import compute_local_torque
 from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transform_native
 
-from energy_pipeline import angle_between
+from energy_pipeline import AdaptiveCutoff, EnergyFilterConfig, angle_between, compute_cycle_energy_filtered
 
 from app.gauge.thresholds import PartBand, part_bands
+from app.hybrid.demo_gauge import DemoConfig, DemoGauge
 from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
 from app.hybrid.gravity import GravityChoice, choose_gravity
-from app.hybrid.rep_detector import RepConfig, RepDetector
+from app.hybrid.rep_detector import RepConfig, RepDetector, RepEvent
 from app.tuning.ekf_profile import SCALE_REF_PAIR, body_scale_ratio
-from app.hybrid.rep_work import MAX_STEP_S, RepAccumulator, WorkSample
+from app.hybrid.rep_work import MAX_STEP_S, PartWork, RepAccumulator, WorkSample
 from app.net.sync_buffer import PairedSample
 
 # 歪み補正で扱う画像の外側の余白（幅・高さに対する比）。NetworkMeasurement._undistort を参照。
@@ -109,6 +119,12 @@ class ImplausibleBodyScale(ValueError):
 DEFAULT_GRAVITY = np.asarray(_CONFIG_GRAVITY, dtype=np.float64)
 
 
+# 腕の長さの安全策で、長さがずれたフレームの後に積まないフレーム数を含めた幅（そのフレーム＋差分で速度・
+# 加速度にそれを使う後の 2 フレーム）
+_ARM_HISTORY = 3
+# process の時間を中央値・95% の計算に残すフレーム数（30 Hz で 5 分）
+_TIMING_WINDOW = 9000
+
 # リンク定義は config.part_calculations が正本（USB 経路と共通）。
 # ここでは (start, end) のタプル形式に落として使う。
 PART_LINKS: dict[str, tuple[int, int]] = {
@@ -117,8 +133,8 @@ PART_LINKS: dict[str, tuple[int, int]] = {
 
 # 部位キーは config.py が持っている（順序も一致）。
 PART_KEYS = tuple(_PART_KEYS)
-
-_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+# ゲージに出す部位（肩は出さない。app.gauge.protocol.PART_NAMES と同じ）
+GAUGE_PARTS = ("elbow_L", "elbow_R", "wrist_L", "wrist_R")
 
 
 @dataclass
@@ -132,21 +148,6 @@ class MeasurementConfig:
     # 1 フレームの瞬時値だとその瞬間の三角測量誤差が全実行に固定される（再検算 R-6）。
     inertia_ready_frames: int = INERTIA_LENGTH_FRAMES
     dynamics_ready_frames: int = max(7, INERTIA_LENGTH_FRAMES)
-
-    # サイクル検出の基準値を作るフレーム範囲（既存と同じ 5..14）
-    baseline_first_frame: int = 5
-    baseline_last_frame: int = 14
-    # 基準値を確定させるのに最低限必要なサンプル数。欠測があっても
-    # これだけ集まれば検出器を作る（1 フレームの欠測で無効化されないように）。
-    baseline_min_samples: int = 3
-
-    # サイクル検出に使う軸。既存の RT_CYCLE_AXIS（既定 'y'）に合わせる。
-    cycle_axis: str = "y"
-    cycle_threshold: float = 0.015
-    cycle_velocity_epsilon: float = 0.01
-    cycle_min_interval: int = 10
-    cycle_mode: str = "rise_to_rise"
-    cycle_negative_down: bool = True
 
     # 重力の決め方（push_up_model.estimate_gravity の mode）。慣性テンソルを確定する
     # 初期フレームの体幹の向きから決める。
@@ -163,6 +164,17 @@ class MeasurementConfig:
 
     # 押し上げの回の区切り（関所を兼ねる、app.hybrid.rep_detector）
     rep: RepConfig = field(default_factory=RepConfig)
+    # 力学の関所（HYBRID_DYN_GATE）。偽なら常に開いた扱い（回の区切りは RepDetector のまま）
+    dyn_gate: bool = True
+    # デモ（DEMO_MONO_GAUGE_ON=1）。None でなければ、ゲージの now をトルクではなく 3D の肩の上昇と肘角の変化で
+    # 動かす（app.hybrid.demo_gauge）。回の区切り・トルク・記録は今までどおり
+    demo: DemoConfig | None = None
+    # 肘の濾波 E± の前処理（energy_pipeline、USB の E_*）。計測の子は EnergyFilterConfig.from_env() を渡す
+    energy_filter: EnergyFilterConfig = field(default_factory=EnergyFilterConfig)
+    # 腕の長さの安全策: 先頭の窓の上腕長・前腕長（中央値）から、この比を超えてずれた腕の仕事率を回とゲージに
+    # 積まない（トルクは記録する）。0 で無効。三角測量の誤りが続くと EKF でも吸収しきれず、2026-09-23 の実機の
+    # 記録の再生で右腕の |τy| が最大 24 万 N·m になった
+    arm_length_tolerance: float = 0.25
 
     # EKF（app.hybrid.ekf）。既定は有効・同梱の既定値の雑音。計測の子は EkfSettings.from_env() を渡す
     ekf: EkfSettings = field(default_factory=EkfSettings)
@@ -171,10 +183,6 @@ class MeasurementConfig:
     # 物理計算が実際に見るのは直近 2 フレームだけ（LinkVectorCalculator は
     # i と i-1、calculate_M_and_F は [-1] しか使わない）。
     history_limit: int = 600
-
-    @property
-    def cycle_axis_index(self) -> int:
-        return _AXIS_INDEX.get(self.cycle_axis.strip().lower(), 1)
 
 
 @dataclass
@@ -200,6 +208,21 @@ class FrameResult:
     velocity: np.ndarray | None = None
     # このフレームで先頭の窓が閉じた（体格・重力・帯が決まった）
     window_closed: bool = False
+    # 関所が開いていた（このフレームの仕事を回とゲージに積んだ）。先読みで後から積んだフレームは偽のまま
+    dyn_active: bool = False
+    # 高さ = 肩の中点・上向き u [m]（窓が閉じる前・肩が無いフレームは NaN）
+    height_m: float = float("nan")
+    # このフレームが属する回の番号（0 始まり＝それまでに確定した回の数）
+    rep: int = 0
+    # 腕の長さの安全策（L・R）。偽ならその腕の仕事率を回とゲージに積まなかった
+    arm_ok: dict[str, bool] = field(default_factory=lambda: {"L": True, "R": True})
+    # 回を確定したフレームだけ: 部位ごとの W+・W−（app.hybrid.rep_work.PartWork）と W_1RM [J]（帯が無い部位は None）
+    cycle_parts: dict[str, PartWork] = field(default_factory=dict)
+    cycle_w1rm: dict[str, float | None] = field(default_factory=dict)
+    # このフレームの後のゲージの値（今の回の W+ [J]、部位 → 値）。tracker があればその値（デモなら置いた値）
+    gauge_now: dict[str, float] = field(default_factory=dict)
+    # 回を確定したフレームだけ: 肘の濾波 E±（部位 → {"e_pos","e_neg","fc","n_u"}）
+    cycle_energy: dict[str, dict] = field(default_factory=dict)
 
 
 class NetworkMeasurement:
@@ -247,6 +270,15 @@ class NetworkMeasurement:
         # 100 ms を超える抜けで速度の計算をやり直した回数
         self.dynamics_restarts = 0
 
+        # process の時間 [s]（直近 _TIMING_WINDOW フレームと、全体の最大）。meta の timing に残す
+        self._durations: deque[float] = deque(maxlen=_TIMING_WINDOW)
+        self._duration_max = 0.0
+        self._timed = 0
+
+        self._demo = None if self.config.demo is None else DemoGauge(self.config.demo)
+        # 肘の濾波 E± の適応カットオフ（E_FC_ADAPTIVE_ON=1 のときだけ動く）。毎フレーム左右の肘角の平均を渡す
+        self._cutoff = AdaptiveCutoff(self.config.energy_filter, fps=30.0)
+
         # EKF（app.hybrid.ekf）。無効なら None
         self.ekf = GridEkf(self.config.ekf, self.pose_keypoints) if self.config.ekf.enabled else None
 
@@ -264,16 +296,20 @@ class NetworkMeasurement:
         self.up: np.ndarray | None = None
         self.baseline_height_m: float | None = None
         self.forearm_m: dict[str, float | None] = {}
+        self.upper_arm_m: dict[str, float | None] = {}
+        # 腕の長さの安全策: 最後に長さがずれてからのフレーム数と、積まなかったフレーム数
+        self._arm_clean = {"L": _ARM_HISTORY, "R": _ARM_HISTORY}
+        self.arm_guard_rejected = {"L": 0, "R": 0}
         self.bands: dict[str, PartBand] = {}
         self.rep_detector: RepDetector | None = None
         # ゲージの状態（app.gauge.tracker.GaugeTracker）。None なら積まない
         self.tracker = tracker
 
-        # サイクル検出
-        self._baseline_sum = 0.0
-        self._baseline_samples = 0
-        self._detector = None
+        # 確定した回。cycle_work は部位ごとの符号付きの仕事 W± [J]、cycles は回ごとの詳細（frame・t_ns・parts）
         self.cycle_work: dict[str, list[float]] = {k: [] for k in PART_KEYS}
+        self.cycles: list[dict] = []
+        # 押し上げでなかった回（最小の持ち上げに届かず捨てた）の数
+        self.discarded_reps = 0
         # 今の回の仕事。フレームごとの dt で積む（かつては確定したフレームの dt を全体に掛けていた）
         self.rep_work = RepAccumulator(PART_KEYS)
 
@@ -296,6 +332,25 @@ class NetworkMeasurement:
 
     def process(self, pair: PairedSample) -> FrameResult | None:
         """1 ペアを処理する。まだ計算できない段階では None を返す。"""
+        start = time.perf_counter()
+        try:
+            return self._process(pair)
+        finally:
+            elapsed = time.perf_counter() - start
+            self._durations.append(elapsed)
+            self._duration_max = max(self._duration_max, elapsed)
+            self._timed += 1
+
+    def timing(self) -> dict:
+        """process の時間 [ms]（直近の中央値・95%・全体の最大）。受信スレッドの予算は 30 Hz で 33 ms。"""
+        if not self._durations:
+            return {"frames": 0, "median_ms": None, "p95_ms": None, "max_ms": None}
+        recent = np.asarray(self._durations) * 1e3
+        return {"frames": self._timed, "median_ms": float(np.median(recent)),
+                "p95_ms": float(np.percentile(recent, 95)), "max_ms": self._duration_max * 1e3,
+                "window": len(recent)}
+
+    def _process(self, pair: PairedSample) -> FrameResult | None:
         raw = self.points_3d(pair)
         if raw is None:
             return None
@@ -318,7 +373,6 @@ class NetworkMeasurement:
             del self._recent_points[0]
 
         self._update_links(dt)
-        self._update_baseline(raw)
 
         result = FrameResult(t_ns=pair.t_ns, points_3d=points, dt_s=dt, points_raw=raw,
                              grid_index=grid, velocity=velocity)
@@ -328,11 +382,20 @@ class NetworkMeasurement:
 
         if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
             dynamics = self._dynamics(points)
+            sample = None
+            result.arm_ok = self._arm_ok(points)
             if dynamics is not None:
                 result.local_torques, result.powers, theta, tau_y = dynamics
-                self.rep_work.add(WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y))
-                self._accumulate_cycle(points, dt, result)
+                angles = [v for v in theta.values() if math.isfinite(v)]
+                if angles:
+                    self._cutoff.step(float(np.mean(angles)))
+                sample = self._guarded_sample(
+                    WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y), result.arm_ok)
+            self._gate(points, velocity, dt, sample, result)
 
+        if self._demo is not None and self.tracker is not None and self.window_closed:
+            self.tracker.set_now(self._demo.update(points, self.up, self.bands))
+        result.gauge_now = self._gauge_now()
         self.frame_index += 1
         self._append_result(result)
         self._trim_storage()
@@ -405,6 +468,35 @@ class NetworkMeasurement:
             self._t0_ns = t_ns
         return round((t_ns - self._t0_ns) / GRID_NS)
 
+    def summary(self) -> dict:
+        """計測を閉じるときに meta.json へ残す値（被験者の帯・重力・EKF・関所・腕の長さの安全策）。"""
+        from config import OUTPUT_SCHEMA_VERSION
+
+        choice = self.gravity_choice
+        bands = self.bands
+        return {
+            "output_schema_version": OUTPUT_SCHEMA_VERSION,
+            "forearm_len_m": dict(self.forearm_m) or None,
+            "upper_arm_len_m": dict(self.upper_arm_m) or None,
+            "w1rm_j": {part: band.w1rm for part, band in bands.items()} or None,
+            "gauge_bands_j": {part: (None if band.band is None else list(band.band)) for part, band in bands.items()} or None,
+            "gauge_band_reasons": {part: band.reason for part, band in bands.items() if band.reason} or None,
+            "gravity": None if choice is None else {
+                "source": choice.source, "label": choice.label, "vector": np.asarray(choice.vector).tolist(),
+                "up_label": choice.up_label, "detail": choice.detail,
+            },
+            "ekf": self.ekf_provenance(),
+            "dyn_gate": self.config.dyn_gate,
+            "demo": self._demo is not None,
+            "baseline_height_m": self.baseline_height_m,
+            "reps": self.cycle_count,
+            "discarded_reps": self.discarded_reps,
+            "dynamics_restarts": self.dynamics_restarts,
+            "arm_length_guard": {"tolerance": self.config.arm_length_tolerance,
+                                 "rejected_frames": dict(self.arm_guard_rejected)},
+            "timing": self.timing(),
+        }
+
     def ekf_provenance(self) -> dict:
         """EKF の出どころ（meta.json・サイドカー用）。"""
         return {"enabled": False} if self.ekf is None else self.ekf.provenance()
@@ -432,43 +524,6 @@ class NetworkMeasurement:
                 continue
             r_vec, vel, omega, centroid, p1, acc, ang_acc = result
             self.storage.add_data(part, r_vec, vel, omega, centroid, p1, ang_acc, acc)
-
-    def _cycle_value(self, points: np.ndarray) -> float:
-        """サイクル検出に使うスカラー。既存は右手首相当の点の指定軸。"""
-        return float(points[0][self.config.cycle_axis_index])
-
-    def _update_baseline(self, points: np.ndarray) -> None:
-        """サイクル検出の基準値（安定座位での値）を作る。
-
-        欠測に強くしてある。既存はフレーム番号ちょうどで検出器を作るので、
-        その 1 フレームが欠測だと以後一度も検出されない。ここでは
-        実際に集まったサンプル数で平均し、範囲を過ぎた時点で確定させる。
-        """
-        config = self.config
-        value = self._cycle_value(points)
-
-        in_window = config.baseline_first_frame <= self.frame_index <= config.baseline_last_frame
-        if in_window and math.isfinite(value):
-            self._baseline_sum += value
-            self._baseline_samples += 1
-
-        if self._detector is not None:
-            return
-        if self.frame_index < config.baseline_last_frame:
-            return
-        if self._baseline_samples < config.baseline_min_samples:
-            # まだ足りない。窓を過ぎても集まるまで待つ（全滅時は検出しない）。
-            return
-
-        baseline = self._baseline_sum / self._baseline_samples
-        self._detector = PushCycleDetector(
-            baseline,
-            threshold=config.cycle_threshold,
-            velocity_epsilon=config.cycle_velocity_epsilon,
-            min_interval=config.cycle_min_interval,
-            mode=config.cycle_mode,
-            negative_down=config.cycle_negative_down,
-        )
 
     def _collect_window(self, raw: np.ndarray, points: np.ndarray, result: FrameResult) -> None:
         """肩と肘が有限の組を先頭の窓に溜め、埋まったら閉じる。"""
@@ -513,6 +568,7 @@ class NetworkMeasurement:
             return float(np.median(lengths)) if lengths.size else None
 
         self.forearm_m = {side: median_length(f"{side}_ELBOW", f"{side}_WRIST") for side in ("L", "R")}
+        self.upper_arm_m = {side: median_length(f"{side}_SHOULDER", f"{side}_ELBOW") for side in ("L", "R")}
         self.bands = part_bands(self.config.body_mass_kg, self.forearm_m, self.config.one_rm or {})
         if self.tracker is not None:
             self.tracker.set_bands(self.bands)
@@ -614,24 +670,126 @@ class NetworkMeasurement:
             tau_y[f"elbow_{side}"] = float(local[f"elbow_{side}"][1])
         return {key: local[key] for key in PART_KEYS}, powers_by_key, theta, tau_y
 
-    def _accumulate_cycle(self, points: np.ndarray, dt: float, result: FrameResult) -> None:
-        """サイクルを検出し、その区間の仕事を積む。"""
-        if self._detector is None:
-            return
+    def _arm_ok(self, points: np.ndarray) -> dict[str, bool]:
+        """腕の長さの安全策。上腕長か前腕長が先頭の窓の中央値から許容の比を超えてずれた腕は偽。
 
-        value = self._cycle_value(points)
-        if not math.isfinite(value):
-            return
+        速度・加速度は直近のフレームとの差分なので、ずれたフレームの後の 2 フレームも偽にする。
+        """
+        tolerance = self.config.arm_length_tolerance
+        if tolerance <= 0 or not self.window_closed:
+            return {"L": True, "R": True}
+        ok = {}
+        for side in ("L", "R"):
+            good = True
+            for (a, b), reference in (((f"{side}_SHOULDER", f"{side}_ELBOW"), self.upper_arm_m.get(side)),
+                                      ((f"{side}_ELBOW", f"{side}_WRIST"), self.forearm_m.get(side))):
+                if reference is None or not math.isfinite(reference) or reference <= 0:
+                    continue   # 窓で長さを決められなかった腕は検査しない
+                length = float(np.linalg.norm(points[slot_of(a)] - points[slot_of(b)]))
+                if not (math.isfinite(length) and abs(length / reference - 1.0) <= tolerance):
+                    good = False
+            self._arm_clean[side] = self._arm_clean[side] + 1 if good else 0
+            ok[side] = self._arm_clean[side] >= _ARM_HISTORY
+        return ok
 
-        if self._detector.update(value, self.frame_index):
+    def _guarded_sample(self, sample: WorkSample, arm_ok: dict[str, bool]) -> WorkSample:
+        """長さがずれた腕の部位（手首・肘・肩）を仕事率・肘角・τ_y から外す。"""
+        bad = [side for side, good in arm_ok.items() if not good]
+        if not bad:
+            return sample
+        for side in bad:
+            self.arm_guard_rejected[side] += 1
+
+        def keep(key: str) -> bool:
+            return not any(key.endswith(f"_{side}") for side in bad)
+
+        return WorkSample(
+            dt=sample.dt,
+            powers={k: v for k, v in sample.powers.items() if keep(k)},
+            theta={k: v for k, v in sample.theta.items() if keep(k)},
+            tau_y={k: v for k, v in sample.tau_y.items() if keep(k)},
+        )
+
+    def _height(self, vectors: np.ndarray | None) -> float:
+        """肩の中点の上向き成分（位置なら高さ [m]、速度なら上向きの速さ [m/s]）。"""
+        if vectors is None or self.up is None:
+            return float("nan")
+        mid = 0.5 * (vectors[slot_of("L_SHOULDER")] + vectors[slot_of("R_SHOULDER")])
+        return float(mid @ self.up)
+
+    def _gate(self, points: np.ndarray, velocity: np.ndarray | None, dt: float,
+              sample: WorkSample | None, result: FrameResult) -> None:
+        """関所と回の区切り。開いている間だけ仕事とゲージに積み、閉じている間は先読みの輪に置く。"""
+        result.rep = self.cycle_count
+        detector = self.rep_detector
+        gate = self.config.dyn_gate
+        event = RepEvent.NONE
+        result.height_m = self._height(points)
+        if detector is not None:
+            speed = self._height(velocity) if velocity is not None else None
+            event = detector.update(result.height_m, speed, dt)
+        if event is RepEvent.OPENED and gate:
+            for held in self.rep_work.release():
+                self._feed_tracker(held)
+        is_open = (not gate) or (detector is not None and detector.is_open) \
+            or event in (RepEvent.CLOSED, RepEvent.DISCARDED)
+        result.dyn_active = is_open
+        if sample is not None:
+            if is_open:
+                if self.rep_work.add(sample):
+                    self._feed_tracker(sample)
+            else:
+                self.rep_work.hold(sample)
+        if event is RepEvent.CLOSED:
             self._close_rep(result)
+        elif event is RepEvent.DISCARDED and gate:
+            # 押し上げでなかった（持ち上げが 3 cm に届かない）。今の回の仕事を捨てる
+            self.rep_work.reset()
+            self.discarded_reps += 1
+            if self.tracker is not None:
+                self.tracker.discard_rep()
+
+    def _elbow_energy(self) -> dict[str, dict]:
+        """今の回の肘の濾波 E±（USB 経路と同じ ``compute_cycle_energy_filtered``、dt は格子の 1/30 s）。"""
+        config = self.config.energy_filter
+        fc = self._cutoff.fc if config.fc_adaptive_on else None
+        energy = {}
+        for side in ("L", "R"):
+            theta, tau = self.rep_work.series(f"elbow_{side}")
+            e_pos, e_neg, info = compute_cycle_energy_filtered(theta, tau, 1.0 / 30.0, fc_override=fc, config=config)
+            energy[f"elbow_{side}"] = {"e_pos": e_pos, "e_neg": e_neg, "fc": info.get("fc"),
+                                       "n_u": int(info.get("n_u", 0))}
+        return energy
+
+    def _gauge_now(self) -> dict[str, float]:
+        """ゲージの今の値。tracker があればその値（デモなら置いた値）、無ければ今の回の W+。"""
+        if self.tracker is not None:
+            return self.tracker.values()
+        work = self.rep_work.work()
+        return {part: work[part].pos for part in GAUGE_PARTS}
+
+    def _feed_tracker(self, sample: WorkSample) -> None:
+        if self.tracker is None or self._demo is not None:
+            return
+        for part in self.tracker.parts:
+            power = sample.powers.get(part)
+            if power is not None:
+                self.tracker.add(part, power, sample.dt)
 
     def _close_rep(self, result: FrameResult) -> None:
         """今の回を確定する。仕事はフレームごとの dt で積んだ値（``rep_work``）。"""
         result.cycle_detected = True
-        for key, work in self.rep_work.reset().items():
+        result.cycle_energy = self._elbow_energy()
+        parts = self.rep_work.reset()
+        for key, work in parts.items():
             self.cycle_work[key].append(work.net)
             result.cycle_work_j[key] = work.net
+        result.cycle_parts = parts
+        result.cycle_w1rm = {key: (self.bands[key].w1rm if key in self.bands else None) for key in parts}
+        self.cycles.append({"frame": self.frame_index, "t_ns": result.t_ns, "parts": parts,
+                            "energy": result.cycle_energy})
+        if self.tracker is not None:
+            self.tracker.close_rep()
 
     # -- メモリ管理 --------------------------------------------------------
     def _append_result(self, result: FrameResult) -> None:
