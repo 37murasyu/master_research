@@ -116,6 +116,19 @@ def save_calibration(i0, i1, stereo, board, *, cameras, root=None):
     return directory
 
 
+def update_meta(directory, **fields):
+    """保存済みの校正フォルダの ``meta.json`` に鍵を足す（同じ鍵は置き換える）。書き直した meta を返す。
+
+    盤を立てる段階は校正を保存した後に行うので、その結果を後から足すために使う。``write_json`` は一時ファイルに
+    書いてから ``os.replace`` で置き換えるので、途中で落ちても元の meta.json は壊れない。
+    """
+    path = Path(directory) / "meta.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta.update(fields)
+    write_json(path, meta)
+    return meta
+
+
 @dataclass
 class Calibration:
     directory: Path

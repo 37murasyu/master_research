@@ -177,3 +177,110 @@ def test_camera_default_accepts_any_cam0(monkeypatch, value, expected):
 
     monkeypatch.setenv("CAM0", value)
     assert default_camera_index() == expected
+
+
+# ---------------------------------------------------------------------------
+# 校正の最後の「盤を立てて静止」（B4）
+# ---------------------------------------------------------------------------
+#
+# なぜこのテストがあるか: 混成の校正は盤を自由に傾けて集めるので、USB のように全ビューの短辺から重力の向きを
+# 出せない。校正を保存した後に盤を立てて静止させ、その短辺の上向きを meta.json の checkerboard_short_axis に足す
+# （計測側は gravity.read_board_up で読む）。途中で止めても校正そのものは失わないこと（保存が先）、偽物のキーが
+# Space を返し続けても静止・時間切れ・キー・停止のどれかで必ず終わることを固定する。
+
+
+def _upright(monkeypatch, tilt_deg=0.0):
+    """Mac の画像に、カメラの正面で立てた盤（カメラの光軸の周りに tilt_deg 傾けた）を写す。"""
+    board = Board()
+    _a, _b, k0, *_ = synthetic_views(board)
+    rvec = np.array([0.0, 0.0, np.radians(tilt_deg)])
+    corners = cv.projectPoints(board.object_points, rvec, np.array([-9.0, -4.5, 80.0]), k0, np.zeros(5))[0]
+    monkeypatch.setattr(runner.LiveSession, "local_corners", corners.astype(np.float32))
+
+
+def _keys(monkeypatch, *keys):
+    """最初の Space（盤集めの開始）の後、keys を順に返し、尽きたら最後の値を返し続ける。"""
+    sequence = iter((32, *keys))
+    last = [keys[-1] if keys else 32]
+    monkeypatch.setattr(runner, "poll_window", lambda: next(sequence, last[0]))
+
+
+def test_the_upright_board_is_recorded_after_saving(tmp_path, monkeypatch, capsys):
+    _install(monkeypatch, tmp_path)
+    _upright(monkeypatch)
+    assert runner.main([]) == 0
+    entry = load_calibration("latest", root=tmp_path).meta["checkerboard_short_axis"]
+    assert entry["samples"] == 10
+    assert entry["up_label_runtime"] == "Z+"
+    assert entry["tilt_deg"] < 1.0
+    out = capsys.readouterr().out
+    assert "[盤を立てる]" in out and "警告" not in out
+
+
+def test_a_tilted_board_is_recorded_with_a_warning(tmp_path, monkeypatch, capsys):
+    _install(monkeypatch, tmp_path)
+    _upright(monkeypatch, tilt_deg=15.0)
+    assert runner.main([]) == 0
+    entry = load_calibration("latest", root=tmp_path).meta["checkerboard_short_axis"]
+    assert entry["tilt_deg"] == pytest.approx(15.0, abs=0.5)
+    assert "警告" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("key, word", [(13, "省略"), (ord("n"), "省略"), (ord("q"), "中止")])
+def test_keys_end_the_board_step_but_keep_the_calibration(tmp_path, monkeypatch, capsys, key, word):
+    _install(monkeypatch, tmp_path)
+    _upright(monkeypatch)
+    _keys(monkeypatch, key)
+    assert runner.main([]) == 0
+    meta = load_calibration("latest", root=tmp_path).meta
+    assert "checkerboard_short_axis" not in meta
+    assert meta["stereo"]["rms"] < 0.01, "盤を立てる前に校正を保存している"
+    assert word in capsys.readouterr().out
+
+
+def test_no_board_times_out(tmp_path, monkeypatch, capsys):
+    _install(monkeypatch, tmp_path)
+    monkeypatch.setattr(runner.LiveSession, "local_corners", None)
+    assert runner.main(["--board-up-timeout", "6"]) == 0
+    assert "checkerboard_short_axis" not in load_calibration("latest", root=tmp_path).meta
+    assert "時間切れ" in capsys.readouterr().out
+
+
+def test_a_stop_request_ends_the_board_step(tmp_path, monkeypatch, capsys):
+    """GUI の停止ボタン（停止ファイル・SIGTERM）でも盤を立てる段階から抜ける。"""
+    _install(monkeypatch, tmp_path)
+    _upright(monkeypatch)
+    answers = iter((False, False))
+
+    class Stop:
+        @classmethod
+        def from_environment(cls):
+            return cls()
+
+        def install_signal_handlers(self):
+            pass
+
+        def requested(self):
+            return next(answers, True)
+
+    monkeypatch.setattr(runner, "StopRequest", Stop)
+    assert runner.main([]) == 0
+    meta = load_calibration("latest", root=tmp_path).meta
+    assert "checkerboard_short_axis" not in meta
+    assert "停止" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv, env, recorded", [
+    (["--board-up", "off"], None, False),
+    ([], "0", False),
+    (["--board-up", "on"], "0", True),
+])
+def test_the_board_step_can_be_turned_off(tmp_path, monkeypatch, capsys, argv, env, recorded):
+    """HYBRID_GRAVITY_BOARD（GUI の設定、既定 1）で切り、引数 --board-up が優先する。"""
+    if env is not None:
+        monkeypatch.setenv("HYBRID_GRAVITY_BOARD", env)
+    _install(monkeypatch, tmp_path)
+    _upright(monkeypatch)
+    assert runner.main(argv) == 0
+    assert ("checkerboard_short_axis" in load_calibration("latest", root=tmp_path).meta) is recorded
+    assert ("[盤を立てる]" in capsys.readouterr().out) is recorded

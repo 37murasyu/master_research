@@ -34,3 +34,8 @@ def replay_root() -> Path:
 def session_file() -> Path:
     """Pixel が覚えておく接続先の session（``app.hybrid.session``）。利用者は見ない設定側に置く。"""
     return user_config_dir(APP_NAME) / "hybrid_session.txt"
+
+
+def ekf_profile_root() -> Path:
+    """混成の EKF の較正プロファイル（``app.runners.tune_ekf`` が混成の収録から作る）。設定 ``HYBRID_EKF_PROFILE`` に入れる。"""
+    return hybrid_root() / "ekf_profiles"
