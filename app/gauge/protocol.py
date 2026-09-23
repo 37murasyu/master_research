@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import math
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ __all__ = [
     "GaugeFrame",
     "encode",
     "decode",
+    "LineDemux",
 ]
 
 # 1 行の接頭辞。GUI 側はこれで「ゲージの行」と、子プロセスが誤って（あるいは
@@ -128,8 +130,17 @@ def encode(frame: GaugeFrame) -> str:
 
 
 def _is_number(value: Any) -> bool:
-    # bool は int の派生なので明示的に弾く（True が 1 として通ると気づきにくい）
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """「数か null」の「数」。bool と非有限（NaN・±inf）は数として扱わない。
+
+    bool は int の派生なので明示的に弾く（True が 1 として通ると気づきにくい）。
+    契約では「NaN は null で来る」が、これは正しい送り主の振る舞いであって
+    decode 側の保証ではない。壊れた・悪意ある送り主が生の NaN／Infinity を
+    JSON リテラルとして送ってきても（``json.loads`` は既定でこれを受理する）、
+    isinstance だけでは通ってしまうので、ここで isfinite も確かめる。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def _decode_band(raw: Any) -> tuple[float, float] | None:
@@ -182,7 +193,11 @@ def decode(line: str) -> GaugeFrame | None:
         return None
 
     version = payload.get("v")
-    if isinstance(version, bool) or version != VERSION:
+    # 型も一致させる（bool は type() が int にならないのでここで弾ける）。
+    # ``version == VERSION`` だけだと、浮動小数の 2.0 が Python の等価規則で
+    # 通ってしまう（2.0 == 2 は真）。文字列の "2" と同様に、数値でも整数
+    # そのもの以外は版違いとして扱う。
+    if type(version) is not int or version != VERSION:
         return None
 
     link = payload.get("link")
@@ -210,3 +225,100 @@ def decode(line: str) -> GaugeFrame | None:
             parts[name] = reading
 
     return GaugeFrame(link=link, rep=rep, source=source, parts=parts)
+
+
+class LineDemux:
+    """子プロセスの出力の塊（bytes）から、ゲージの行だけを拾い出す。
+
+    ``QProcess`` の ``MergedChannels``（GUI 側。このクラスは呼ばない）は
+    ``readAllStandardOutput()`` の bytes を塊単位で渡してくる。行の途中で
+    塊が切れることは普通にある（パイプのバッファ次第）ので、行として組み直す
+    役目をここに切り出す。子プロセス側の解析スクリプトが ``\\r`` で進捗表示を
+    書き換えることがあり、それを改行が来るまで止めてしまうと使い勝手が悪いので、
+    「ゲージの行らしい途中」だけをため、それ以外の普通の行はすぐログへ流す。
+
+    Qt には依存しない（``app.gauge.protocol`` 全体の方針と同じ）。呼び出し側
+    （後で足す ``app/runners/worker.py``）が Qt のシグナルに変換する。
+    """
+
+    def __init__(self) -> None:
+        # UTF-8 の増分デコーダ。マルチバイト文字が塊の境目で切れても、
+        # 完成するまで内部でためてくれる（手で bytes をためる必要がない）。
+        # errors="replace" は、本当に壊れたバイト列（子プロセスのバグ等）を
+        # 例外にせず U+FFFD に変えて先へ進むため。
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # 改行でまだ終わっていない、今組み立て中の行（文字列）。
+        self._pending = ""
+
+    def feed(self, data: bytes) -> tuple[str, list[GaugeFrame]]:
+        """塊を1つ渡す。戻り値は (ログへ出す文字列, 拾えたフレームの列)。"""
+        self._pending += self._decoder.decode(data)
+
+        log_parts: list[str] = []
+        frames: list[GaugeFrame] = []
+
+        while True:
+            newline_at = self._pending.find("\n")
+            if newline_at == -1:
+                break
+            line = self._pending[: newline_at + 1]
+            self._pending = self._pending[newline_at + 1 :]
+            self._consume_line(line, log_parts, frames)
+
+        # 残り（改行なしの途中の行）。ゲージの行になりうる途中だけをため、
+        # それ以外はここで確定させてすぐログへ流す（\r の進捗表示を止めないため）。
+        if self._pending and not self._looks_like_gauge_prefix(self._pending):
+            prefix_at = self._pending.find(PREFIX)
+            if prefix_at == -1:
+                log_parts.append(self._pending)
+                self._pending = ""
+            else:
+                # 行の途中に PREFIX が現れた場合（任意の要件）。手前はログへ、
+                # PREFIX から先はゲージの行の候補としてためておく。
+                log_parts.append(self._pending[:prefix_at])
+                self._pending = self._pending[prefix_at:]
+
+        return "".join(log_parts), frames
+
+    def flush(self) -> str:
+        """ためている残り（改行が来ないまま終わった分）をログとして返す。"""
+        # デコーダの内部にも、まだ完成していないマルチバイト列の断片が
+        # 残っていることがある（プロセスが行の途中・文字の途中で終了した場合）。
+        # final=True で確定させ、壊れていれば errors="replace" で置き換える。
+        tail = self._pending + self._decoder.decode(b"", final=True)
+        self._pending = ""
+        return tail
+
+    def reset(self) -> None:
+        """バッファとデコーダを初期化する（前回の計測の続きと混ざらないように）。"""
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._pending = ""
+
+    @staticmethod
+    def _looks_like_gauge_prefix(text: str) -> bool:
+        """``text`` が PREFIX の頭の一部、または PREFIX で始まる途中か。"""
+        return PREFIX.startswith(text) or text.startswith(PREFIX)
+
+    @classmethod
+    def _consume_line(cls, line: str, log_parts: list[str], frames: list[GaugeFrame]) -> None:
+        """改行で終わった1行を、フレームかログへ振り分ける。"""
+        if line.startswith(PREFIX):
+            cls._consume_gauge_candidate(line, log_parts, frames)
+            return
+        # 行の途中に PREFIX が現れた場合（任意の要件）。手前はログへ、
+        # PREFIX から先だけをゲージの行の候補として decode する。
+        prefix_at = line.find(PREFIX)
+        if prefix_at > 0:
+            log_parts.append(line[:prefix_at])
+            cls._consume_gauge_candidate(line[prefix_at:], log_parts, frames)
+            return
+        log_parts.append(line)
+
+    @staticmethod
+    def _consume_gauge_candidate(line: str, log_parts: list[str], frames: list[GaugeFrame]) -> None:
+        """``PREFIX`` で始まり改行で終わる1行を decode し、壊れていればログへ。"""
+        frame = decode(line)
+        if frame is not None:
+            frames.append(frame)
+        else:
+            log_parts.append(line)

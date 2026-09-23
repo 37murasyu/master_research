@@ -155,8 +155,9 @@ class TestDecodeRejects:
         assert g.decode(g.PREFIX + "{これは JSON ではない\n") is None
         assert g.decode(g.PREFIX + "\n") is None
 
-    @pytest.mark.parametrize("version", [1, 3, "2"])
+    @pytest.mark.parametrize("version", [1, 3, "2", 2.0, True])
     def test_decode_rejects_other_versions(self, version):
+        """整数の 2 だけを受け付ける。浮動小数の 2.0 も bool の True も拒否する。"""
         body = json.dumps(
             {"v": version, "link": "waiting", "rep": 0, "source": "measure", "parts": {}}
         )
@@ -252,6 +253,60 @@ class TestDecodeRejects:
         assert frame is not None
         assert "elbow_L" not in frame.parts
         assert "elbow_R" in frame.parts
+
+    def test_decode_drops_part_with_non_finite_now(self):
+        """契約は「NaN は null で来る」だが、壊れた送り主が生の NaN・Infinity を
+        JSON リテラルとして送ってくることもある（``json.loads`` は既定でこれを読む）。
+        非有限は「数」として扱わず、now と同じ規則（部位を丸ごと捨てる）に従う。
+        """
+        for bad_now in (float("nan"), float("inf"), float("-inf")):
+            body = json.dumps(
+                {
+                    "v": 2,
+                    "link": "connected",
+                    "rep": 1,
+                    "source": "measure",
+                    "parts": {"elbow_L": {"now": bad_now}},
+                }
+            )
+            frame = g.decode(g.PREFIX + body + "\n")
+            assert frame is not None
+            assert "elbow_L" not in frame.parts, bad_now
+
+    def test_decode_turns_non_finite_prev_and_w1rm_into_none(self):
+        body = json.dumps(
+            {
+                "v": 2,
+                "link": "connected",
+                "rep": 1,
+                "source": "measure",
+                "parts": {
+                    "elbow_L": {"now": 12.3, "prev": float("inf"), "w1rm": float("nan")}
+                },
+            }
+        )
+        frame = g.decode(g.PREFIX + body + "\n")
+        assert frame is not None
+        reading = frame.parts["elbow_L"]
+        assert reading.now == 12.3
+        assert reading.prev is None
+        assert reading.w1rm is None
+
+    def test_decode_turns_band_with_non_finite_bound_into_none(self):
+        """lo・hi の非有限を isfinite で明示的に確かめる（NaN の比較が偶然 False になることに頼らない）。"""
+        for bad_band in ([1.0, float("inf")], [float("-inf"), 20.0], [float("nan"), 20.0]):
+            body = json.dumps(
+                {
+                    "v": 2,
+                    "link": "connected",
+                    "rep": 1,
+                    "source": "measure",
+                    "parts": {"elbow_L": {"now": 12.3, "band": bad_band}},
+                }
+            )
+            frame = g.decode(g.PREFIX + body + "\n")
+            assert frame is not None
+            assert frame.parts["elbow_L"].band is None, bad_band
 
 
 def test_protocol_does_not_import_qt():

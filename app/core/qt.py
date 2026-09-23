@@ -7,9 +7,9 @@
 
 from __future__ import annotations
 
-from pyqtgraph.Qt import QT_LIB, QtCore, QtGui, QtWidgets
+from pyqtgraph.Qt import QT_LIB, QtCore, QtGui, QtSvg, QtWidgets
 
-__all__ = ["QtCore", "QtGui", "QtWidgets", "QT_LIB", "assert_lgpl_backend"]
+__all__ = ["QtCore", "QtGui", "QtSvg", "QtWidgets", "QT_LIB", "assert_lgpl_backend"]
 
 
 def assert_lgpl_backend() -> None:
