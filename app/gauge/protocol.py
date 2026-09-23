@@ -128,8 +128,17 @@ def encode(frame: GaugeFrame) -> str:
 
 
 def _is_number(value: Any) -> bool:
-    # bool は int の派生なので明示的に弾く（True が 1 として通ると気づきにくい）
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """「数か null」の「数」。bool と非有限（NaN・±inf）は数として扱わない。
+
+    bool は int の派生なので明示的に弾く（True が 1 として通ると気づきにくい）。
+    契約では「NaN は null で来る」が、これは正しい送り主の振る舞いであって
+    decode 側の保証ではない。壊れた・悪意ある送り主が生の NaN／Infinity を
+    JSON リテラルとして送ってきても（``json.loads`` は既定でこれを受理する）、
+    isinstance だけでは通ってしまうので、ここで isfinite も確かめる。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def _decode_band(raw: Any) -> tuple[float, float] | None:
@@ -182,7 +191,11 @@ def decode(line: str) -> GaugeFrame | None:
         return None
 
     version = payload.get("v")
-    if isinstance(version, bool) or version != VERSION:
+    # 型も一致させる（bool は type() が int にならないのでここで弾ける）。
+    # ``version == VERSION`` だけだと、浮動小数の 2.0 が Python の等価規則で
+    # 通ってしまう（2.0 == 2 は真）。文字列の "2" と同様に、数値でも整数
+    # そのもの以外は版違いとして扱う。
+    if type(version) is not int or version != VERSION:
         return None
 
     link = payload.get("link")
