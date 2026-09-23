@@ -2,6 +2,7 @@ import textwrap
 import os
 import time
 import warnings
+from functools import lru_cache
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -194,54 +195,114 @@ def calculate_3d_keypoints(frame0_keypoints, frame1_keypoints, P0, P1, _=None):
     return frame_p3ds
 
 
+@lru_cache(maxsize=512)
+def _glyph_sprite(ch: str, font_size: int, color: tuple):
+    """1 文字を RGBA スプライトにしてキャッシュする。
+
+    文字列全体でキャッシュすると数値が変わるたびに描き直しになるので、文字単位で持つ。
+    ラベル＋数字なら数十エントリで飽和し、以降はすべてキャッシュに当たる。
+
+    戻り値: (premul (h,w,3) f32, inv_a (h,w,3) f32, ox, oy, advance)
+      premul = color × alpha、inv_a = 1 − alpha を前計算しておき、合成を 2 演算にする。
+    """
+    from app.core.resources import japanese_font
+
+    font = japanese_font(int(font_size))
+    try:
+        adv = float(font.getlength(ch))
+    except Exception:
+        adv = float(font_size)
+    try:
+        x0, y0, x1, y1 = font.getbbox(ch)
+    except Exception:
+        x0, y0, x1, y1 = 0, 0, int(adv), int(font_size * 1.2)
+    w = max(1, int(x1 - x0) + 1)
+    h = max(1, int(y1 - y0) + 1)
+    spr = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(spr).text((-x0, -y0), ch, font=font, fill=(*(int(c) for c in color[:3]), 255))
+    rgba = np.asarray(spr, dtype=np.uint8)
+    a = (rgba[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
+    # inv_a は (h,w,1) のままだと合成時に末尾軸が stride 0 になり、numpy がベクトル化ループを
+    # 使えず 3 要素ずつのバッファリング処理に落ちる。(h,w,3) に展開しておくと合成が 4〜8 倍速い。
+    inv_a = np.ascontiguousarray(np.broadcast_to(1.0 - a, (a.shape[0], a.shape[1], 3)))
+    return (rgba[:, :, :3].astype(np.float32) * a, inv_a, int(x0), int(y0), adv)
+
+
+def prewarm_text_jp(chars: str, font_size: int, color) -> None:
+    """使う文字のスプライトを先に作っておく。初回フレームでフォント読み込み（約 15 ms）と
+    グリフ描画がまとめて走ると 1 フレーム落ちるため、起動時に呼ぶ。"""
+    for ch in chars:
+        _glyph_sprite(ch, int(font_size), tuple(color))
+
+
+def draw_text_jp(img, text, position, font_size, color, line_width=20):
+    """HxWx3 の uint8 画像に日本語テキストを**その場で**描き、同じ配列を返す。
+
+    フレーム全体を PIL へ往復させず、文字ごとのスプライト（キャッシュ）を合成する。
+    折り返しと行送りは PIL（``put_text_jp`` の従来の実装）と同じ: 常に ``textwrap.fill`` を通し、
+    行送りは「A の高さ + 4」。色は配列のチャネル順のまま書く（OpenCV の画像なら BGR）。
+
+    かつて ``master_research_code.py`` の ``_blit_label`` が同じことを別に実装しており、
+    折り返し（長いときだけ）と行送り（文字サイズ × 1.25）が食い違っていた（KNOWN_ISSUES §4-2）。
+    """
+    from app.core.resources import japanese_font
+
+    font_size = int(font_size)
+    color = tuple(int(c) for c in color[:3])
+    height, width = img.shape[:2]
+    line_spacing = japanese_font(font_size).getbbox("A")[3] + 4
+    for row, line in enumerate(textwrap.fill(text, width=line_width).split("\n")):
+        pen_x = 0.0
+        pen_y = int(position[1]) + row * line_spacing
+        for ch in line:
+            premul, inv_a, ox, oy, adv = _glyph_sprite(ch, font_size, color)
+            if ch != " ":
+                sh, sw = premul.shape[:2]
+                x = int(position[0]) + int(pen_x) + ox
+                y = pen_y + oy
+                x0, y0 = max(0, x), max(0, y)
+                x1, y1 = min(width, x + sw), min(height, y + sh)
+                if x1 > x0 and y1 > y0:
+                    sx, sy = x0 - x, y0 - y
+                    dst = img[y0:y1, x0:x1]
+                    blended = dst * inv_a[sy:sy + y1 - y0, sx:sx + x1 - x0] + premul[sy:sy + y1 - y0, sx:sx + x1 - x0]
+                    # PIL の合成は四捨五入（MULDIV255）。切り捨てると灰色の背景で 1 ずれる
+                    np.copyto(dst, (blended + 0.5).astype(np.uint8))
+            pen_x += adv
+    return img
+
+
 def put_text_jp(img, text, position, font_size, color, line_width):
     """
     OpenCV画像に日本語テキストを描画する関数。
 
     OpenCV形式の画像に対して、日本語フォントに対応したテキストを指定位置に描画し、
-    改行幅を考慮して整形した後、新たな画像をOpenCV形式で返す。
+    改行幅を考慮して整形した後、新たな画像をOpenCV形式で返す（入力は変えない）。
+
+    3 チャネルの uint8 画像は ``draw_text_jp``（文字ごとのスプライト合成）で描く。
+    それ以外（グレースケールなど）は従来どおり PIL で描く。
 
     Parameters:
         img (numpy.ndarray): OpenCV形式の入力画像。
         text (str): 描画する日本語テキスト。
         position (tuple): テキストの描画位置（x, y）。
         font_size (int): フォントサイズ。
-        color (tuple): テキストの色（R, G, B）。
+        color (tuple): テキストの色（配列のチャネル順。OpenCV の画像なら B, G, R）。
         line_width (int): 1行あたりの最大文字数（改行幅）。
 
     Returns:
         numpy.ndarray: テキストが描画されたOpenCV形式の画像。
     """
-    _t0 = time.perf_counter()
-    img_pil = Image.fromarray(img)
-    _t1 = time.perf_counter()
+    if img.ndim == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
+        return draw_text_jp(img.copy(), text, position, font_size, color, line_width)
 
     # フォントの取得・キャッシュ・欠落時の扱いは resources に集約してある。
     from app.core.resources import japanese_font
 
-    draw = ImageDraw.Draw(img_pil)
-    _t2a = time.perf_counter()
-    font = japanese_font(int(font_size))
-    _t2b = time.perf_counter()
-
-    wrapped_text = textwrap.fill(text, width=line_width)
-    _t3 = time.perf_counter()
-    draw.text(position, wrapped_text, font=font, fill=color)
-    _t4 = time.perf_counter()
-    out = np.array(img_pil)
-    _t5 = time.perf_counter()
-
-    if os.getenv('PERF_DRAW_TRACE', '0') in ('1','true','True'):
-        print(
-            "[DRAW_TIMING] fromarray={:.2f}ms font={:.2f}ms wrap={:.2f}ms draw={:.2f}ms toarray={:.2f}ms".format(
-                (_t1 - _t0) * 1000.0,
-                (_t2b - _t2a) * 1000.0,
-                (_t3 - _t2b) * 1000.0,
-                (_t4 - _t3) * 1000.0,
-                (_t5 - _t4) * 1000.0,
-            )
-        )
-    return out
+    img_pil = Image.fromarray(img)
+    ImageDraw.Draw(img_pil).text(
+        position, textwrap.fill(text, width=line_width), font=japanese_font(int(font_size)), fill=color)
+    return np.array(img_pil)
 
 
 def display_choices(question, a, _=None):

@@ -96,6 +96,15 @@ def _is_getenv(node: ast.AST) -> bool:
     )
 
 
+def _is_env_flag(node: ast.AST) -> bool:
+    """``env_flag('X', True)``（config.env_flag）。真偽値の設定として拾う。"""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "env_flag"
+    )
+
+
 def _infer_type(call: ast.Call) -> str:
     """呼び出しの包まれ方から型を推定する。"""
     parent = getattr(call, "parent", None)
@@ -151,7 +160,8 @@ def extract(source_path: Path) -> dict[str, dict]:
 
     found: dict[str, dict] = {}
     for node in ast.walk(tree):
-        if not _is_getenv(node):
+        is_flag = _is_env_flag(node)
+        if not (is_flag or _is_getenv(node)):
             continue
         if not node.args or not isinstance(node.args[0], ast.Constant):
             continue
@@ -160,9 +170,11 @@ def extract(source_path: Path) -> dict[str, dict]:
         default = None
         if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
             default = node.args[1].value
+        if is_flag and default is not None:
+            default = "1" if default else "0"
 
         entry = {
-            "type": _infer_type(node),
+            "type": "bool" if is_flag else _infer_type(node),
             "default": default,
             "group": _group_of(name),
             "lines": [node.lineno],

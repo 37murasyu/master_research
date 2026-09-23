@@ -53,6 +53,29 @@ pose_keypoints = [16, 14, 12, 11, 13, 15, 24, 23, 25, 26, 27, 28, 20, 18, 19, 17
 # input_stream1 = folder_path + "\\media\\cam000_test.mp4"
 # input_stream2 = folder_path + "\\media\\cam111_test.mp4"
 
+_ENV_TRUE = ("1", "true", "yes", "on")
+_ENV_FALSE = ("0", "false", "no", "off")
+
+
+def env_flag(name, default):
+    """環境変数を真偽値として読む。大文字小文字と前後の空白は問わない。
+
+    1 / true / yes / on なら True、0 / false / no / off なら False、未設定やそれ以外は default。
+    かつて master_research_code.py は ``in ('1','true','True')`` と ``not in ('0','false','False')`` の
+    2 通りで読んでおり、''・'yes'・'TRUE' などで結果が逆になっていた（KNOWN_ISSUES §4-4）。
+    設定スキーマの抽出器（tools/extract_env_schema.py）はこの呼び出しを bool として拾う。
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    value = raw.strip().lower()
+    if value in _ENV_TRUE:
+        return True
+    if value in _ENV_FALSE:
+        return False
+    return bool(default)
+
+
 # 入力ストリーム（デフォルトはカメラID 0/1）
 input_stream1 = 0
 input_stream2 = 1

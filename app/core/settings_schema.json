@@ -10,7 +10,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        66
+        111
       ]
     },
     "BODY_MASS_KG": {
@@ -18,7 +18,7 @@
       "default": "65",
       "group": "その他",
       "lines": [
-        1394
+        1274
       ]
     },
     "CALIB_BASE_DIR": {
@@ -26,7 +26,7 @@
       "default": "",
       "group": "キャリブレーション",
       "lines": [
-        1697
+        1569
       ]
     },
     "CAM0": {
@@ -34,7 +34,7 @@
       "default": null,
       "group": "カメラ",
       "lines": [
-        55
+        100
       ]
     },
     "CAM1": {
@@ -42,7 +42,7 @@
       "default": null,
       "group": "カメラ",
       "lines": [
-        56
+        101
       ]
     },
     "CAMERA_DIAG": {
@@ -50,7 +50,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        2743
+        2439
       ]
     },
     "CAMERA_TRACE_EVERY": {
@@ -58,15 +58,15 @@
       "default": "30",
       "group": "その他",
       "lines": [
-        2745
+        2441
       ]
     },
     "DEBUG_LOGS": {
-      "type": "str",
+      "type": "bool",
       "default": "0",
       "group": "その他",
       "lines": [
-        1878
+        1750
       ]
     },
     "DEMO_BASELINE_EMA": {
@@ -74,7 +74,7 @@
       "default": "0.01",
       "group": "デモ用",
       "lines": [
-        2569
+        2347
       ]
     },
     "DEMO_ELBOW_DELTA_FULL_DEG": {
@@ -82,7 +82,7 @@
       "default": "45.0",
       "group": "デモ用",
       "lines": [
-        2562
+        2340
       ]
     },
     "DEMO_ELBOW_DELTA_PARTIAL_DEG": {
@@ -90,7 +90,7 @@
       "default": "8.0",
       "group": "デモ用",
       "lines": [
-        2564
+        2342
       ]
     },
     "DEMO_MONO_CAM0_ONLY": {
@@ -98,8 +98,8 @@
       "default": "1",
       "group": "デモ用",
       "lines": [
-        1713,
-        2570
+        1585,
+        2348
       ]
     },
     "DEMO_MONO_GAUGE_ON": {
@@ -107,8 +107,8 @@
       "default": "1",
       "group": "デモ用",
       "lines": [
-        1711,
-        2560
+        1583,
+        2338
       ]
     },
     "DEMO_RATIO_DOWN_STEP": {
@@ -116,7 +116,7 @@
       "default": "0.035",
       "group": "デモ用",
       "lines": [
-        2568
+        2346
       ]
     },
     "DEMO_RATIO_FULL": {
@@ -124,7 +124,7 @@
       "default": "0.80",
       "group": "デモ用",
       "lines": [
-        2565
+        2343
       ]
     },
     "DEMO_RATIO_PARTIAL": {
@@ -132,7 +132,7 @@
       "default": "0.30",
       "group": "デモ用",
       "lines": [
-        2566
+        2344
       ]
     },
     "DEMO_RATIO_UP_STEP": {
@@ -140,7 +140,7 @@
       "default": "0.025",
       "group": "デモ用",
       "lines": [
-        2567
+        2345
       ]
     },
     "DEMO_SHOULDER_RISE_FULL_M": {
@@ -148,7 +148,7 @@
       "default": "0.10",
       "group": "デモ用",
       "lines": [
-        2561
+        2339
       ]
     },
     "DEMO_SHOULDER_RISE_PARTIAL_M": {
@@ -156,7 +156,7 @@
       "default": "0.02",
       "group": "デモ用",
       "lines": [
-        2563
+        2341
       ]
     },
     "DISABLE_IMSHOW": {
@@ -164,15 +164,15 @@
       "default": "0",
       "group": "機能無効化",
       "lines": [
-        2641
+        2419
       ]
     },
     "DISABLE_MPL": {
-      "type": "str",
+      "type": "bool",
       "default": "0",
       "group": "機能無効化",
       "lines": [
-        1344
+        1224
       ]
     },
     "DISABLE_WRITE": {
@@ -180,23 +180,23 @@
       "default": "0",
       "group": "機能無効化",
       "lines": [
-        2640
+        2418
       ]
     },
     "DRAW_KEYPOINTS": {
-      "type": "str",
+      "type": "bool",
       "default": "1",
       "group": "描画",
       "lines": [
-        767
+        627
       ]
     },
-    "DRAW_LABEL_CACHE": {
+    "DT_SEC": {
       "type": "str",
-      "default": "1",
-      "group": "描画",
+      "default": "",
+      "group": "その他",
       "lines": [
-        2649
+        2629
       ]
     },
     "EARLY_PREVIEW": {
@@ -204,7 +204,7 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        3041
+        2822
       ]
     },
     "EKF_BPF_HIGH": {
@@ -212,7 +212,7 @@
       "default": "0",
       "group": "カルマンフィルタ",
       "lines": [
-        172
+        182
       ]
     },
     "EKF_BPF_LOW": {
@@ -220,7 +220,7 @@
       "default": "0",
       "group": "カルマンフィルタ",
       "lines": [
-        171
+        181
       ]
     },
     "EKF_BPF_ORDER": {
@@ -228,7 +228,7 @@
       "default": "2",
       "group": "カルマンフィルタ",
       "lines": [
-        173
+        183
       ]
     },
     "EKF_ENABLE": {
@@ -236,7 +236,7 @@
       "default": "1",
       "group": "カルマンフィルタ",
       "lines": [
-        166
+        176
       ]
     },
     "EKF_GATE_STD": {
@@ -244,7 +244,7 @@
       "default": "3.0",
       "group": "カルマンフィルタ",
       "lines": [
-        169
+        179
       ]
     },
     "EKF_Q_ACC": {
@@ -252,7 +252,7 @@
       "default": "1e-3",
       "group": "カルマンフィルタ",
       "lines": [
-        167
+        177
       ]
     },
     "EKF_R": {
@@ -260,23 +260,23 @@
       "default": "1e-3",
       "group": "カルマンフィルタ",
       "lines": [
-        168
+        178
       ]
     },
     "EKF_VECTORIZED": {
-      "type": "str",
+      "type": "bool",
       "default": "1",
       "group": "カルマンフィルタ",
       "lines": [
-        175
+        185
       ]
     },
     "ENABLE_VERBOSE_CLEANUP": {
-      "type": "str",
+      "type": "bool",
       "default": "0",
       "group": "その他",
       "lines": [
-        1532
+        1412
       ]
     },
     "ESC_HOLD_FRAMES": {
@@ -284,7 +284,7 @@
       "default": "10",
       "group": "その他",
       "lines": [
-        1437
+        1317
       ]
     },
     "E_DEBUG": {
@@ -292,7 +292,7 @@
       "default": "0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        134
+        144
       ]
     },
     "E_F0_FMIN": {
@@ -300,7 +300,7 @@
       "default": "0.3",
       "group": "エネルギー・フィルタ",
       "lines": [
-        159
+        169
       ]
     },
     "E_F0_SNR_THRESHOLD": {
@@ -308,7 +308,7 @@
       "default": "3.0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        160
+        170
       ]
     },
     "E_F0_WIN_SEC": {
@@ -316,7 +316,7 @@
       "default": "4.0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        156
+        166
       ]
     },
     "E_FC": {
@@ -324,7 +324,7 @@
       "default": "1.2",
       "group": "エネルギー・フィルタ",
       "lines": [
-        128
+        138
       ]
     },
     "E_FC_ADAPTIVE_ON": {
@@ -332,7 +332,7 @@
       "default": "0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        152
+        162
       ]
     },
     "E_FC_EMA_BETA": {
@@ -340,7 +340,7 @@
       "default": "0.15",
       "group": "エネルギー・フィルタ",
       "lines": [
-        157
+        167
       ]
     },
     "E_FC_K": {
@@ -348,7 +348,7 @@
       "default": "6.0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        155
+        165
       ]
     },
     "E_FC_MAX": {
@@ -356,7 +356,7 @@
       "default": "6.0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        154
+        164
       ]
     },
     "E_FC_MIN": {
@@ -364,7 +364,7 @@
       "default": "2.1",
       "group": "エネルギー・フィルタ",
       "lines": [
-        153
+        163
       ]
     },
     "E_FC_UPDATE_HZ": {
@@ -372,7 +372,7 @@
       "default": "1.0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        158
+        168
       ]
     },
     "E_FPS_EMA_BETA": {
@@ -380,7 +380,7 @@
       "default": "0.20",
       "group": "エネルギー・フィルタ",
       "lines": [
-        161
+        171
       ]
     },
     "E_FPS_MAX": {
@@ -388,7 +388,7 @@
       "default": "120.0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        163
+        173
       ]
     },
     "E_FPS_MIN": {
@@ -396,7 +396,7 @@
       "default": "5.0",
       "group": "エネルギー・フィルタ",
       "lines": [
-        162
+        172
       ]
     },
     "E_LPF_NATIVE_ON": {
@@ -404,7 +404,7 @@
       "default": "1",
       "group": "エネルギー・フィルタ",
       "lines": [
-        135
+        145
       ]
     },
     "E_LPF_ORDER": {
@@ -412,7 +412,7 @@
       "default": "2",
       "group": "エネルギー・フィルタ",
       "lines": [
-        129
+        139
       ]
     },
     "E_MAX_DTH": {
@@ -420,7 +420,7 @@
       "default": "0.25",
       "group": "エネルギー・フィルタ",
       "lines": [
-        131
+        141
       ]
     },
     "E_RESAMPLE_N": {
@@ -428,7 +428,7 @@
       "default": "80",
       "group": "エネルギー・フィルタ",
       "lines": [
-        130
+        140
       ]
     },
     "E_WHIGH": {
@@ -436,7 +436,7 @@
       "default": "95",
       "group": "エネルギー・フィルタ",
       "lines": [
-        133
+        143
       ]
     },
     "E_WLOW": {
@@ -444,15 +444,15 @@
       "default": "5",
       "group": "エネルギー・フィルタ",
       "lines": [
-        132
+        142
       ]
     },
     "GAUGE_DEBUG": {
-      "type": "str",
+      "type": "bool",
       "default": "0",
       "group": "ゲージ表示",
       "lines": [
-        1358
+        1238
       ]
     },
     "GAUGE_LOG_INT": {
@@ -460,7 +460,7 @@
       "default": "1",
       "group": "ゲージ表示",
       "lines": [
-        1231
+        1080
       ]
     },
     "GAUGE_THRESH_AUTO": {
@@ -468,15 +468,15 @@
       "default": "1",
       "group": "ゲージ表示",
       "lines": [
-        1393
+        1273
       ]
     },
     "GAUGE_TRACE": {
-      "type": "str",
+      "type": "bool",
       "default": "0",
       "group": "ゲージ表示",
       "lines": [
-        1230
+        1079
       ]
     },
     "GAUGE_UPDATE_INTERVAL": {
@@ -484,7 +484,7 @@
       "default": "2",
       "group": "ゲージ表示",
       "lines": [
-        1492
+        1372
       ]
     },
     "GAUGE_WARMUP": {
@@ -492,7 +492,15 @@
       "default": "1",
       "group": "ゲージ表示",
       "lines": [
-        1359
+        1239
+      ]
+    },
+    "GRAB_PARALLEL": {
+      "type": "bool",
+      "default": "1",
+      "group": "その他",
+      "lines": [
+        1192
       ]
     },
     "GRAVITY_AMBIG_DELTA": {
@@ -500,7 +508,7 @@
       "default": "0.08",
       "group": "重力方向推定",
       "lines": [
-        148
+        158
       ]
     },
     "GRAVITY_AUTO_DETECT": {
@@ -508,7 +516,7 @@
       "default": "1",
       "group": "重力方向推定",
       "lines": [
-        139
+        149
       ]
     },
     "GRAVITY_CHECKERBOARD_AXIS_FILE": {
@@ -516,7 +524,7 @@
       "default": "camera_parameters/checkerboard_short_axis.json",
       "group": "重力方向推定",
       "lines": [
-        141
+        151
       ]
     },
     "GRAVITY_DETECT_FRAMES": {
@@ -524,7 +532,7 @@
       "default": "90",
       "group": "重力方向推定",
       "lines": [
-        142
+        152
       ]
     },
     "GRAVITY_FROM_CHECKERBOARD_SHORT": {
@@ -532,7 +540,7 @@
       "default": "1",
       "group": "重力方向推定",
       "lines": [
-        140
+        150
       ]
     },
     "GRAVITY_LEVEL_PLANE": {
@@ -540,7 +548,7 @@
       "default": "YZ",
       "group": "重力方向推定",
       "lines": [
-        147
+        157
       ]
     },
     "GRAVITY_LEVEL_PLANE_ON": {
@@ -548,7 +556,7 @@
       "default": "0",
       "group": "重力方向推定",
       "lines": [
-        146
+        156
       ]
     },
     "GRAVITY_LEVEL_PLANE_WEBCAM_OK": {
@@ -556,7 +564,7 @@
       "default": "0",
       "group": "重力方向推定",
       "lines": [
-        149
+        159
       ]
     },
     "GRAVITY_PREFERRED": {
@@ -564,7 +572,7 @@
       "default": "Y-",
       "group": "重力方向推定",
       "lines": [
-        143
+        153
       ]
     },
     "GRAVITY_TAG_IN_CSV": {
@@ -572,7 +580,7 @@
       "default": "1",
       "group": "重力方向推定",
       "lines": [
-        144
+        154
       ]
     },
     "G_SCALAR": {
@@ -580,7 +588,7 @@
       "default": "9.80665",
       "group": "その他",
       "lines": [
-        1401
+        1281
       ]
     },
     "HEADLESS": {
@@ -588,7 +596,7 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        70
+        115
       ]
     },
     "HEALTH_INTERVAL": {
@@ -596,7 +604,7 @@
       "default": "150",
       "group": "ヘルスモニタ",
       "lines": [
-        1491
+        1371
       ]
     },
     "HEALTH_TRACEMALLOC": {
@@ -604,7 +612,7 @@
       "default": "0",
       "group": "ヘルスモニタ",
       "lines": [
-        1488
+        1368
       ]
     },
     "HX711_BASE_URL": {
@@ -612,7 +620,7 @@
       "default": "http://192.168.4.1",
       "group": "ロードセル",
       "lines": [
-        2323
+        2101
       ]
     },
     "HX711_CLIENT_DIR": {
@@ -620,7 +628,7 @@
       "default": null,
       "group": "ロードセル",
       "lines": [
-        827
+        687
       ]
     },
     "HX711_ENABLE": {
@@ -628,7 +636,7 @@
       "default": "0",
       "group": "ロードセル",
       "lines": [
-        811
+        671
       ]
     },
     "HX_DIAG": {
@@ -636,7 +644,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        2326
+        2104
       ]
     },
     "IMMEDIATE_ESC_BREAK": {
@@ -644,7 +652,15 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        1444
+        1324
+      ]
+    },
+    "INERTIA_LENGTH_FRAMES": {
+      "type": "int",
+      "default": "30",
+      "group": "その他",
+      "lines": [
+        354
       ]
     },
     "IO_DEBUG": {
@@ -652,7 +668,7 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        73
+        118
       ]
     },
     "KPS_FAST_ON": {
@@ -660,7 +676,7 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        768
+        628
       ]
     },
     "LOOP_FILE_PLAYBACK": {
@@ -668,15 +684,15 @@
       "default": "0",
       "group": "メインループ",
       "lines": [
-        2525
+        2303
       ]
     },
     "LOOP_TRACE": {
-      "type": "str",
+      "type": "bool",
       "default": "1",
       "group": "メインループ",
       "lines": [
-        2638
+        2416
       ]
     },
     "M5_PORT": {
@@ -684,8 +700,8 @@
       "default": null,
       "group": "その他",
       "lines": [
-        1153,
-        2330
+        1002,
+        2108
       ]
     },
     "MAX_FRAMES": {
@@ -693,7 +709,7 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        2531
+        2309
       ]
     },
     "MP_INPUT_SCALE": {
@@ -701,7 +717,7 @@
       "default": "0.5",
       "group": "MediaPipe",
       "lines": [
-        753
+        613
       ]
     },
     "MP_THREADS": {
@@ -709,8 +725,8 @@
       "default": null,
       "group": "MediaPipe",
       "lines": [
-        747,
-        747
+        607,
+        607
       ],
       "conflicting_defaults": [
         ""
@@ -721,8 +737,8 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        3613,
-        4353
+        3256,
+        3911
       ]
     },
     "OPENCV_THREADS": {
@@ -730,7 +746,7 @@
       "default": "",
       "group": "その他",
       "lines": [
-        792
+        652
       ]
     },
     "PERF_INT": {
@@ -738,8 +754,8 @@
       "default": null,
       "group": "性能計測",
       "lines": [
-        2524,
-        2524
+        2302,
+        2302
       ],
       "conflicting_defaults": [
         "60"
@@ -750,7 +766,7 @@
       "default": "0",
       "group": "性能計測",
       "lines": [
-        2523
+        2301
       ]
     },
     "PERF_TOPK": {
@@ -758,8 +774,8 @@
       "default": null,
       "group": "性能計測",
       "lines": [
-        2582,
-        2582
+        2360,
+        2360
       ],
       "conflicting_defaults": [
         "7"
@@ -770,7 +786,7 @@
       "default": "0",
       "group": "性能計測",
       "lines": [
-        2580
+        2358
       ]
     },
     "PERF_TRACE_EVERY": {
@@ -778,8 +794,8 @@
       "default": null,
       "group": "性能計測",
       "lines": [
-        2581,
-        2581
+        2359,
+        2359
       ],
       "conflicting_defaults": [
         "5"
@@ -790,11 +806,9 @@
       "default": "0",
       "group": "姿勢推定",
       "lines": [
-        724,
-        771,
-        1326,
-        2294,
-        3540
+        584,
+        631,
+        1175
       ]
     },
     "POSE_MIN_DET": {
@@ -802,7 +816,7 @@
       "default": "0.5",
       "group": "姿勢推定",
       "lines": [
-        1309
+        1158
       ]
     },
     "POSE_MIN_TRACK": {
@@ -810,15 +824,15 @@
       "default": "0.5",
       "group": "姿勢推定",
       "lines": [
-        1313
+        1162
       ]
     },
     "POSE_PARALLEL": {
-      "type": "str",
+      "type": "bool",
       "default": "1",
       "group": "姿勢推定",
       "lines": [
-        1323
+        1172
       ]
     },
     "POSE_ROI_MARGIN_RATIO": {
@@ -826,7 +840,7 @@
       "default": "0.25",
       "group": "姿勢推定",
       "lines": [
-        760
+        620
       ]
     },
     "POSE_ROI_MAX_MISS": {
@@ -834,7 +848,7 @@
       "default": "4",
       "group": "姿勢推定",
       "lines": [
-        763
+        623
       ]
     },
     "POSE_ROI_MIN_SIDE_RATIO": {
@@ -842,7 +856,7 @@
       "default": "0.45",
       "group": "姿勢推定",
       "lines": [
-        761
+        621
       ]
     },
     "POSE_ROI_MIN_VALID_KPTS": {
@@ -850,7 +864,7 @@
       "default": "4",
       "group": "姿勢推定",
       "lines": [
-        762
+        622
       ]
     },
     "POSE_ROI_MISS_GROW_RATIO": {
@@ -858,7 +872,7 @@
       "default": "0.25",
       "group": "姿勢推定",
       "lines": [
-        764
+        624
       ]
     },
     "POSE_ROI_ON": {
@@ -866,7 +880,7 @@
       "default": "1",
       "group": "姿勢推定",
       "lines": [
-        759
+        619
       ]
     },
     "POSE_TASK_MODEL": {
@@ -874,7 +888,7 @@
       "default": null,
       "group": "姿勢推定",
       "lines": [
-        714
+        574
       ]
     },
     "POSE_TRACE_EVERY": {
@@ -882,7 +896,7 @@
       "default": "30",
       "group": "姿勢推定",
       "lines": [
-        1327
+        1176
       ]
     },
     "POSE_X_CROP_MARGIN": {
@@ -890,7 +904,7 @@
       "default": "140",
       "group": "姿勢推定",
       "lines": [
-        765
+        625
       ]
     },
     "POSE_X_CROP_MIN_WIDTH_RATIO": {
@@ -898,7 +912,7 @@
       "default": "0.85",
       "group": "姿勢推定",
       "lines": [
-        766
+        626
       ]
     },
     "PREFER_RECORDING_PAIRS": {
@@ -906,7 +920,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        78
+        123
       ]
     },
     "RT_CYCLE_AXIS": {
@@ -914,7 +928,7 @@
       "default": "y",
       "group": "リアルタイム処理",
       "lines": [
-        2554
+        2332
       ]
     },
     "RT_CYCLE_NEGATIVE_DOWN": {
@@ -922,7 +936,7 @@
       "default": "1",
       "group": "リアルタイム処理",
       "lines": [
-        2555
+        2333
       ]
     },
     "RT_DELAY_SKIP_GAIN": {
@@ -930,7 +944,7 @@
       "default": "1.0",
       "group": "リアルタイム処理",
       "lines": [
-        2538
+        2316
       ]
     },
     "RT_DELAY_SKIP_MAX": {
@@ -938,7 +952,7 @@
       "default": "300",
       "group": "リアルタイム処理",
       "lines": [
-        2540
+        2318
       ]
     },
     "RT_DELAY_SKIP_MIN": {
@@ -946,7 +960,7 @@
       "default": "0",
       "group": "リアルタイム処理",
       "lines": [
-        2539
+        2317
       ]
     },
     "RT_DELAY_SKIP_ON": {
@@ -954,7 +968,7 @@
       "default": "0",
       "group": "リアルタイム処理",
       "lines": [
-        2537
+        2315
       ]
     },
     "RT_DROP_DIST_MARGIN": {
@@ -962,7 +976,7 @@
       "default": "0.0010",
       "group": "リアルタイム処理",
       "lines": [
-        2557
+        2335
       ]
     },
     "RT_DROP_VEL_THR": {
@@ -970,7 +984,7 @@
       "default": "0.0008",
       "group": "リアルタイム処理",
       "lines": [
-        2556
+        2334
       ]
     },
     "RT_DYN_ON_RISE_ONLY": {
@@ -978,7 +992,7 @@
       "default": "1",
       "group": "リアルタイム処理",
       "lines": [
-        2550
+        2328
       ]
     },
     "RT_DYN_PREV_FRAMES": {
@@ -986,7 +1000,7 @@
       "default": "1",
       "group": "リアルタイム処理",
       "lines": [
-        2551
+        2329
       ]
     },
     "RT_POSE_FIXED_HZ": {
@@ -994,7 +1008,7 @@
       "default": "4.0",
       "group": "リアルタイム処理",
       "lines": [
-        2549
+        2327
       ]
     },
     "RT_POSE_FIXED_HZ_ON": {
@@ -1002,7 +1016,7 @@
       "default": "1",
       "group": "リアルタイム処理",
       "lines": [
-        2548
+        2326
       ]
     },
     "RT_RISE_BURST_COOLDOWN": {
@@ -1010,7 +1024,7 @@
       "default": "18",
       "group": "リアルタイム処理",
       "lines": [
-        2545
+        2323
       ]
     },
     "RT_RISE_BURST_FRAMES": {
@@ -1018,7 +1032,7 @@
       "default": "12",
       "group": "リアルタイム処理",
       "lines": [
-        2544
+        2322
       ]
     },
     "RT_RISE_BURST_ON": {
@@ -1026,7 +1040,7 @@
       "default": "1",
       "group": "リアルタイム処理",
       "lines": [
-        2542
+        2320
       ]
     },
     "RT_RISE_BURST_SKIP": {
@@ -1034,7 +1048,7 @@
       "default": "7",
       "group": "リアルタイム処理",
       "lines": [
-        2547
+        2325
       ]
     },
     "RT_RISE_ZDIST_MARGIN": {
@@ -1042,7 +1056,7 @@
       "default": "0.0035",
       "group": "リアルタイム処理",
       "lines": [
-        2546
+        2324
       ]
     },
     "RT_RISE_ZVEL_THR": {
@@ -1050,7 +1064,7 @@
       "default": "0.0008",
       "group": "リアルタイム処理",
       "lines": [
-        2543
+        2321
       ]
     },
     "RT_SIT_CONSEC_FRAMES": {
@@ -1058,7 +1072,7 @@
       "default": "2",
       "group": "リアルタイム処理",
       "lines": [
-        2553
+        2331
       ]
     },
     "RT_SIT_ZDIST_MARGIN": {
@@ -1066,7 +1080,7 @@
       "default": "0.0060",
       "group": "リアルタイム処理",
       "lines": [
-        2552
+        2330
       ]
     },
     "SKIP_FRAMES": {
@@ -1074,7 +1088,7 @@
       "default": "0",
       "group": "その他",
       "lines": [
-        105
+        195
       ]
     },
     "STOP_AFTER": {
@@ -1082,7 +1096,7 @@
       "default": "",
       "group": "その他",
       "lines": [
-        2528
+        2306
       ]
     },
     "SUBJECT_ID": {
@@ -1090,7 +1104,7 @@
       "default": null,
       "group": "その他",
       "lines": [
-        907
+        767
       ]
     },
     "TIMESTAMP_OVERRIDE": {
@@ -1098,15 +1112,15 @@
       "default": "",
       "group": "その他",
       "lines": [
-        85
+        175
       ]
     },
     "TRACE_DYN": {
-      "type": "str",
+      "type": "bool",
       "default": "0",
       "group": "トレース出力",
       "lines": [
-        1880
+        1752
       ]
     },
     "TRACE_EVERY": {
@@ -1114,15 +1128,15 @@
       "default": "10",
       "group": "トレース出力",
       "lines": [
-        1883
+        1755
       ]
     },
     "TRACE_POSE": {
-      "type": "str",
+      "type": "bool",
       "default": "0",
       "group": "トレース出力",
       "lines": [
-        1881
+        1753
       ]
     },
     "TRIANG_NATIVE_ON": {
@@ -1130,24 +1144,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        136
-      ]
-    },
-    "USE_NATIVE_DRAW": {
-      "type": "bool",
-      "default": "1",
-      "group": "入力ソース",
-      "lines": [
-        2642
-      ]
-    },
-    "USE_NATIVE_DYNAMICS": {
-      "type": "bool",
-      "default": "1",
-      "group": "入力ソース",
-      "lines": [
-        2215,
-        3501
+        146
       ]
     },
     "USE_NATIVE_POSE": {
@@ -1155,7 +1152,7 @@
       "default": "0",
       "group": "入力ソース",
       "lines": [
-        712
+        572
       ]
     },
     "USE_POSE_LANDMARKER": {
@@ -1163,7 +1160,7 @@
       "default": "1",
       "group": "入力ソース",
       "lines": [
-        711
+        571
       ]
     },
     "USE_SAMPLE_VIDEOS": {
@@ -1171,7 +1168,7 @@
       "default": "0",
       "group": "入力ソース",
       "lines": [
-        65
+        110
       ]
     },
     "VIDEO_TRACE_EVERY": {
@@ -1179,7 +1176,7 @@
       "default": "1",
       "group": "その他",
       "lines": [
-        2735
+        2432
       ]
     }
   }

@@ -14,9 +14,7 @@ except Exception:
 import sys
 import datetime
 import collections
-import textwrap
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -58,6 +56,7 @@ from config import (
     OUTPUT_SCHEMA_VERSION,
     part_calculations,
     slot_of,
+    env_flag,
     INERTIA_LENGTH_FRAMES,
     WORK_INTEGRAL_K,
     EFFECTIVE_MASS_BY_JOINT,
@@ -89,7 +88,8 @@ from utils import (
     DLT,
     extract_keypoints,
     get_projection_matrix,
-    put_text_jp,
+    draw_text_jp,
+    prewarm_text_jp,
     compute_local_torque,
     PushCycleDetector,
 )
@@ -112,10 +112,6 @@ try:
     from Gauge_display import GaugeDisplay
 except Exception:
     GaugeDisplay = None
-try:
-    import py_native_overlay as _native_overlay
-except Exception:
-    _native_overlay = None
 try:
     import py_native_pose as _native_pose
 except Exception:
@@ -145,22 +141,22 @@ E_RESAMPLE_N = int(os.getenv('E_RESAMPLE_N', '80'))  # 50〜100
 E_MAX_DTH = float(os.getenv('E_MAX_DTH', '0.25'))  # 角度ステップの上限 [rad]
 E_WINSOR_PCTL_LOW = float(os.getenv('E_WLOW', '5'))  # トルクの下側ウィンズライジング
 E_WINSOR_PCTL_HIGH = float(os.getenv('E_WHIGH', '95'))
-E_DEBUG = os.getenv('E_DEBUG', '0') in ('1','true','True')
-E_LPF_NATIVE_ON = os.getenv('E_LPF_NATIVE_ON', '1') in ('1','true','True')
-TRIANG_NATIVE_ON = os.getenv('TRIANG_NATIVE_ON', '1') in ('1','true','True')
+E_DEBUG = env_flag('E_DEBUG', False)
+E_LPF_NATIVE_ON = env_flag('E_LPF_NATIVE_ON', True)
+TRIANG_NATIVE_ON = env_flag('TRIANG_NATIVE_ON', True)
 
 # ===================== 重力向き検出/管理 設定 =====================
-GRAVITY_AUTO_DETECT = os.getenv('GRAVITY_AUTO_DETECT', '1') in ('1','true','True')
-GRAVITY_FROM_CHECKERBOARD_SHORT = os.getenv('GRAVITY_FROM_CHECKERBOARD_SHORT', '1') in ('1','true','True')
+GRAVITY_AUTO_DETECT = env_flag('GRAVITY_AUTO_DETECT', True)
+GRAVITY_FROM_CHECKERBOARD_SHORT = env_flag('GRAVITY_FROM_CHECKERBOARD_SHORT', True)
 GRAVITY_CHECKERBOARD_AXIS_FILE = os.getenv('GRAVITY_CHECKERBOARD_AXIS_FILE', 'camera_parameters/checkerboard_short_axis.json')
 GRAVITY_DETECT_FRAMES = int(os.getenv('GRAVITY_DETECT_FRAMES', '90'))  # 3秒@30fps目安
 GRAVITY_PREFERRED = os.getenv('GRAVITY_PREFERRED', 'Y-')  # フォールバック表示用
-GRAVITY_TAG_IN_CSV = os.getenv('GRAVITY_TAG_IN_CSV', '1') in ('1','true','True')
+GRAVITY_TAG_IN_CSV = env_flag('GRAVITY_TAG_IN_CSV', True)
 # Webカメラは必ずしも水平でないため、平面拘束は既定OFF（必要時のみON）
-GRAVITY_LEVEL_PLANE_ON = os.getenv('GRAVITY_LEVEL_PLANE_ON', '0') in ('1','true','True')
+GRAVITY_LEVEL_PLANE_ON = env_flag('GRAVITY_LEVEL_PLANE_ON', False)
 GRAVITY_LEVEL_PLANE = os.getenv('GRAVITY_LEVEL_PLANE', 'YZ').upper()  # XY/YZ/XZ
 GRAVITY_AMBIG_DELTA = float(os.getenv('GRAVITY_AMBIG_DELTA', '0.08'))  # 近接時はpreferred優先
-GRAVITY_LEVEL_PLANE_WEBCAM_OK = os.getenv('GRAVITY_LEVEL_PLANE_WEBCAM_OK', '0') in ('1','true','True')
+GRAVITY_LEVEL_PLANE_WEBCAM_OK = env_flag('GRAVITY_LEVEL_PLANE_WEBCAM_OK', False)
 
 # ===================== 適応的LPF設定（リアルタイムf0追跡）=====================
 E_FC_ADAPTIVE_ON = int(os.getenv('E_FC_ADAPTIVE_ON', '0'))  # 0=固定fc, 1=適応fc
@@ -177,7 +173,7 @@ E_FPS_MIN = float(os.getenv('E_FPS_MIN', '5.0'))  # 実効fps下限（異常値�
 E_FPS_MAX = float(os.getenv('E_FPS_MAX', '120.0'))  # 実効fps上限（異常値抑制）
 
 # 拡張カルマンフィルタ設定（ランドマーク位置/速度/加速度）
-EKF_ENABLE = os.getenv('EKF_ENABLE', '1') in ('1', 'true', 'True')
+EKF_ENABLE = env_flag('EKF_ENABLE', True)
 EKF_Q_ACC = float(os.getenv('EKF_Q_ACC', '1e-3'))
 EKF_R = float(os.getenv('EKF_R', '1e-3'))
 EKF_GATE_STD = float(os.getenv('EKF_GATE_STD', '3.0'))
@@ -186,7 +182,7 @@ EKF_BPF_LOW = float(os.getenv('EKF_BPF_LOW', '0'))
 EKF_BPF_HIGH = float(os.getenv('EKF_BPF_HIGH', '0'))
 EKF_BPF_ORDER = int(os.getenv('EKF_BPF_ORDER', '2'))
 # n_points x 3 本のスカラーEKFを配列演算で一括処理する（0 で従来のPythonループ）
-EKF_VECTORIZED = os.getenv('EKF_VECTORIZED', '1') not in ('0', 'false', 'False')
+EKF_VECTORIZED = env_flag('EKF_VECTORIZED', True)
 
 # 肘の角度・トルクのフレーム蓄積バッファ（1サイwクル分）
 _E_buffers = {
@@ -585,7 +581,7 @@ if not os.path.exists(POSE_TASK_MODEL):
             # 'pose' を含むものを優先
             _candidates.sort(key=lambda p: (0 if 'pose' in os.path.basename(p).lower() else 1, len(os.path.basename(p))))
             POSE_TASK_MODEL = _candidates[0]
-            if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
+            if env_flag('POSE_DEBUG', False):
                 logger.debug("[Pose] Auto-detected model: %s", POSE_TASK_MODEL)
     except Exception:
         pass
@@ -620,7 +616,7 @@ except Exception:
 MP_INPUT_SCALE = max(0.25, min(MP_INPUT_SCALE, 1.0))
 
 # 前フレーム近傍ROIでPose推論を軽量化（人体が急変しない前提）
-POSE_ROI_ON = os.getenv('POSE_ROI_ON', '1') in ('1', 'true', 'True')
+POSE_ROI_ON = env_flag('POSE_ROI_ON', True)
 POSE_ROI_MARGIN_RATIO = float(os.getenv('POSE_ROI_MARGIN_RATIO', '0.25'))
 POSE_ROI_MIN_SIDE_RATIO = float(os.getenv('POSE_ROI_MIN_SIDE_RATIO', '0.45'))
 POSE_ROI_MIN_VALID_KPTS = int(os.getenv('POSE_ROI_MIN_VALID_KPTS', '4'))
@@ -628,11 +624,11 @@ POSE_ROI_MAX_MISS = int(os.getenv('POSE_ROI_MAX_MISS', '4'))
 POSE_ROI_MISS_GROW_RATIO = float(os.getenv('POSE_ROI_MISS_GROW_RATIO', '0.25'))
 POSE_X_CROP_MARGIN = int(os.getenv('POSE_X_CROP_MARGIN', '140'))
 POSE_X_CROP_MIN_WIDTH_RATIO = float(os.getenv('POSE_X_CROP_MIN_WIDTH_RATIO', '0.85'))
-DRAW_KEYPOINTS_ON = os.getenv('DRAW_KEYPOINTS', '1') not in ('0', 'false', 'False')
-KPS_FAST_ON = os.getenv('KPS_FAST_ON', '0') in ('1', 'true', 'True')
+DRAW_KEYPOINTS_ON = env_flag('DRAW_KEYPOINTS', True)
+KPS_FAST_ON = env_flag('KPS_FAST_ON', False)
 
 # デバッグ出力: 使用コア数・モデルパスなど（POSE_DEBUG=1 で有効）
-if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
+if env_flag('POSE_DEBUG', False):
     try:
         import importlib.util as _ilu
         _phy = _log = None
@@ -672,7 +668,7 @@ def _tasks_imports():
         return None, None, None, None
 
 # ================= HX711 Recorder (M5StampS3) 連携 追加インポート (オプション) =================
-HX711_ENABLE = os.getenv('HX711_ENABLE', '0') in ('1', 'true', 'True')
+HX711_ENABLE = env_flag('HX711_ENABLE', False)
 HX_RECORDER_AVAILABLE = False
 BLE_RECORDER_AVAILABLE = False
 RecorderClient = None  # type: ignore
@@ -1080,7 +1076,7 @@ if HX711_ENABLE:
 # ================= 追加: Gauge 詳細デバッグダンプ =================
 # 目的: ゲージの初期化→毎フレーム更新→描画の各段階で、
 #       値としきい値、角度、ウォームアップ状態、Figure 状態などを可視化。
-_GAUGE_TRACE = os.getenv('GAUGE_TRACE', '0') not in ('0', 'false', 'False')
+_GAUGE_TRACE = env_flag('GAUGE_TRACE', False)
 _GAUGE_LOG_INT = int(os.getenv('GAUGE_LOG_INT', '1'))  # 何フレ毎にログするか（既定: 毎フレ）
 
 def _gauge_log_state(tag: str = "", force: bool = False) -> None:
@@ -1173,10 +1169,10 @@ pose1 = PoseEstimator(USE_POSE_LANDMARKER, POSE_TASK_MODEL, min_det=POSE_MIN_DET
 # pose0 / pose1 は独立インスタンスで、process() は self のみを触るためスレッド安全。
 # ワーカは cam1 側だけを担当し、cam0 はメインスレッドで実行する（2並列に必要なのは1本）。
 # POSE_PARALLEL=0 で直列に戻せる（A/B比較用）。
-POSE_PARALLEL = os.getenv('POSE_PARALLEL', '1') not in ('0', 'false', 'False')
+POSE_PARALLEL = env_flag('POSE_PARALLEL', True)
 _pose_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pose1') if POSE_PARALLEL else None
 # ループ内から毎フレーム読まないよう、起動時に一度だけ確定させる
-POSE_DEBUG = os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True')
+POSE_DEBUG = env_flag('POSE_DEBUG', False)
 POSE_TRACE_EVERY = max(1, int(os.getenv('POSE_TRACE_EVERY', '30')))
 
 
@@ -1193,7 +1189,7 @@ POSE_TRACE_EVERY = max(1, int(os.getenv('POSE_TRACE_EVERY', '30')))
 # 待っている間 GIL は解放されるので、cam1 側だけワーカに出せば足りる。
 # VideoCapture は別インスタンスなので、それぞれのスレッドから触ってよい。
 # GRAB_PARALLEL=0 で直列に戻せる（A/B比較用）。
-GRAB_PARALLEL = os.getenv('GRAB_PARALLEL', '1') not in ('0', 'false', 'False')
+GRAB_PARALLEL = env_flag('GRAB_PARALLEL', True)
 _grab_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='grab1') if GRAB_PARALLEL else None
 if _grab_pool is not None:
     atexit.register(_grab_pool.shutdown, wait=False)
@@ -1225,7 +1221,7 @@ def _pose_job(pose_estimator, frame_bgr, roi):
 print(f"✅ Mediapipe・モデル準備 完了 (pose_parallel={'ON' if _pose_pool is not None else 'OFF'})")
 ## Gauge / Matplotlib 初期化（環境変数 DISABLE_MPL=1 で完全無効化可能）
 gauge = None  # type: ignore
-if (os.getenv('DISABLE_MPL', '0') not in ('1','true','True')) and not HEADLESS:
+if (not env_flag('DISABLE_MPL', False)) and not HEADLESS:
     # 統計ファイルが無ければ空テンプレを生成
     if not os.path.exists(stats_file):
         print(f"[Gauge] 統計ファイルが無いためテンプレ生成: {stats_file}")
@@ -1239,7 +1235,7 @@ if (os.getenv('DISABLE_MPL', '0') not in ('1','true','True')) and not HEADLESS:
     config_path = os.path.join(os.path.dirname(__file__), "gauge_layout.json")  # 旧: positions.json
     with open(config_path, "r", encoding="utf-8") as f:
         ui_conf = json.load(f)
-    _g_debug = os.getenv('GAUGE_DEBUG', '0') not in ('0','false','False')
+    _g_debug = env_flag('GAUGE_DEBUG', False)
     _g_warm = int(os.getenv('GAUGE_WARMUP', '1'))  # 約 30フレーム = 1秒想定
     try:
         gauge = GaugeDisplay(config_path, stats, image_path="wheelchair_user.png", debug=_g_debug, warmup_frames=_g_warm)
@@ -1369,7 +1365,7 @@ if not HEADLESS:
 # tracemalloc は全メモリ確保に Python トレースバック(25段)を記録するため、
 # numpy の小さな配列演算が 2us -> 900us と約400倍遅くなる。ループ全体を支配する
 # ほどのコストなので既定では無効。メモリ調査時のみ HEALTH_TRACEMALLOC=1 で有効化する。
-HEALTH_TRACEMALLOC = os.getenv('HEALTH_TRACEMALLOC', '0') in ('1', 'true', 'True')
+HEALTH_TRACEMALLOC = env_flag('HEALTH_TRACEMALLOC', False)
 if HEALTH_TRACEMALLOC:
     tracemalloc.start(25)
 _HEALTH_LOG_INTERVAL = int(os.getenv('HEALTH_INTERVAL', '150'))
@@ -1413,7 +1409,7 @@ def _cleanup_resources():
     _CLEANUP_RAN = True
 
     import sys as _sys
-    verbose = os.getenv('ENABLE_VERBOSE_CLEANUP', '0') not in ('0','false','False')
+    verbose = env_flag('ENABLE_VERBOSE_CLEANUP', False)
     finalizing = getattr(_sys, 'is_finalizing', lambda: False)()
     def _log(msg):
         if verbose:
@@ -1584,9 +1580,9 @@ print("Projection matrices loaded")
 # %%
 # 参照順の都合で、デモ用フラグをここでも安全に初期化
 if 'DEMO_MONO_GAUGE_ON' not in globals():
-    DEMO_MONO_GAUGE_ON = os.getenv('DEMO_MONO_GAUGE_ON', '1') in ('1', 'true', 'True')
+    DEMO_MONO_GAUGE_ON = env_flag('DEMO_MONO_GAUGE_ON', True)
 if 'DEMO_MONO_CAM0_ONLY' not in globals():
-    DEMO_MONO_CAM0_ONLY = os.getenv('DEMO_MONO_CAM0_ONLY', '1') in ('1', 'true', 'True')
+    DEMO_MONO_CAM0_ONLY = env_flag('DEMO_MONO_CAM0_ONLY', True)
 
 save_path0 = f"cam0_output_{timestamp}.mp4"
 save_path1 = f"cam1_output_{timestamp}.mp4"
@@ -1751,10 +1747,10 @@ if EKF_ENABLE:
         print(f"[EKF] disabled (init failed): {_ekf_init_e}")
         landmark_ekf = None
 
-DEBUG_LOGS = os.getenv('DEBUG_LOGS', '0') not in ('0','false','False')
+DEBUG_LOGS = env_flag('DEBUG_LOGS', False)
 # 追加: 動力学＆姿勢デバッグの詳細トグル（必要時のみON）
-TRACE_DYN = os.getenv('TRACE_DYN', '0') not in ('0','false','False')
-TRACE_POSE = os.getenv('TRACE_POSE', '0') not in ('0','false','False')
+TRACE_DYN = env_flag('TRACE_DYN', False)
+TRACE_POSE = env_flag('TRACE_POSE', False)
 try:
     TRACE_EVERY = max(1, int(os.getenv('TRACE_EVERY', '10')))
 except Exception:
@@ -2105,7 +2101,7 @@ hx_serial_client: object | None = None
 HX_BASE_URL = os.getenv('HX711_BASE_URL', 'http://192.168.4.1')  # Wi-Fi 経由ダウンロード用 (任意)
 
 # 追加: HX711 クイック診断設定（最初の使用箇所より前に配置）
-HX_DIAG = os.getenv('HX_DIAG', '1') in ('1','true','True')
+HX_DIAG = env_flag('HX_DIAG', True)
 
 if HX711_ENABLE and (RecorderClient is not None):
     # シリアルポート推定: まずは環境変数 M5_PORT、無ければ COM3 を採用
@@ -2316,30 +2312,30 @@ except Exception:
 
 # 追加: リアルタイム遅延反映スキップ（処理時間に応じて次フレームを間引く）
 # 例: 30fps入力で1.0秒かかった場合、約30フレーム先を次の処理対象にする
-RT_DELAY_SKIP_ON = os.getenv('RT_DELAY_SKIP_ON', '0') in ('1', 'true', 'True')
+RT_DELAY_SKIP_ON = env_flag('RT_DELAY_SKIP_ON', False)
 RT_DELAY_SKIP_GAIN = float(os.getenv('RT_DELAY_SKIP_GAIN', '1.0'))
 RT_DELAY_SKIP_MIN = int(os.getenv('RT_DELAY_SKIP_MIN', '0'))
 RT_DELAY_SKIP_MAX = int(os.getenv('RT_DELAY_SKIP_MAX', '300'))
 # 立ち上がり区間だけ高密度に処理するバーストモード
-RT_RISE_BURST_ON = os.getenv('RT_RISE_BURST_ON', '1') in ('1', 'true', 'True')
+RT_RISE_BURST_ON = env_flag('RT_RISE_BURST_ON', True)
 RT_RISE_ZVEL_THR = float(os.getenv('RT_RISE_ZVEL_THR', '0.0008'))  # [m/frame] 目安
 RT_RISE_BURST_FRAMES = int(os.getenv('RT_RISE_BURST_FRAMES', '12'))
 RT_RISE_BURST_COOLDOWN = int(os.getenv('RT_RISE_BURST_COOLDOWN', '18'))
 RT_RISE_ZDIST_MARGIN = float(os.getenv('RT_RISE_ZDIST_MARGIN', '0.0035'))  # cycle閾値近傍で先行発火
 RT_RISE_BURST_SKIP = int(os.getenv('RT_RISE_BURST_SKIP', '7'))  # burst中skip=7 -> 約4Hz @ 30fps
-RT_POSE_FIXED_HZ_ON = os.getenv('RT_POSE_FIXED_HZ_ON', '1') in ('1', 'true', 'True')
+RT_POSE_FIXED_HZ_ON = env_flag('RT_POSE_FIXED_HZ_ON', True)
 RT_POSE_FIXED_HZ = float(os.getenv('RT_POSE_FIXED_HZ', '4.0'))
-RT_DYN_ON_RISE_ONLY = os.getenv('RT_DYN_ON_RISE_ONLY', '1') in ('1', 'true', 'True')
+RT_DYN_ON_RISE_ONLY = env_flag('RT_DYN_ON_RISE_ONLY', True)
 RT_DYN_PREV_FRAMES = int(os.getenv('RT_DYN_PREV_FRAMES', '1'))
 RT_SIT_ZDIST_MARGIN = float(os.getenv('RT_SIT_ZDIST_MARGIN', '0.0060'))
 RT_SIT_CONSEC_FRAMES = int(os.getenv('RT_SIT_CONSEC_FRAMES', '2'))
 RT_CYCLE_AXIS = os.getenv('RT_CYCLE_AXIS', 'y').strip().lower()  # x/y/z
-RT_CYCLE_NEGATIVE_DOWN = os.getenv('RT_CYCLE_NEGATIVE_DOWN', '1') in ('1', 'true', 'True')
+RT_CYCLE_NEGATIVE_DOWN = env_flag('RT_CYCLE_NEGATIVE_DOWN', True)
 RT_DROP_VEL_THR = float(os.getenv('RT_DROP_VEL_THR', '0.0008'))
 RT_DROP_DIST_MARGIN = float(os.getenv('RT_DROP_DIST_MARGIN', '0.0010'))
 
 # デモ向け: トルク解析を使わず、単眼(cam0)の肩上昇/肘角変化でゲージを制御
-DEMO_MONO_GAUGE_ON = os.getenv('DEMO_MONO_GAUGE_ON', '1') in ('1', 'true', 'True')
+DEMO_MONO_GAUGE_ON = env_flag('DEMO_MONO_GAUGE_ON', True)
 DEMO_SHOULDER_RISE_FULL_M = float(os.getenv('DEMO_SHOULDER_RISE_FULL_M', '0.10'))
 DEMO_ELBOW_DELTA_FULL_DEG = float(os.getenv('DEMO_ELBOW_DELTA_FULL_DEG', '45.0'))
 DEMO_SHOULDER_RISE_PARTIAL_M = float(os.getenv('DEMO_SHOULDER_RISE_PARTIAL_M', '0.02'))
@@ -2349,7 +2345,7 @@ DEMO_RATIO_PARTIAL = float(os.getenv('DEMO_RATIO_PARTIAL', '0.30'))
 DEMO_RATIO_UP_STEP = float(os.getenv('DEMO_RATIO_UP_STEP', '0.025'))
 DEMO_RATIO_DOWN_STEP = float(os.getenv('DEMO_RATIO_DOWN_STEP', '0.035'))
 DEMO_BASELINE_EMA = float(os.getenv('DEMO_BASELINE_EMA', '0.01'))
-DEMO_MONO_CAM0_ONLY = os.getenv('DEMO_MONO_CAM0_ONLY', '1') in ('1', 'true', 'True')
+DEMO_MONO_CAM0_ONLY = env_flag('DEMO_MONO_CAM0_ONLY', True)
 
 class _LoopPerf:
     def __init__(self, enabled: bool, interval: int):
@@ -2417,101 +2413,20 @@ class _LoopPerf:
             print(f"  {k:18s}: {v*1000.0:7.2f} ms  ({pct:5.1f}%)")
 
 _perf = _LoopPerf(PERF_LOG, PERF_INT)
-LOOP_TRACE = os.getenv('LOOP_TRACE', '1') not in ('0','false','False')
+LOOP_TRACE = env_flag('LOOP_TRACE', True)
 # 診断用: 書き込み/表示の無効化トグル
-DISABLE_WRITE = os.getenv('DISABLE_WRITE', '0') in ('1','true','True')
-DISABLE_IMSHOW = os.getenv('DISABLE_IMSHOW', '0') in ('1','true','True')
-USE_NATIVE_DRAW = os.getenv('USE_NATIVE_DRAW', '1') in ('1','true','True')
-
-# ---- ラベル描画のスプライトキャッシュ ----
-# utils.put_text_jp はフレーム全体を PIL へ往復変換するため、6ラベル/フレームで
-# 6回のフルフレーム変換が走る。文字列ごとに小さな RGBA スプライトを一度だけ
-# 描画してキャッシュし、以降は numpy スライスで合成する。
-# DRAW_LABEL_CACHE=0 で従来の put_text_jp に戻せる。
-DRAW_LABEL_CACHE = os.getenv('DRAW_LABEL_CACHE', '1') not in ('0', 'false', 'False')
-
-
-def _label_font(size: int):
-    # フォントの取得・キャッシュ・欠落時の扱いは resources に集約してある。
-    from app.core.resources import japanese_font
-
-    return japanese_font(size)
-
-
-@lru_cache(maxsize=512)
-def _glyph_sprite(ch: str, font_size: int, color):
-    """1文字を RGBA スプライト化してキャッシュする。
-
-    文字列全体でキャッシュすると数値が変わるたびに再描画になるため、
-    文字単位で持つ。ラベル+数字なら数十エントリで飽和し以降は全ヒットになる。
-
-    戻り値: (premul (h,w,3) f32, inv_a (h,w,3) f32, ox, oy, advance)
-      premul = color * alpha, inv_a = 1 - alpha を事前計算して合成を2演算に減らす。
-    """
-    from PIL import Image as _IM, ImageDraw as _ID
-    font = _label_font(int(font_size))
-    try:
-        adv = float(font.getlength(ch))
-    except Exception:
-        adv = float(font_size)
-    try:
-        x0, y0, x1, y1 = font.getbbox(ch)
-    except Exception:
-        x0, y0, x1, y1 = 0, 0, int(adv), int(font_size * 1.2)
-    w = max(1, int(x1 - x0) + 1)
-    h = max(1, int(y1 - y0) + 1)
-    spr = _IM.new('RGBA', (w, h), (0, 0, 0, 0))
-    _ID.Draw(spr).text((-x0, -y0), ch, font=font,
-                       fill=(int(color[0]), int(color[1]), int(color[2]), 255))
-    rgba = np.asarray(spr, dtype=np.uint8)
-    a = (rgba[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
-    # inv_a は (h,w,1) のままだと合成時に末尾軸が stride 0 になり、numpy が
-    # ベクトル化ループを使えず 3 要素ずつのバッファリング処理に落ちる。
-    # キャッシュ側で (h,w,3) に展開しておくと合成が 4〜8 倍速くなる。
-    inv_a = np.ascontiguousarray(np.broadcast_to(1.0 - a, (a.shape[0], a.shape[1], 3)))
-    return (rgba[:, :, :3].astype(np.float32) * a, inv_a, int(x0), int(y0), adv)
-
-
-def _blit_label(frame, text: str, position, font_size: int, color, line_width: int = 20):
-    """キャッシュ済みグリフを frame へ順に合成する（frame を破壊的に更新）。"""
-    if line_width and len(text) > line_width:
-        text = textwrap.fill(text, width=line_width)
-    H, W = frame.shape[:2]
-    base_x = int(position[0])
-    pen_y = int(position[1])
-    line_h = int(font_size * 1.25)
-    pen_x = 0.0
-    # _glyph_sprite は lru_cache なので引数はハッシュ可能でなければならない
-    font_size = int(font_size)
-    color = tuple(color)
-    for ch in text:
-        if ch == '\n':
-            pen_x = 0.0
-            pen_y += line_h
-            continue
-        premul, inv_a, ox, oy, adv = _glyph_sprite(ch, font_size, color)
-        if ch != ' ':
-            sh, sw = premul.shape[:2]
-            x = base_x + int(pen_x) + ox
-            y = pen_y + oy
-            x0, y0 = max(0, x), max(0, y)
-            x1, y1 = min(W, x + sw), min(H, y + sh)
-            if x1 > x0 and y1 > y0:
-                sx, sy = x0 - x, y0 - y
-                hh, ww = y1 - y0, x1 - x0
-                dst = frame[y0:y1, x0:x1]
-                np.copyto(dst, (dst * inv_a[sy:sy + hh, sx:sx + ww]
-                                + premul[sy:sy + hh, sx:sx + ww]).astype(np.uint8))
-        pen_x += adv
-    return frame
-
-
-if DRAW_LABEL_CACHE:
-    # 初回描画フレームで truetype ロード(約15ms)とグリフ描画がまとめて走ると
-    # 1フレーム落ちるため、起動時に使用する文字を焼いておく
-    for _ch in '右左手首肘肩E:.0123456789 ':
-        _glyph_sprite(_ch, 24, (255, 255, 255))
-    del _ch
+DISABLE_WRITE = env_flag('DISABLE_WRITE', False)
+DISABLE_IMSHOW = env_flag('DISABLE_IMSHOW', False)
+# ---- ラベル描画 ----
+# 文字ごとのスプライトをキャッシュして合成する（utils.draw_text_jp）。フレーム全体を PIL へ
+# 往復させないので 6 ラベル/フレームでも軽い。かつてはここに同じ実装（_blit_label）が別にあり、
+# utils.put_text_jp と折り返し・行送りが食い違っていた（KNOWN_ISSUES §4-2）。
+# DirectWrite の一括描画（py_native_overlay、Windows 専用）の分岐もあったが、この分岐より後ろに
+# 置かれて到達不能になっており（18aadcc 以降）、使われていなかったので外した（§4-1）。
+#
+# 初回描画フレームでフォント読み込み（約 15 ms）とグリフ描画がまとめて走ると 1 フレーム落ちるため、
+# 起動時に使う文字を焼いておく。
+prewarm_text_jp('右左手首肘肩E:.0123456789 ', 24, (255, 255, 255))
 
 try:
     VIDEO_TRACE_EVERY = int(os.getenv('VIDEO_TRACE_EVERY', '1'))
@@ -2519,10 +2434,9 @@ except Exception:
     VIDEO_TRACE_EVERY = 1
 if LOOP_TRACE:
     print(f"[CFG] LOOP_TRACE=1 VIDEO_TRACE_EVERY={VIDEO_TRACE_EVERY} DISABLE_WRITE={int(DISABLE_WRITE)} DISABLE_IMSHOW={int(DISABLE_IMSHOW)} PERF_TRACE={int(_perf.trace)} PERF_TRACE_EVERY={_perf.trace_every} PERF_TOPK={_perf.topk} STOP_AFTER='{STOP_AFTER or '-'}'")
-    print(f"[CFG] USE_NATIVE_DRAW={int(USE_NATIVE_DRAW)} NATIVE_DLL={'ok' if (_native_overlay is not None and getattr(_native_overlay, '_dll', None)) else 'none'}")
 
 # 追加: カメラ診断（実カメラで遅くなる要因の切り分け用）
-CAMERA_DIAG = os.getenv('CAMERA_DIAG', '1') in ('1','true','True')
+CAMERA_DIAG = env_flag('CAMERA_DIAG', True)
 try:
     CAMERA_TRACE_EVERY = max(1, int(os.getenv('CAMERA_TRACE_EVERY', '30')))
 except Exception:
@@ -2905,7 +2819,7 @@ while True:
         except Exception:
             pass
     # 早期プレビュー（デバッグ用）：環境変数 EARLY_PREVIEW=1 で有効
-    if os.getenv('EARLY_PREVIEW', '0') in ('1','true','True') and (not HEADLESS) and (not DISABLE_IMSHOW):
+    if env_flag('EARLY_PREVIEW', False) and (not HEADLESS) and (not DISABLE_IMSHOW):
         try:
             cv.imshow('EarlyPreview0', frame0)
             cv.imshow('EarlyPreview1', frame1)
@@ -3337,9 +3251,9 @@ while True:
         y_comp = {k: float(v[1]) if v is not None and np.all(np.isfinite(v)) else None for k, v in locals_map.items()}
         print(f"[DBG] frame {WHILE_COUNT}: local y {{elbow±/wrist±}} {y_comp}")
 
-    t_u_accum = time.perf_counter()
+    t_seg = time.perf_counter()
     # ---- Offline wrist energy capture (optional, bilateral) ----
-    if os.getenv('OFFLINE_WRIST_CAPTURE','0') in ('1','true','True'):
+    if env_flag('OFFLINE_WRIST_CAPTURE', False):
         try:
             # Right side
             _fw_vec_R = links.get('wrist_R')
@@ -3432,9 +3346,9 @@ while True:
         if E_DEBUG and (WHILE_COUNT % 60 == 0):
             print(f"[EPIPE] accumulate failed: {_e_acc}")
 
-    _perf.add('e_accum', time.perf_counter() - t_u_accum)
+    _perf.add('e_accum', time.perf_counter() - t_seg)
 
-    t_u_fb = time.perf_counter()
+    t_seg = time.perf_counter()
     # ================= フォールバック: サイクル未検出時の暫定エネルギー更新 =================
     # 目的: detector.update が発火しない環境でもゲージ針が全く動かない状況を回避し、
     # デバッグ観察を容易にする。一定フレーム経過後、瞬時トルクノルムを擬似エネルギーとして蓄積。
@@ -3472,9 +3386,9 @@ while True:
         if WHILE_COUNT % 120 == 0:
             print(f"[GaugeFallback] failed: {_fb_e}")
 
-    _perf.add('e_fallback', time.perf_counter() - t_u_fb)
+    _perf.add('e_fallback', time.perf_counter() - t_seg)
 
-    t_u_wait = time.perf_counter()
+    t_seg = time.perf_counter()
     # ==== ローカル座標軸デバッグ描画（任意） ====
     # 低頻度でのキー受付: 'a' キーでトグル (OpenCV window フォーカス時)
     if ENABLE_AXES_DEBUG:
@@ -3486,9 +3400,9 @@ while True:
     # キー入力の取得はループ末尾の1箇所に集約した（同一フレームで waitKey を
     # 2回呼ぶと GUI ポンプの待ちを二重に払ううえ、両者がキューを奪い合って
     # 'a' と 'q' が互いに取りこぼされるため）。'a' の処理もそちらにある。
-    _perf.add('axes_debug', time.perf_counter() - t_u_wait)
+    _perf.add('axes_debug', time.perf_counter() - t_seg)
 
-    t_u_hist = time.perf_counter()
+    t_seg = time.perf_counter()
     # ディクショナリにトルク値を格納
     for key in [
         "wrist_R",
@@ -3514,9 +3428,9 @@ while True:
     # 仕事が出ていた（計画メモ A-4 (2)、H-B）。
     for key in current_power_history.keys():
         current_power_history[key].append(powers_map.get(key, 0.0))
-    _perf.add('hist_store', time.perf_counter() - t_u_hist)
+    _perf.add('hist_store', time.perf_counter() - t_seg)
 
-    t_u_cyc = time.perf_counter()
+    t_seg = time.perf_counter()
     if WHILE_COUNT > 15:
         _z_cycle = transformed_p3ds[0][_cycle_axis_idx]
         if np.isfinite(_z_cycle) and detector.update(_z_cycle, WHILE_COUNT):
@@ -3586,9 +3500,9 @@ while True:
             current_torque_history[key].append(vec[2])
     else:
         pass
-    _perf.add('cycle_energy', time.perf_counter() - t_u_cyc)
+    _perf.add('cycle_energy', time.perf_counter() - t_seg)
 
-    t_u_gauge = time.perf_counter()
+    t_seg = time.perf_counter()
     # 連続エネルギー値/単眼デモ判定をゲージへ毎フレーム反映
     if gauge is not None:
         if DEMO_MONO_GAUGE_ON:
@@ -3662,7 +3576,7 @@ while True:
                 _gauge_log_state(tag="after_update_impulses")
             except Exception:
                 pass
-    _perf.add('gauge_apply', time.perf_counter() - t_u_gauge)
+    _perf.add('gauge_apply', time.perf_counter() - t_seg)
 
     # ノルムだけ取り出してプロット用に
     temp_norms = [np.linalg.norm(v) for v in temp_local]
@@ -3691,79 +3605,13 @@ while True:
     }
     # 表示対象キー: 非監修モードではフィルタ済み gauge.part_keys を使う
     display_keys = (gauge.part_keys if (gauge is not None) else part_keys)
-    # 2) テキスト描画
-    draw_put_total = 0.0
-    if DRAW_LABEL_CACHE:
-        # スプライトキャッシュ方式: フルフレームの色空間変換も PIL 往復も行わない
-        t_lbl_all = time.perf_counter()
-        for i, key in enumerate(display_keys):
-            lbl = jp_labels.get(key, key)
-            cur_E = float(current_impulses.get(key, 0.0))
-            new_frame = _blit_label(
-                new_frame,
-                f"{lbl} E:{cur_E:.1f}",
-                (new_width - 350, 40 + 30 * i),
-                24,
-                (255, 255, 255),
-                20,
-            )
-        draw_put_total = time.perf_counter() - t_lbl_all
-        _perf.add('draw_put_total', draw_put_total)
-    elif USE_NATIVE_DRAW and (_native_overlay is not None) and getattr(_native_overlay, '_dll', None):
-        # ネイティブ: 一括描画（BGRAで作業）
-        t_lbl_all = time.perf_counter()
-        try:
-            bgra = cv.cvtColor(new_frame, cv.COLOR_BGR2BGRA)
-        except Exception:
-            # 予防的フォールバック
-            bgra = np.concatenate([new_frame, np.full((*new_frame.shape[:2],1), 255, dtype=new_frame.dtype)], axis=2)
-        items = []
-        for i, key in enumerate(display_keys):
-            lbl = jp_labels.get(key, key)
-            y = 40 + 30 * i
-            cur_E = float(current_impulses.get(key, 0.0))
-            text = f"{lbl} E:{cur_E:.1f}"
-            items.append({
-                'x': new_width - 350,
-                'y': y,
-                'font': 24,
-                'color': (255, 255, 255, 255),
-                'text': text,
-            })
-        rc = _native_overlay.draw_texts_bgra(bgra, items)
-        if rc < 0 and LOOP_TRACE:
-            print(f"[TRACE] native draw failed rc={rc}")
-            pass
-        new_frame = cv.cvtColor(bgra, cv.COLOR_BGRA2BGR)
-        draw_put_total = time.perf_counter() - t_lbl_all
-        _perf.add('draw_put_total', draw_put_total)
-    else:
-        for i, key in enumerate(display_keys):
-            lbl = jp_labels.get(key, key)
-            y = 40 + 30 * i
-            cur_E = float(current_impulses.get(key, 0.0))
-            text = f"{lbl} E:{cur_E:.1f}"
-            t_lbl = time.perf_counter()
-            # この else 節に来るのは DRAW_LABEL_CACHE が偽のときだけなので、
-            # ここでスプライト経路を分岐しても到達しない
-            new_frame = put_text_jp(
-                new_frame,
-                text,
-                (new_width - 350, y),
-                24,
-                (255, 255, 255),
-                20,
-            )
-            dt_lbl = time.perf_counter() - t_lbl
-            draw_put_total += dt_lbl
-            try:
-                _perf.add(f'draw_put:{key}', dt_lbl)
-            except Exception:
-                _perf.add('draw_put:unknown', dt_lbl)
-            if LOOP_TRACE and (WHILE_COUNT % VIDEO_TRACE_EVERY == 0):
-                #print(f"[TRACE] draw_put key={key} dt={dt_lbl*1000.0:.2f} ms")
-                pass
-        _perf.add('draw_put_total', draw_put_total)
+    # 2) テキスト描画。文字ごとのスプライトを合成する（フルフレームの色空間変換も PIL 往復もしない）
+    t_lbl_all = time.perf_counter()
+    for i, key in enumerate(display_keys):
+        lbl = jp_labels.get(key, key)
+        cur_E = float(current_impulses.get(key, 0.0))
+        draw_text_jp(new_frame, f"{lbl} E:{cur_E:.1f}", (new_width - 350, 40 + 30 * i), 24, (255, 255, 255), 20)
+    _perf.add('draw_put_total', time.perf_counter() - t_lbl_all)
     _perf.add('draw_text', time.perf_counter() - t_draw_total)
 
     # グラフ用には10倍して丸め
@@ -4060,7 +3908,7 @@ else:
 # -------------------------------
 # ⑤ Offline wrist capture NPY 保存 (任意)
 # -------------------------------
-if os.getenv('OFFLINE_WRIST_CAPTURE','0') in ('1','true','True'):
+if env_flag('OFFLINE_WRIST_CAPTURE', False):
     try:
         _wv = globals().get('_offline_wrist_vectors')
         _wt = globals().get('_offline_wrist_tau_y')
