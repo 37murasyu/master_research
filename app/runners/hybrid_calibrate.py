@@ -1,7 +1,8 @@
-"""Guided Mac + Pixel calibration: preview → collect → review/save."""
+"""Guided Mac + Pixel calibration: preview → collect → review/save → 盤を立てて静止（任意）。"""
 
 import argparse
 from contextlib import ExitStack
+import os
 import sys
 import time
 import cv2 as cv
@@ -14,6 +15,7 @@ from app.hybrid.calibration_io import (
     load_intrinsics,
     save_intrinsics,
     save_calibration,
+    update_meta,
 )
 from app.hybrid.checkerboard import (
     Board,
@@ -24,6 +26,7 @@ from app.hybrid.checkerboard import (
 )
 from app.hybrid.collector import REASONS, STILL_PX, BoardCollector
 from app.hybrid.display import compose
+from app.hybrid.gravity_board import MAX_TILT_DEG, STILL_PX as UPRIGHT_STILL_PX, WARN_TILT_DEG, UprightCollector
 from app.hybrid.live import LiveSession
 from app.hybrid.session import stable_session
 from app.hybrid.link import PhoneLink, PREVIEW, CALIBRATION, OFF
@@ -35,6 +38,17 @@ from app.runners.hybrid_preview import poll_window
 # OpenCV のカメラ番号は入れ替わる（Camo や iPhone の連係カメラ）ので、キャッシュの鍵が
 # 合っても別のカメラのものを引きうる。超えたら捨てて、単体ビューから求め直す。
 CACHE_TOLERANCE_PX = 1.5
+# 盤を立てる段階: 既定の時間切れ [s]、標準出力へ進み具合を出す間隔 [s]、省略のキー（Enter）
+BOARD_UP_TIMEOUT_S = 30.0
+BOARD_UP_REPORT_S = 2.0
+ENTER_KEYS = (10, 13)
+UPRIGHT_STATUS = {
+    "no_board": "盤が見えない",
+    "waiting": "静止を確かめ中",
+    "moving": f"動いている（{UPRIGHT_STILL_PX:g} px 以下で採用）",
+    "tilted": f"傾きすぎ（{MAX_TILT_DEG:g}° 以下で採用）",
+    "accepted": "採用",
+}
 
 
 def rejection_summary(collector):
@@ -45,6 +59,83 @@ def rejection_summary(collector):
     if motion is not None:
         text += f" / 直近の盤の動き {motion:.1f} px（{STILL_PX:.1f} 以下で採用）"
     return text
+
+
+def board_up_enabled(choice=None):
+    """盤を立てる段階を行うか。引数 ``--board-up on|off`` が優先し、無ければ ``HYBRID_GRAVITY_BOARD``（既定 1）。"""
+    if choice is not None:
+        return choice == "on"
+    value = os.environ.get("HYBRID_GRAVITY_BOARD", "1").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def board_up_timeout(value=None):
+    """盤を立てる段階の時間切れ [s]。引数が優先し、無ければ ``HYBRID_GRAVITY_BOARD_TIMEOUT_S``（既定 30）。"""
+    if value is not None:
+        return float(value)
+    try:
+        return float(os.environ.get("HYBRID_GRAVITY_BOARD_TIMEOUT_S") or BOARD_UP_TIMEOUT_S)
+    except ValueError:
+        return BOARD_UP_TIMEOUT_S
+
+
+def run_board_up(session, board, intrinsic, directory, stop, *, timeout_s=BOARD_UP_TIMEOUT_S):
+    """校正の保存の後、盤を立てて静止させた短辺の上向きを校正フォルダの meta.json に足す。
+
+    記録したら ``checkerboard_short_axis`` の辞書を返す。Enter・n（省略）、q・Esc（中止）、停止の要求、
+    時間切れでは記録せず None を返す（どれも校正は保存済みなので終了コードは 0 のまま）。
+    """
+    collector = UprightCollector(board, intrinsic.K, intrinsic.distortion)
+    session.board = board
+    print(
+        "[盤を立てる] 盤を鉛直に立て（短辺を上下・長辺を水平）、Mac のカメラの正面で静止してください。"
+        f"Enter・n: 省略 / q: 中止（{timeout_s:.0f} 秒で時間切れ）。記録すると計測の重力の向きに使います"
+    )
+    start = last = time.monotonic()
+    status = "waiting"
+    while True:
+        if stop.requested():
+            print("[盤を立てる] 停止の要求で終了（盤の向きは記録しない）")
+            return None
+        now = time.monotonic()
+        if now - start >= timeout_s:
+            print(f"[盤を立てる] 時間切れ（{timeout_s:.0f} 秒）。盤の向きは記録しない（計測は体幹から重力を決める）")
+            return None
+        session.step(infer=False, lines=(
+            f"盤を立てて静止: 標本 {len(collector.samples)}/{collector.needed}  {UPRIGHT_STATUS[status]}",
+            "短辺を上下・長辺を水平に、Mac のカメラの正面で止める / Enter・n: 省略 / q: 中止",
+        ))
+        status = collector.add(session.local_corners)
+        if collector.done:
+            entry = collector.result()
+            update_meta(directory, checkerboard_short_axis=entry)
+            print(
+                f"[盤を立てる] 記録: 上向き {entry['up_label_runtime']}、傾き {entry['tilt_deg']:.1f}°、"
+                f"ばらつき {entry['spread_deg']:.1f}°（{entry['samples']} 標本）→ {directory}"
+            )
+            if entry["tilt_deg"] > WARN_TILT_DEG:
+                print(
+                    f"[盤を立てる][警告] 盤の短辺が Mac のカメラの上向きから {entry['tilt_deg']:.1f}° 傾いている"
+                    f"（{WARN_TILT_DEG:g}° 以下が目安）。Mac の天板を鉛直にし、盤をまっすぐ立てて校正をやり直すと確か"
+                )
+            return entry
+        if now - last >= BOARD_UP_REPORT_S:
+            last = now
+            tilt = collector.last_tilt_deg
+            motion = collector.last_motion_px
+            print(
+                f"[盤を立てる] 標本 {len(collector.samples)}/{collector.needed}、{UPRIGHT_STATUS[status]}"
+                + (f"、傾き {tilt:.1f}°" if tilt is not None else "")
+                + (f"、動き {motion:.1f} px" if motion is not None else "")
+                + f"、残り {max(0.0, timeout_s - (now - start)):.0f} 秒"
+            )
+        key = poll_window()
+        if key in ENTER_KEYS or key == ord("n"):
+            print("[盤を立てる] 省略（盤の向きは記録しない。計測は体幹から重力を決める）")
+            return None
+        if key in (27, ord("q")):
+            print("[盤を立てる] 中止（盤の向きは記録しない。校正は保存済み）")
+            return None
 
 
 def board_defaults():
@@ -73,7 +164,13 @@ def main(argv=None):
     parser.add_argument("--cols", type=int, default=defaults["cols"])
     parser.add_argument("--square-cm", type=float, default=defaults["square_cm"])
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--board-up", choices=("on", "off"), default=None,
+                        help="保存の後に盤を立てて静止させ、重力の向きを記録する（既定は HYBRID_GRAVITY_BOARD、無ければ on）")
+    parser.add_argument("--board-up-timeout", type=float, default=None,
+                        help="盤を立てる段階の時間切れ [s]（既定は HYBRID_GRAVITY_BOARD_TIMEOUT_S、無ければ 30）")
     args = parser.parse_args(argv)
+    board_up = board_up_enabled(args.board_up)
+    board_up_limit = board_up_timeout(args.board_up_timeout)
     if args.camera is None:
         args.camera = default_camera_index()
     board = Board(args.rows, args.cols, args.square_cm)
@@ -248,6 +345,9 @@ def main(argv=None):
                                     for key, value in zip(keys, intrinsics):
                                         save_intrinsics(key, value)
                                     print(f"自動保存: {directory}")
+                                    if board_up:
+                                        run_board_up(session, board, intrinsics[0], directory, stop,
+                                                     timeout_s=board_up_limit)
                                     return 0
                 key = poll_window()
                 if key in (27, ord("q")):
@@ -264,6 +364,8 @@ def main(argv=None):
                     for k, v in zip(keys, solution[:2]):
                         save_intrinsics(k, v)
                     print(f"保存: {directory}")
+                    if board_up:
+                        run_board_up(session, board, solution[0], directory, stop, timeout_s=board_up_limit)
                     return 0
                 elif phase == "review" and key == ord("r"):
                     phase = "preview"

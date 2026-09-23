@@ -67,6 +67,17 @@ class TestSeedFiles:
         missing = [rel for rel in workspace.SEED_FILES if not (REPO_ROOT / rel).is_file()]
         assert missing == []
 
+    def test_the_one_rm_table_is_seeded_and_tracked(self):
+        """混成のゲージの閾値（``app.gauge.thresholds``）は既定で ``config.folder_path/m_max_all_merged.csv`` を読む。
+
+        凍結アプリの作業フォルダに無いと、被験者の 1RM が引けずゲージの帯が出ない。``*.csv`` は .gitignore で
+        外れるので、git で追跡されていないと worktree にも .app にも入らない（計画担当 C の発見）。
+        """
+        assert "m_max_all_merged.csv" in workspace.SEED_FILES
+        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "m_max_all_merged.csv"], cwd=REPO_ROOT,
+                                 capture_output=True, text=True)
+        assert tracked.returncode == 0, tracked.stderr
+
     @pytest.mark.parametrize("file_mode", [False, True], ids=["カメラ入力", "録画入力"])
     def test_seeded_workspace_is_enough_for_the_projection_matrices(self, file_mode, tmp_path, monkeypatch):
         """初期値だけのワークスペースで、計測が使う投影行列を組み立てられること。
