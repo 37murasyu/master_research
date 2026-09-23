@@ -1,0 +1,160 @@
+"""混成の押し上げの回の区切り（力学の関所を兼ねる）。
+
+高さは肩の中点の「重力の上向き」への射影 [m]、基準は座って静止した先頭の窓の中央値（呼び出し側が渡す）。
+開いている間だけ仕事とゲージに積み、閉じている間はトルクを記録するだけにする（座っている間の雑音の仕事を
+積まない。論文 5.4 の過大評価の機序）。
+
+- 開く: 高さが基準 + ``open_rise_m`` を超える、または上向きの速さが ``open_speed_mps`` を
+  ``open_speed_frames`` フレーム続けて超える
+- 閉じる: 開いてから ``min_open_s`` 以上経ち、高さが基準 + ``close_band_m`` 以内に ``close_frames``
+  フレーム続いたとき。``max_open_s`` を超えても閉じる
+- 開いている間の最大の持ち上げが ``min_lift_m`` 未満なら CLOSED ではなく DISCARDED（回に数えない）
+- 高さが NaN のフレームは開閉の状態を変えない
+
+``lookback_frames`` は呼び出し側（仕事の積算）が使う: 速さの条件は数フレーム遅れて開くので、開いた時点で
+直前のこのフレーム数の仕事も今の回に入れる。
+
+速さを ``None`` で渡すと、直近 ``SPEED_WINDOW_FRAMES`` フレームの高さの最小二乗の傾きを使う。生の差分は
+雑音 σ 3 mm で σ≈0.13 m/s になり、座っているだけで 1 分に 20 回以上開く（すべて DISCARDED になるが、ゲージの
+now がちらつく）。傾きなら開かない代わりに約 1 フレーム遅れて開くので、出だしは ``lookback_frames`` で拾う。
+"""
+
+from __future__ import annotations
+
+import enum
+import math
+from collections import deque
+from dataclasses import dataclass
+
+__all__ = ["RepConfig", "RepDetector", "RepEvent"]
+
+# 速さを自前で出すときの窓（σ 3 mm の雑音を 60 s 流して、乱数 10 通りとも開かない。EMA 0.5 は 10 通り中 2 回開いた）
+SPEED_WINDOW_FRAMES = 5
+_EPS_S = 1e-9
+
+
+class RepEvent(enum.Enum):
+    NONE = "none"
+    OPENED = "opened"
+    CLOSED = "closed"
+    DISCARDED = "discarded"
+
+
+@dataclass(frozen=True)
+class RepConfig:
+    open_rise_m: float = 0.02
+    open_speed_mps: float = 0.10
+    open_speed_frames: int = 2
+    close_band_m: float = 0.01
+    close_frames: int = 3
+    min_lift_m: float = 0.03
+    min_open_s: float = 0.3
+    max_open_s: float = 30.0
+    lookback_frames: int = 5
+
+
+def _finite(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+class RepDetector:
+    """押し上げの回を開閉する状態機械。``update`` を 1 フレームごとに呼ぶ。"""
+
+    def __init__(self, baseline_m: float, config: RepConfig | None = None):
+        base = _finite(baseline_m)
+        if base is None:
+            raise ValueError(f"基準の高さが有限でない: {baseline_m!r}")
+        self.baseline_m = base
+        self.config = config or RepConfig()
+        self.reps = 0
+        self.discarded = 0
+        self._open = False
+        self._elapsed = 0.0
+        self._max_lift = 0.0
+        self._in_band = 0
+        self._fast = 0
+        # 速さを自前で出すときの (時刻, 高さ) の窓
+        self._clock = 0.0
+        self._recent: deque[tuple[float, float]] = deque(maxlen=SPEED_WINDOW_FRAMES)
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    @property
+    def open_elapsed_s(self) -> float:
+        return self._elapsed if self._open else 0.0
+
+    @property
+    def max_lift_m(self) -> float:
+        """開いている回の最大の持ち上げ [m]（閉じていれば 0）。"""
+        return self._max_lift if self._open else 0.0
+
+    def _own_speed(self, height: float, dt: float) -> float | None:
+        """直近の窓の高さの最小二乗の傾き [m/s]。3 点に満たなければ None（速さの条件を使わない）。"""
+        self._clock += dt
+        if self._recent and self._clock <= self._recent[-1][0]:
+            self._recent.clear()  # 時間が進まなかった（dt が 0・不正）。傾きを作れないので窓を始め直す
+        self._recent.append((self._clock, height))
+        if len(self._recent) < 3:
+            return None
+        n = len(self._recent)
+        t_mean = sum(t for t, _ in self._recent) / n
+        h_mean = sum(h for _, h in self._recent) / n
+        num = sum((t - t_mean) * (h - h_mean) for t, h in self._recent)
+        den = sum((t - t_mean) ** 2 for t, _ in self._recent)
+        return num / den if den > 0.0 else None
+
+    def update(self, height_m: float, speed_mps: float | None, dt: float) -> RepEvent:
+        """1 フレーム進める。``speed_mps`` は上向きの速さ（None なら高さから自前で出す）、``dt`` は前のフレームからの秒。"""
+        height = _finite(height_m)
+        if height is None:
+            # 開閉の状態は変えない。自前の速さの窓は、抜けをまたいで傾きを取らないように区切る
+            self._recent.clear()
+            return RepEvent.NONE
+        step = _finite(dt)
+        step = step if step is not None and step > 0.0 else 0.0
+        speed = self._own_speed(height, step) if speed_mps is None else _finite(speed_mps)
+        cfg = self.config
+        rise = height - self.baseline_m
+
+        if not self._open:
+            if speed is not None and speed > cfg.open_speed_mps:
+                self._fast += 1
+            else:
+                self._fast = 0
+            if rise > cfg.open_rise_m or self._fast >= cfg.open_speed_frames:
+                self._open = True
+                self._elapsed = 0.0
+                self._max_lift = max(rise, 0.0)
+                self._in_band = 0
+                self._fast = 0
+                return RepEvent.OPENED
+            return RepEvent.NONE
+
+        self._elapsed += step
+        self._max_lift = max(self._max_lift, rise)
+        self._in_band = self._in_band + 1 if rise <= cfg.close_band_m else 0
+        back = self._in_band >= cfg.close_frames and self._elapsed + _EPS_S >= cfg.min_open_s
+        if back or self._elapsed + _EPS_S >= cfg.max_open_s:
+            return self._close()
+        return RepEvent.NONE
+
+    def _close(self) -> RepEvent:
+        lifted = self._max_lift >= self.config.min_lift_m
+        self._open = False
+        self._elapsed = 0.0
+        self._max_lift = 0.0
+        self._in_band = 0
+        self._fast = 0
+        if lifted:
+            self.reps += 1
+            return RepEvent.CLOSED
+        self.discarded += 1
+        return RepEvent.DISCARDED
