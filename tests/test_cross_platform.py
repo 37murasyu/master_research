@@ -45,6 +45,7 @@ IMPORT_SAFE_MODULES = [
     "app.hybrid.rep_detector",
     "app.hybrid.demo_gauge",
     "app.hybrid.gravity_board",
+    "app.runners.hybrid_replay",
     "app.hybrid.link",
     "app.hybrid.mac_camera",
     "app.hybrid.pose_detector",
