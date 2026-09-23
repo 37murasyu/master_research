@@ -1,16 +1,21 @@
 """Recalculate elbow local torque using forearm/upper-arm plane normal (y-axis).
 
 Updates elbow_R_local_* and elbow_L_local_* in torque CSVs based on pose CSVs.
+
+局所軸は ``compute_torque_from_pose.py`` と同じ ``push_up_model.joint_axes``（肘: z = 上腕、
+親 = 前腕）で作る。かつては z = 前腕・親 = 上腕で作っており、y は一致するが z と x が
+入れ替わって、肘の局所列だけ別の座標系になっていた。
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 
+from push_up_model import joint_axes
 from utils import compute_local_torque
 
 MP_JOINTS = {
@@ -43,24 +48,12 @@ def _detect_joint_map(pose_df: pd.DataFrame) -> dict:
     raise ValueError("Pose CSV does not contain expected joint columns (MediaPipe or legacy)")
 
 
-def _extract_vecs(pose_df: pd.DataFrame, joint_map: dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    def cols(name: str) -> List[str]:
-        return list(_joint_cols(joint_map[name]))
+def _elbow_axes(pose_df: pd.DataFrame, joint_map: dict, side: str) -> Tuple[np.ndarray, np.ndarray]:
+    """肘の局所軸の (link, parent)。compute_torque_from_pose と同じ joint_axes から取る。"""
+    def point(name: str) -> np.ndarray:
+        return pose_df[list(_joint_cols(joint_map[f"{side}_{name}"]))].to_numpy(float)
 
-    r_elbow = pose_df[cols("R_ELBOW")].to_numpy(float)
-    r_wrist = pose_df[cols("R_WRIST")].to_numpy(float)
-    r_shoulder = pose_df[cols("R_SHOULDER")].to_numpy(float)
-
-    l_elbow = pose_df[cols("L_ELBOW")].to_numpy(float)
-    l_wrist = pose_df[cols("L_WRIST")].to_numpy(float)
-    l_shoulder = pose_df[cols("L_SHOULDER")].to_numpy(float)
-
-    forearm_r = r_wrist - r_elbow
-    upperarm_r = r_shoulder - r_elbow
-    forearm_l = l_wrist - l_elbow
-    upperarm_l = l_shoulder - l_elbow
-
-    return forearm_r, upperarm_r, forearm_l, upperarm_l
+    return joint_axes(point("SHOULDER"), point("ELBOW"), point("WRIST"))["elbow"]
 
 
 def _ensure_local_cols(df: pd.DataFrame, prefix: str) -> None:
@@ -72,8 +65,8 @@ def _ensure_local_cols(df: pd.DataFrame, prefix: str) -> None:
 
 def _recalc_side(
     torque_df: pd.DataFrame,
-    forearm: np.ndarray,
-    upperarm: np.ndarray,
+    link: np.ndarray,
+    parent: np.ndarray,
     side: str,
 ) -> int:
     torque_cols = [f"elbow_{side}_x", f"elbow_{side}_y", f"elbow_{side}_z"]
@@ -89,13 +82,13 @@ def _recalc_side(
     local_new = local_existing.copy()
 
     valid = (
-        np.isfinite(forearm).all(axis=1)
-        & np.isfinite(upperarm).all(axis=1)
+        np.isfinite(link).all(axis=1)
+        & np.isfinite(parent).all(axis=1)
         & np.isfinite(tau_global).all(axis=1)
     )
 
     for i in np.where(valid)[0]:
-        local_new[i] = compute_local_torque(tau_global[i], forearm[i], upperarm[i])
+        local_new[i] = compute_local_torque(tau_global[i], link[i], parent[i])
 
     torque_df[local_cols] = local_new
     return int(valid.sum())
@@ -110,10 +103,8 @@ def recalc_pair(pose_csv: Path, torque_csv: Path, out_dir: Path | None) -> None:
     joint_map = _detect_joint_map(pose_df)
     pose_aligned = torque_df[["frame"]].merge(pose_df, on="frame", how="left")
 
-    forearm_r, upperarm_r, forearm_l, upperarm_l = _extract_vecs(pose_aligned, joint_map)
-
-    cnt_r = _recalc_side(torque_df, forearm_r, upperarm_r, "R")
-    cnt_l = _recalc_side(torque_df, forearm_l, upperarm_l, "L")
+    cnt_r = _recalc_side(torque_df, *_elbow_axes(pose_aligned, joint_map, "R"), "R")
+    cnt_l = _recalc_side(torque_df, *_elbow_axes(pose_aligned, joint_map, "L"), "L")
 
     out_path = torque_csv
     if out_dir is not None:

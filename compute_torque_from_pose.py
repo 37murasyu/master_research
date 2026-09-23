@@ -4,6 +4,10 @@ Reads a MediaPipe-style pose CSV, interpolates missing samples, derives upper
 limb segment kinematics, and invokes `utils_dynamic` helpers to recover joint
 torques in both global and local frames.
 
+既定では座位プッシュアップのモデル（``push_up_model``、KNOWN_ISSUES §2-1）で解く:
+手を固定端に前腕 → 上腕の鎖を解き、体幹＋頭の荷重を肩に載せる。重力は初期フレームの
+体幹の向きから決める（§1-5）。入力の座標系（カメラ座標で y が下、など）には依らない。
+
 Example:
     python compute_torque_from_pose.py \
         --pose-csv output_data/poses/kpts3d_subject5_20250925_133228_filtpos.csv \
@@ -14,17 +18,34 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
+from config import INERTIA_LENGTH_FRAMES
+from config import MP_LANDMARK
+from config import OUTPUT_SCHEMA_VERSION
 from config import SUPPORT_SHARE_DEFAULT
-from config import SUPPORTED_MASS_FRACTION
 from config import g as CONFIG_GRAVITY
 from config import w as CONFIG_BODY_MASS
-from utils import compute_local_torque
+from push_up_model import (
+    GRAVITY_MODES,
+    GravityEstimate,
+    SegmentState,
+    estimate_gravity,
+    hand_mass,
+    hand_point,
+    inertia_about_link,
+    joint_axes,
+    push_up_torques,
+    torso_load_mass,
+    trunk_up_vectors,
+    wrist_hand_mask,
+)
+from utils import LocalFrameFallbackWarning, compute_local_torque
 from utils_dynamic import calculate_inertia_tensor, compute_MF_batch_native, compute_tau_chain_native
 
 # ---------------------------------------------------------------------------
@@ -53,22 +74,8 @@ LEFT_SEGMENTS: Tuple[SegmentSpec, ...] = (
     SegmentSpec("forearm_L", 13, 15, 4, 0.0160, 0.430),
 )
 
-RIGHT_SHOULDER_IDX_LEGACY = 0
-LEFT_SHOULDER_IDX_LEGACY = 1
-RIGHT_ELBOW_IDX_LEGACY = 2
-LEFT_ELBOW_IDX_LEGACY = 3
-RIGHT_WRIST_IDX_LEGACY = 4
-LEFT_WRIST_IDX_LEGACY = 5
-
-LEGACY_RIGHT_SEGMENTS: Tuple[SegmentSpec, ...] = (
-    SegmentSpec("upper_arm_R", RIGHT_SHOULDER_IDX_LEGACY, RIGHT_ELBOW_IDX_LEGACY, 3, 0.0227, 0.436),
-    SegmentSpec("forearm_R", RIGHT_ELBOW_IDX_LEGACY, RIGHT_WRIST_IDX_LEGACY, 4, 0.0160, 0.430),
-)
-LEGACY_LEFT_SEGMENTS: Tuple[SegmentSpec, ...] = (
-    SegmentSpec("upper_arm_L", LEFT_SHOULDER_IDX_LEGACY, LEFT_ELBOW_IDX_LEGACY, 3, 0.0227, 0.436),
-    SegmentSpec("forearm_L", LEFT_ELBOW_IDX_LEGACY, LEFT_WRIST_IDX_LEGACY, 4, 0.0160, 0.430),
-)
-
+# 手を固定端にした鎖（0: 前腕、関節 = 手首 / 1: 上腕、関節 = 肘）。push_up_model に渡す部位の並び。
+# 重心比は近位端（肘・肩）から測った文献値を、手首・肘側から測り直したもの。
 WRIST_BASE_SEGMENTS_RIGHT: Tuple[SegmentSpec, ...] = (
     SegmentSpec("forearm_R_wrist", 16, 14, 4, 0.0160, 1.0 - 0.430),
     SegmentSpec("upper_arm_R_wrist", 14, 12, 3, 0.0227, 1.0 - 0.436),
@@ -78,15 +85,7 @@ WRIST_BASE_SEGMENTS_LEFT: Tuple[SegmentSpec, ...] = (
     SegmentSpec("upper_arm_L_wrist", 13, 11, 3, 0.0227, 1.0 - 0.436),
 )
 
-LEGACY_WRIST_BASE_SEGMENTS_RIGHT: Tuple[SegmentSpec, ...] = (
-    SegmentSpec("forearm_R_wrist", RIGHT_WRIST_IDX_LEGACY, RIGHT_ELBOW_IDX_LEGACY, 4, 0.0160, 1.0 - 0.430),
-    SegmentSpec("upper_arm_R_wrist", RIGHT_ELBOW_IDX_LEGACY, RIGHT_SHOULDER_IDX_LEGACY, 3, 0.0227, 1.0 - 0.436),
-)
-LEGACY_WRIST_BASE_SEGMENTS_LEFT: Tuple[SegmentSpec, ...] = (
-    SegmentSpec("forearm_L_wrist", LEFT_WRIST_IDX_LEGACY, LEFT_ELBOW_IDX_LEGACY, 4, 0.0160, 1.0 - 0.430),
-    SegmentSpec("upper_arm_L_wrist", LEFT_ELBOW_IDX_LEGACY, LEFT_SHOULDER_IDX_LEGACY, 3, 0.0227, 1.0 - 0.436),
-)
-
+# --no-wrist-base の自由振りの鎖（腕を肩から吊る）で、部位 → 出力する関節。
 SEGMENT_TO_OUTPUT = {
     "upper_arm_R": "shoulder_R",
     "forearm_R": "elbow_R",
@@ -94,12 +93,7 @@ SEGMENT_TO_OUTPUT = {
     "forearm_L": "elbow_L",
 }
 
-SEGMENT_TO_OUTPUT_WRIST_BASE = {
-    "forearm_R_wrist": "wrist_R",
-    "upper_arm_R_wrist": "elbow_R",
-    "forearm_L_wrist": "wrist_L",
-    "upper_arm_L_wrist": "elbow_L",
-}
+JOINTS = ("wrist", "elbow", "shoulder")
 
 OUTPUT_PART_ORDER = [
     "wrist_R",
@@ -138,12 +132,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--poly", type=int, default=3, help="Savitzky-Golay polynomial order")
     parser.add_argument("--debug", action="store_true", help="Verbose diagnostics")
     parser.add_argument("--pos-scale", type=float, default=1.0, help="Scale factor applied to positions (e.g., 0.01 if CSV is cm)")
-    parser.add_argument("--dumbbell-mass-right", type=float, default=0.0, help="External load mass at right wrist [kg]")
-    parser.add_argument("--dumbbell-mass-left", type=float, default=0.0, help="External load mass at left wrist [kg]")
+    parser.add_argument("--dumbbell-mass-right", type=float, default=0.0,
+                        help="External load mass at right wrist [kg] (--no-wrist-base only)")
+    parser.add_argument("--dumbbell-mass-left", type=float, default=0.0,
+                        help="External load mass at left wrist [kg] (--no-wrist-base only)")
     parser.add_argument(
         "--wrist-base",
-        action="store_true",
-        help="Also solve a wrist-anchored two-link chain (forearm+upper arm) supporting torso load",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="座位プッシュアップのモデル（手を固定端に前腕→上腕、体幹＋頭の荷重を肩に載せる）で解く。"
+             "既定オン。--no-wrist-base で腕を肩から吊る旧来の鎖だけを解く（手首は 0）",
+    )
+    parser.add_argument(
+        "--gravity-mode",
+        choices=GRAVITY_MODES,
+        default="axis",
+        help="重力の決め方。axis: 初期フレームの体幹の向きに最も近い座標軸（カメラが水平な前提、既定）。"
+             "trunk: 体幹の向きそのもの",
+    )
+    parser.add_argument(
+        "--gravity-frames",
+        type=int,
+        default=INERTIA_LENGTH_FRAMES,
+        help="重力の推定に使う先頭のフレーム数（試技前の安静座位）",
     )
     parser.add_argument(
         "--support-share",
@@ -157,11 +168,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help="Override torso mass [kg] treated as external load in wrist-base mode",
     )
+    # かつて既定 0.01（N·cm → N·m 用）で、m 単位の入力（Adjusted 3D Pose/*.csv）では
+    # トルクが黙って 1/100 になっていた。
     parser.add_argument(
         "--torque-scale",
         type=float,
-        default=0.01,
-        help="Scale factor applied to all output torques (use 0.01 if upstream produces N-cm)",
+        default=1.0,
+        help="Scale factor applied to all output torques (default 1: positions in metres give N·m)",
     )
     return parser.parse_args(argv)
 
@@ -379,6 +392,7 @@ def run_side_inverse_dynamics(
     external_force: Optional[np.ndarray] = None,
     external_point: Optional[np.ndarray] = None,
     root_parent_vec: Optional[np.ndarray] = None,
+    up_axis: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     T, N, _ = omegas.shape
     tau_global = np.zeros((T, N, 3), dtype=np.float64)
@@ -415,8 +429,10 @@ def run_side_inverse_dynamics(
     for t in range(T):
         f_ext = ext_force_arr[t] if ext_force_arr is not None else zero3
         r_x = ext_point_arr[t] if ext_point_arr is not None else zero3
+        # 部位固定系の慣性テンソルを、このフレームのリンクの向きに合わせて回す（§2-3）
+        inertia_now = np.stack([inertia_about_link(inertia_tensors[i], link_vec[t, i]) for i in range(N)])
         M, F_base = compute_MF_batch_native(
-            inertia_tensors,
+            inertia_now,
             masses,
             omegas[t],
             domegas[t],
@@ -453,7 +469,7 @@ def run_side_inverse_dynamics(
             parent_vec = link_vec[t, n - 1] if n > 0 else None
             if parent_vec is None and root_parent_arr is not None:
                 parent_vec = root_parent_arr[t]
-            tau_local[t, n] = compute_local_torque(tau[n], link_vec[t, n], parent_vec)
+            tau_local[t, n] = compute_local_torque(tau[n], link_vec[t, n], parent_vec, up_axis)
 
     if support_forces is not None and support_frame_count > 0:
         for idx in range(N):
@@ -481,6 +497,7 @@ def compute_side_torques(
     external_force: Optional[np.ndarray] = None,
     external_point: Optional[np.ndarray] = None,
     root_parent_vec: Optional[np.ndarray] = None,
+    up_axis: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     inputs = build_side_inverse_inputs(pose, segments, body_mass, dt, gravity)
     return run_side_inverse_dynamics(
@@ -491,7 +508,100 @@ def compute_side_torques(
         external_force=external_force,
         external_point=external_point,
         root_parent_vec=root_parent_vec,
+        up_axis=up_axis,
     )
+
+
+# ---------------------------------------------------------------------------
+# 座位プッシュアップのモデル（push_up_model）
+# ---------------------------------------------------------------------------
+
+
+def _landmark(pose: np.ndarray, name: str) -> Optional[np.ndarray]:
+    """ランドマーク名の点列 (T, 3)。CSV に無い・全フレーム欠測なら None。"""
+    jid = MP_LANDMARK[name]
+    if pose.shape[1] <= jid or not np.isfinite(pose[:, jid]).any():
+        return None
+    return pose[:, jid]
+
+
+def estimate_pose_gravity(pose: np.ndarray, magnitude: float, frames: int, mode: str) -> GravityEstimate:
+    """先頭 frames フレーム（試技前の安静座位）の体幹の向きから重力を決める（§1-5）。
+
+    かつて重力を全体座標の −z に固定していた。入力の Adjusted 3D Pose/*.csv はカメラ座標で
+    y が鉛直下向き・z が奥行きなので、重力が奥行き方向を向いていた。一方
+    5_1stereo_pose_scaled.csv だけは z が上で、座標系が混在している。ファイルごとに
+    体幹から決めれば、どちらでも鉛直下向きになる。
+    """
+    points = [_landmark(pose, n) for n in ("L_SHOULDER", "R_SHOULDER", "L_HIP", "R_HIP")]
+    if any(p is None for p in points):
+        raise ValueError(
+            "両肩（ID 11・12）と両腰（ID 23・24）が無いので、体幹の向きから重力を決められない")
+    head = slice(0, max(1, int(frames)))
+    return estimate_gravity(trunk_up_vectors(*(p[head] for p in points)), magnitude, mode)
+
+
+def _hand(pose: np.ndarray, side: str) -> Optional[np.ndarray]:
+    pinky = _landmark(pose, f"{side}_PINKY")
+    index = _landmark(pose, f"{side}_INDEX")
+    if pinky is None or index is None:
+        return None
+    return hand_point(pinky, index)
+
+
+def compute_push_up_side(
+    pose: np.ndarray,
+    side: str,
+    body_mass: float,
+    dt: float,
+    gravity: np.ndarray,
+    load_mass: float,
+    hand_mass_kg: float,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, int]]:
+    """片腕の手首・肘・肩のトルクを ``push_up_model`` で解く。
+
+    Returns
+    -------
+    global_map, local_map : {"wrist" | "elbow" | "shoulder": (T, 3)}
+    info : {"local_frame_fallbacks": 局所座標系を作れなかった件数,
+            "wrist_hand": 手首の軸を手のひらから作ったフレーム数}
+    """
+    segments = WRIST_BASE_SEGMENTS_RIGHT if side == "R" else WRIST_BASE_SEGMENTS_LEFT
+    inertia, masses, omegas, domegas, com_acc, com_pos, _, link_vec = build_side_inverse_inputs(
+        pose, segments, body_mass, dt, gravity)
+    wrist = pose[:, MP_LANDMARK[f"{side}_WRIST"]]
+    elbow = pose[:, MP_LANDMARK[f"{side}_ELBOW"]]
+    shoulder = pose[:, MP_LANDMARK[f"{side}_SHOULDER"]]
+    other_shoulder = _landmark(pose, f"{'L' if side == 'R' else 'R'}_SHOULDER")
+    hand = _hand(pose, side)
+    axes = joint_axes(shoulder, elbow, wrist, hand=hand, other_shoulder=other_shoulder)
+    up = -np.asarray(gravity, dtype=np.float64)
+
+    T = pose.shape[0]
+    global_map = {j: np.zeros((T, 3)) for j in JOINTS}
+    local_map = {j: np.zeros((T, 3)) for j in JOINTS}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", LocalFrameFallbackWarning)
+        for t in range(T):
+            forearm, upper_arm = (
+                SegmentState(inertia[i], masses[i], omegas[t, i], domegas[t, i],
+                             com_acc[t, i], com_pos[t, i], link_vec[t, i])
+                for i in (0, 1))
+            tau = push_up_torques(forearm, upper_arm, wrist[t], elbow[t], shoulder[t],
+                                  gravity, load_mass, hand_mass_kg)
+            for joint in JOINTS:
+                link, parent = axes[joint]
+                global_map[joint][t] = tau[joint]
+                local_map[joint][t] = compute_local_torque(
+                    tau[joint], link[t], None if parent is None else parent[t], up)
+    fallbacks = 0
+    for record in caught:
+        if issubclass(record.category, LocalFrameFallbackWarning):
+            fallbacks += 1
+        else:
+            warnings.warn_explicit(record.message, record.category, record.filename, record.lineno)
+    hand_frames = 0 if hand is None else int(np.sum(wrist_hand_mask(elbow, wrist, hand)))
+    return global_map, local_map, {"local_frame_fallbacks": fallbacks, "wrist_hand": hand_frames}
 
 
 # ---------------------------------------------------------------------------
@@ -501,103 +611,77 @@ def compute_side_torques(
 
 def build_output(
     frames: np.ndarray,
-    tau_g_right: np.ndarray,
-    tau_l_right: np.ndarray,
-    tau_g_left: np.ndarray,
-    tau_l_left: np.ndarray,
-    right_segments: Sequence[SegmentSpec],
-    left_segments: Sequence[SegmentSpec],
-    override_global: Optional[Dict[str, np.ndarray]] = None,
-    override_local: Optional[Dict[str, np.ndarray]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Tuple[int, ...]]]:
+    global_map: Dict[str, np.ndarray],
+    local_map: Dict[str, np.ndarray],
+) -> pd.DataFrame:
+    """関節名（wrist_R など）→ (T, 3) の辞書から出力の表を作る。無い関節は 0。"""
     T = len(frames)
-    global_map: Dict[str, np.ndarray] = {part: np.zeros((T, 3), dtype=np.float64) for part in OUTPUT_PART_ORDER}
-    local_map: Dict[str, np.ndarray] = {part: np.zeros((T, 3), dtype=np.float64) for part in OUTPUT_PART_ORDER}
-    for idx, seg in enumerate(right_segments):
-        part = SEGMENT_TO_OUTPUT[seg.name]
-        global_map[part] = tau_g_right[:, idx, :]
-        local_map[part] = tau_l_right[:, idx, :]
-    for idx, seg in enumerate(left_segments):
-        part = SEGMENT_TO_OUTPUT[seg.name]
-        global_map[part] = tau_g_left[:, idx, :]
-        local_map[part] = tau_l_left[:, idx, :]
-
-    if override_global:
-        for part, arr in override_global.items():
-            if arr.shape[0] != T or arr.shape[1] != 3:
-                raise ValueError(f"override_global[{part!s}] must have shape ({T}, 3)")
-            global_map[part] = arr
-    if override_local:
-        for part, arr in override_local.items():
-            if arr.shape[0] != T or arr.shape[1] != 3:
-                raise ValueError(f"override_local[{part!s}] must have shape ({T}, 3)")
-            local_map[part] = arr
-
     data = {"frame": frames.astype(np.int64)}
     for part in OUTPUT_PART_ORDER:
-        g_vals = global_map[part]
-        l_vals = local_map[part]
-        data[f"{part}_x"] = g_vals[:, 0]
-        data[f"{part}_y"] = g_vals[:, 1]
-        data[f"{part}_z"] = g_vals[:, 2]
-        data[f"{part}_local_x"] = l_vals[:, 0]
-        data[f"{part}_local_y"] = l_vals[:, 1]
-        data[f"{part}_local_z"] = l_vals[:, 2]
-    df = pd.DataFrame(data)
-    meta = {part: global_map[part].shape for part in OUTPUT_PART_ORDER}
-    return df, meta
+        g_vals = global_map.get(part, np.zeros((T, 3)))
+        l_vals = local_map.get(part, np.zeros((T, 3)))
+        for label, vals in (("", g_vals), ("local_", l_vals)):
+            if vals.shape != (T, 3):
+                raise ValueError(f"{part} must have shape ({T}, 3)")
+            for axis_idx, axis in enumerate(("x", "y", "z")):
+                data[f"{part}_{label}{axis}"] = vals[:, axis_idx]
+    return pd.DataFrame(data)
 
 
 def save_outputs(
     df: pd.DataFrame,
-    meta_shapes: Dict[str, Tuple[int, ...]],
     out_dir: str,
     prefix: str,
     save_npy: bool,
-    tau_g_right: np.ndarray,
-    tau_l_right: np.ndarray,
-    tau_g_left: np.ndarray,
-    tau_l_left: np.ndarray,
+    global_map: Dict[str, np.ndarray],
+    local_map: Dict[str, np.ndarray],
     frames: np.ndarray,
-    body_mass: float,
-    gravity: np.ndarray,
-    fps: float,
-    dt: float,
-    extra_arrays: Optional[Dict[str, np.ndarray]] = None,
+    meta: Dict[str, object],
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, f"{prefix}_torque.csv")
-    df.to_csv(csv_path, index=False)
+    df.to_csv(os.path.join(out_dir, f"{prefix}_torque.csv"), index=False)
 
     meta = {
+        **meta,
         "frames": int(len(frames)),
-        "body_mass": body_mass,
-        "gravity": gravity.tolist(),
-        "fps": fps,
-        "dt": dt,
-        "columns": {
-            "global": OUTPUT_GLOBAL_COLS,
-            "local": OUTPUT_LOCAL_COLS,
-        },
-        "shapes": meta_shapes,
+        "columns": {"global": OUTPUT_GLOBAL_COLS, "local": OUTPUT_LOCAL_COLS},
+        "npy_joint_order": list(JOINTS),
     }
     with open(os.path.join(out_dir, f"{prefix}_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     if save_npy:
-        np.save(os.path.join(out_dir, f"{prefix}_tau_global_right.npy"), tau_g_right)
-        np.save(os.path.join(out_dir, f"{prefix}_tau_global_left.npy"), tau_g_left)
-        np.save(os.path.join(out_dir, f"{prefix}_tau_local_right.npy"), tau_l_right)
-        np.save(os.path.join(out_dir, f"{prefix}_tau_local_left.npy"), tau_l_left)
+        T = len(frames)
+        for side, name in (("R", "right"), ("L", "left")):
+            for kind, source in (("global", global_map), ("local", local_map)):
+                stacked = np.stack([source.get(f"{j}_{side}", np.zeros((T, 3))) for j in JOINTS], axis=1)
+                np.save(os.path.join(out_dir, f"{prefix}_tau_{kind}_{name}.npy"), stacked)
         np.save(os.path.join(out_dir, f"{prefix}_frames.npy"), frames)
-        if extra_arrays:
-            for name, arr in extra_arrays.items():
-                np.save(os.path.join(out_dir, f"{prefix}_{name}.npy"), arr)
 
 
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
+
+
+def _free_swing_side(pose, side, args, body_mass, dt, gravity, up):
+    """--no-wrist-base: 腕を肩から吊る鎖（上腕 → 前腕）。手は手首の質点（§2-2）。"""
+    segments = RIGHT_SEGMENTS if side == "R" else LEFT_SEGMENTS
+    dumbbell = args.dumbbell_mass_right if side == "R" else args.dumbbell_mass_left
+    load = max(float(dumbbell), 0.0) + hand_mass(body_mass)
+    T = pose.shape[0]
+    tau_g, tau_l = compute_side_torques(
+        pose, segments, body_mass, dt, gravity,
+        external_force=np.tile(load * gravity, (T, 1)),
+        external_point=pose[:, segments[-1].distal_joint],
+        up_axis=up,
+    )
+    global_map, local_map = {}, {}
+    for idx, seg in enumerate(segments):
+        part = SEGMENT_TO_OUTPUT[seg.name]
+        global_map[part] = tau_g[:, idx, :]
+        local_map[part] = tau_l[:, idx, :]
+    return global_map, local_map
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -606,7 +690,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dt = 1.0 / fps
     body_mass = args.body_mass
     gravity_mag = abs(args.gravity) if args.gravity is not None else float(np.linalg.norm(DEFAULT_GRAVITY))
-    gravity = np.array([0.0, 0.0, -gravity_mag], dtype=np.float64)
 
     frames, pose_full = load_pose_csv(args.pose_csv)
     pos_scale = max(1e-6, float(args.pos_scale))
@@ -621,153 +704,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         poly=args.poly,
     )
 
-    max_required_modern = max(
-        max(seg.proximal_joint, seg.distal_joint)
-        for seg in (*RIGHT_SEGMENTS, *LEFT_SEGMENTS, *WRIST_BASE_SEGMENTS_RIGHT, *WRIST_BASE_SEGMENTS_LEFT)
-    )
-    use_legacy = pose_interp.shape[1] <= max_required_modern
-
-    if use_legacy:
-        right_segments = LEGACY_RIGHT_SEGMENTS
-        left_segments = LEGACY_LEFT_SEGMENTS
-        wrist_segments_right = LEGACY_WRIST_BASE_SEGMENTS_RIGHT
-        wrist_segments_left = LEGACY_WRIST_BASE_SEGMENTS_LEFT
-        if args.debug:
-            print("[DEBUG] Using legacy joint indices (0-based 0..5 mapping) for torque computation")
-    else:
-        right_segments = RIGHT_SEGMENTS
-        left_segments = LEFT_SEGMENTS
-        wrist_segments_right = WRIST_BASE_SEGMENTS_RIGHT
-        wrist_segments_left = WRIST_BASE_SEGMENTS_LEFT
-
-    def _build_external(mass_kg: float, segs: Sequence[SegmentSpec]):
-        if mass_kg <= 0:
-            return None, None
-        fvec = np.array([0.0, 0.0, -mass_kg * gravity_mag], dtype=np.float64)
-        T = pose_interp.shape[0]
-        farr = np.repeat(fvec[np.newaxis, :], T, axis=0)
-        wrist_idx = segs[-1].distal_joint
-        point = np.asarray(pose_interp[:, wrist_idx, :], dtype=np.float64)
-        return farr, point
-
-    ext_force_right, ext_point_right = _build_external(args.dumbbell_mass_right, right_segments)
-    ext_force_left, ext_point_left = _build_external(args.dumbbell_mass_left, left_segments)
-
-    tau_g_right, tau_l_right = compute_side_torques(
-        pose_interp,
-        right_segments,
-        body_mass,
-        dt,
-        gravity,
-        external_force=ext_force_right,
-        external_point=ext_point_right,
-    )
-    tau_g_left, tau_l_left = compute_side_torques(
-        pose_interp,
-        left_segments,
-        body_mass,
-        dt,
-        gravity,
-        external_force=ext_force_left,
-        external_point=ext_point_left,
-    )
+    gravity_est = estimate_pose_gravity(pose_interp, gravity_mag, args.gravity_frames, args.gravity_mode)
+    gravity = gravity_est.vector
+    up = gravity_est.up
+    print(f"[GRAVITY] 先頭 {gravity_est.samples} フレームの体幹から推定: g={np.round(gravity, 4).tolist()} "
+          f"(mode={gravity_est.mode}, 体幹の傾き {gravity_est.lean_deg:.1f}°)")
+    if gravity_est.mode == "axis" and gravity_est.lean_deg > 30.0:
+        warnings.warn(
+            f"体幹が最寄りの座標軸から {gravity_est.lean_deg:.1f}° 傾いている。カメラが水平でない可能性がある"
+            "（--gravity-mode trunk を検討）", RuntimeWarning, stacklevel=1)
 
     torque_scale = float(args.torque_scale)
-    if torque_scale != 1.0:
-        tau_g_right *= torque_scale
-        tau_l_right *= torque_scale
-        tau_g_left *= torque_scale
-        tau_l_left *= torque_scale
-
-    override_global: Dict[str, np.ndarray] = {}
-    override_local: Dict[str, np.ndarray] = {}
-    extra_arrays: Dict[str, np.ndarray] = {}
+    global_map: Dict[str, np.ndarray] = {}
+    local_map: Dict[str, np.ndarray] = {}
+    meta: Dict[str, object] = {
+        "schema_version": OUTPUT_SCHEMA_VERSION,
+        "body_mass": body_mass,
+        "fps": fps,
+        "dt": dt,
+        "torque_scale": torque_scale,
+        "gravity": {
+            "vector": gravity.tolist(),
+            "mode": gravity_est.mode,
+            "trunk_up": gravity_est.trunk_up.tolist(),
+            "lean_deg": gravity_est.lean_deg,
+            "frames": gravity_est.samples,
+        },
+        "hand_mass": hand_mass(body_mass),
+    }
 
     if args.wrist_base:
-        share = float(np.clip(args.support_share, 0.0, 1.0))
-        # 腕が持ち上げるのは**体幹と頭だけ**。脚は床／フットレストが支える。
-        # 前腕・上腕は鎖の一部として自重が入るので含めない。手は固定端なので含めない。
-        #
-        # かつては「体重 − 両腕（上腕＋前腕）」= 60kg なら 55.36 kg としており、
-        # 脚も手も含んだ「全身を浮かせる」前提だった。体幹＋頭を直接指定する方式にすると、
-        # 手を引くべきかという問題も構造的に消える（計画 A-2）。
-        torso_mass_default = body_mass * SUPPORTED_MASS_FRACTION
-        torso_mass_total = args.torso_mass if args.torso_mass is not None else torso_mass_default
-        torso_mass_total = max(torso_mass_total, 0.0)
-        torso_mass_each = torso_mass_total * share
-        external_force_vec = torso_mass_each * gravity
-        T = pose_interp.shape[0]
-        external_force_arr = np.repeat(external_force_vec[np.newaxis, :], T, axis=0)
-        shoulder_idx_right = wrist_segments_right[-1].distal_joint
-        shoulder_idx_left = wrist_segments_left[-1].distal_joint
-        external_point_right = np.asarray(pose_interp[:, shoulder_idx_right, :], dtype=np.float64)
-        external_point_left = np.asarray(pose_interp[:, shoulder_idx_left, :], dtype=np.float64)
-
-        tau_g_right_wrist, tau_l_right_wrist = compute_side_torques(
-            pose_interp,
-            wrist_segments_right,
-            body_mass,
-            dt,
-            gravity,
-            external_force=external_force_arr,
-            external_point=external_point_right,
-        )
-        tau_g_left_wrist, tau_l_left_wrist = compute_side_torques(
-            pose_interp,
-            wrist_segments_left,
-            body_mass,
-            dt,
-            gravity,
-            external_force=external_force_arr,
-            external_point=external_point_left,
-        )
-
-        if torque_scale != 1.0:
-            tau_g_right_wrist *= torque_scale
-            tau_l_right_wrist *= torque_scale
-            tau_g_left_wrist *= torque_scale
-            tau_l_left_wrist *= torque_scale
-
-        for idx, seg in enumerate(wrist_segments_right):
-            part = SEGMENT_TO_OUTPUT_WRIST_BASE.get(seg.name)
-            if part:
-                override_global[part] = tau_g_right_wrist[:, idx, :]
-                override_local[part] = tau_l_right_wrist[:, idx, :]
-        for idx, seg in enumerate(wrist_segments_left):
-            part = SEGMENT_TO_OUTPUT_WRIST_BASE.get(seg.name)
-            if part:
-                override_global[part] = tau_g_left_wrist[:, idx, :]
-                override_local[part] = tau_l_left_wrist[:, idx, :]
-
-        extra_arrays.update({
-            "tau_global_right_wristbase": tau_g_right_wrist,
-            "tau_local_right_wristbase": tau_l_right_wrist,
-            "tau_global_left_wristbase": tau_g_left_wrist,
-            "tau_local_left_wristbase": tau_l_left_wrist,
-        })
-
+        load = torso_load_mass(body_mass, args.support_share, args.torso_mass)
+        meta["model"] = "wrist_base"
+        meta["torso_load_mass_per_arm"] = load
+        meta["local_frame_fallbacks"] = {}
+        meta["wrist_axis"] = {}
+        for side in ("R", "L"):
+            g_side, l_side, info = compute_push_up_side(
+                pose_interp, side, body_mass, dt, gravity, load, hand_mass(body_mass))
+            for joint in JOINTS:
+                global_map[f"{joint}_{side}"] = g_side[joint] * torque_scale
+                local_map[f"{joint}_{side}"] = l_side[joint] * torque_scale
+            meta["local_frame_fallbacks"][side] = info["local_frame_fallbacks"]
+            meta["wrist_axis"][side] = {
+                "hand": info["wrist_hand"],
+                "elbow_plane": int(len(frames) - info["wrist_hand"]),
+            }
+            if info["local_frame_fallbacks"]:
+                print(f"[WARN] {side}: 局所座標系を作れず全体座標の値をそのまま使った件数 "
+                      f"{info['local_frame_fallbacks']}（KNOWN_ISSUES §5-4）")
         if args.debug:
-            print(
-                "[DEBUG] wrist-base load",
-                {
-                    "torso_mass_total": torso_mass_total,
-                    "share": share,
-                    "torso_mass_each": torso_mass_each,
-                    "force_norm": float(np.linalg.norm(external_force_vec)),
-                },
-            )
+            print("[DEBUG] wrist-base load", {"torso_load_mass_per_arm": load, "share": args.support_share})
+    else:
+        meta["model"] = "free_swing"
+        for side in ("R", "L"):
+            g_side, l_side = _free_swing_side(pose_interp, side, args, body_mass, dt, gravity, up)
+            for part in g_side:
+                global_map[part] = g_side[part] * torque_scale
+                local_map[part] = l_side[part] * torque_scale
 
-    df_out, meta_shapes = build_output(
-        frames,
-        tau_g_right,
-        tau_l_right,
-        tau_g_left,
-        tau_l_left,
-        right_segments,
-        left_segments,
-        override_global=override_global if override_global else None,
-        override_local=override_local if override_local else None,
-    )
+    df_out = build_output(frames, global_map, local_map)
 
     out_dir = args.out_dir
     if out_dir is None:
@@ -775,23 +771,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         out_dir = os.path.normpath(os.path.join(base_dir, os.pardir, "torque"))
     prefix = args.prefix or os.path.splitext(os.path.basename(args.pose_csv))[0]
 
-    save_outputs(
-        df_out,
-        meta_shapes,
-        out_dir,
-        prefix,
-        args.save_npy,
-        tau_g_right,
-        tau_l_right,
-        tau_g_left,
-        tau_l_left,
-        frames,
-        body_mass,
-        gravity,
-        fps,
-        dt,
-        extra_arrays=extra_arrays if extra_arrays else None,
-    )
+    save_outputs(df_out, out_dir, prefix, args.save_npy, global_map, local_map, frames, meta)
 
     print(f"Saved torque outputs to {out_dir} (prefix='{prefix}', frames={len(frames)})")
     return 0

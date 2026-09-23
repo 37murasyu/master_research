@@ -13,7 +13,8 @@ from compute_torque_from_pose import (
     compute_segment_kinematics,
 )
 from config import THEORETICAL_WORK_COEFF
-from utils import compute_joint_power
+from push_up_model import hand_point, joint_axes
+from utils import compute_local_torque
 
 FOREARM_MASS_FRAC = 0.0160
 HAND_MASS_FRAC = 0.0060
@@ -31,6 +32,8 @@ LEFT = {
     "elbow": 13,
     "wrist": 15,
 }
+# 手の点（小指, 人差し指）。姿勢 CSV にあれば手首の軸を手のひらから作る（§5-1）
+HAND = {"R": (18, 20), "L": (17, 19)}
 
 
 def _col_triplet(idx: int) -> List[str]:
@@ -99,36 +102,61 @@ def _pose_array(pose_df: pd.DataFrame, joint_ids) -> np.ndarray:
     return pose
 
 
-def _joint_powers(
+def _hand_series(pose_df: pd.DataFrame, side_name: str) -> np.ndarray | None:
+    """手の代表点（小指と人差し指の中点）。姿勢 CSV に列が無ければ None。"""
+    pinky, index = HAND[side_name]
+    if not all(c in pose_df.columns for c in _col_triplet(pinky) + _col_triplet(index)):
+        return None
+    return hand_point(pose_df[_col_triplet(pinky)].to_numpy(float), pose_df[_col_triplet(index)].to_numpy(float))
+
+
+def _joint_projections(
     pose_df: pd.DataFrame, torque_df: pd.DataFrame, side_name: str, dt: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    """肘と手首の仕事率 [W] を (肘, 手首) で返す。
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """肘と手首について、局所 y 軸に射影したトルクと相対角速度 (τ_y, ω_y) を返す。仕事率はこの積。
 
-    トルク CSV は ``compute_torque_from_pose.py --wrist-base`` の出力（全体座標の列）を前提にする。
-    手を固定端として前腕 → 上腕の順に解いた鎖なので、関節の相対角速度も同じ鎖・同じリンクから取る:
+    トルク CSV は ``compute_torque_from_pose.py``（既定の座位プッシュアップのモデル）の出力の
+    全体座標の列を前提にする。手を固定端として前腕 → 上腕の順に解いた鎖なので、関節の相対角速度も
+    同じ鎖・同じリンクから取る:
 
-    - 手首: 前腕の角速度（親の手は固定）。局所軸は前腕リンクから作る
-    - 肘: 上腕の角速度 − 前腕の角速度。局所軸は上腕リンクと親の前腕リンクから作る
+    - 手首: 前腕の角速度（親の手は固定）
+    - 肘: 上腕の角速度 − 前腕の角速度
 
-    どちらもトルクと同じ局所軸に射影して掛ける（``utils.compute_joint_power``）。
+    局所軸はトルク CSV と同じ ``push_up_model.joint_axes`` で作り、τ と ω を同じ軸に射影する。
+    手首の軸は手の点があれば手のひらから、無ければ肘と同じ屈曲軸（§5-1）。
     角度を経由しないので、fps の掛け戻し（§1-1）も ±π の折り返し（§1-2）も起きない。
 
     かつて ``*_local_y`` に「+Y まわりの肘角」「水平面からの前腕の傾き」の微分を掛けていた。
     軸の作り方が τ と別なので、左右を鏡映すると片方だけ符号が反転し、左右で逆の相を積算していた。
+    その後も手首の軸は前腕と全体座標の基準軸から作っており、前腕が鉛直に近いと腕の面内の屈曲を
+    取れていなかった。
     """
+    side = RIGHT if side_name == "R" else LEFT
     segments = WRIST_BASE_SEGMENTS_RIGHT if side_name == "R" else WRIST_BASE_SEGMENTS_LEFT
     joint_ids = sorted({seg.proximal_joint for seg in segments} | {seg.distal_joint for seg in segments})
-    # 角速度とリンクは、トルクを出した compute_torque_from_pose と同じ関数で求める（0: 前腕、1: 上腕）
-    omegas, _, _, _, _, links = compute_segment_kinematics(_pose_array(pose_df, joint_ids), segments, dt)
-    wrist_tau = torque_df[[f"wrist_{side_name}_{ax}" for ax in "xyz"]].to_numpy(float)
-    elbow_tau = torque_df[[f"elbow_{side_name}_{ax}" for ax in "xyz"]].to_numpy(float)
+    # 角速度は、トルクを出した compute_torque_from_pose と同じ関数で求める（0: 前腕、1: 上腕）
+    omegas, _, _, _, _, _ = compute_segment_kinematics(_pose_array(pose_df, joint_ids), segments, dt)
+    points = {name: pose_df[_col_triplet(side[name])].to_numpy(float) for name in ("shoulder", "elbow", "wrist")}
+    axes = joint_axes(points["shoulder"], points["elbow"], points["wrist"], hand=_hand_series(pose_df, side_name))
+    relative = {"wrist": omegas[:, 0], "elbow": omegas[:, 1] - omegas[:, 0]}
+
     n = min(len(pose_df), len(torque_df))
-    wrist = np.array([
-        compute_joint_power(wrist_tau[t], omegas[t, 0], None, links[t, 0]) for t in range(n)])
-    elbow = np.array([
-        compute_joint_power(elbow_tau[t], omegas[t, 1], omegas[t, 0], links[t, 1], links[t, 0])
-        for t in range(n)])
-    return elbow, wrist
+    out = {}
+    for joint in ("elbow", "wrist"):
+        tau = torque_df[[f"{joint}_{side_name}_{ax}" for ax in "xyz"]].to_numpy(float)
+        link, parent = axes[joint]
+        tau_y = np.array([compute_local_torque(tau[t], link[t], parent[t])[1] for t in range(n)])
+        omega_y = np.array([compute_local_torque(relative[joint][t], link[t], parent[t])[1] for t in range(n)])
+        out[joint] = (tau_y, omega_y)
+    return out
+
+
+def _joint_powers(
+    pose_df: pd.DataFrame, torque_df: pd.DataFrame, side_name: str, dt: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """肘と手首の仕事率 [W] を (肘, 手首) で返す。P = τ_y × ω_y（``_joint_projections``）。"""
+    proj = _joint_projections(pose_df, torque_df, side_name, dt)
+    return proj["elbow"][0] * proj["elbow"][1], proj["wrist"][0] * proj["wrist"][1]
 
 
 def _aggregate_cycles(frame_idx: np.ndarray, power: np.ndarray, cycle_index: np.ndarray, dt: float) -> pd.DataFrame:
@@ -237,7 +265,7 @@ def main() -> int:
         for side_name, side in ("R", RIGHT), ("L", LEFT):
             pose_scaled = pose_df.copy()
             if pos_scale != 1.0:
-                for idx in (side["shoulder"], side["elbow"], side["wrist"]):
+                for idx in (side["shoulder"], side["elbow"], side["wrist"], *HAND[side_name]):
                     for ax in ("x", "y", "z"):
                         col = f"joint_{idx}_{ax}"
                         if col in pose_scaled.columns:
@@ -259,6 +287,13 @@ def main() -> int:
             # lever arms (forearm length as elbow->wrist distance)
             forearm_vec, forearm_len_med, r_x_elbow = _compute_lengths(pose_scaled, side)
             # equivalent masses
+            #
+            # 分母（理論 1RM 仕事量）は前腕＋手を回す仕事で、**手を含める**（2026-09-23 決定、§2-2）。
+            # 1RM はダンベルを手に持って肘を曲げる試技なので、手も一緒に持ち上がる。
+            # 分子（プッシュアップのトルク）の鎖は手をアームレストに置いた固定端とするので、
+            # 手の重さはアームレストが直接支え、手首・肘のトルクには入らない。両者の差は
+            # 動作の違い（手が動くか固定か）であって定義の食い違いではない。腕を肩から吊る
+            # 側の鎖（肩トルク）には、分母と同じく手を手首の質点として入れている（push_up_model）。
             m_forearm = args.body_mass * FOREARM_MASS_FRAC
             m_hand = args.body_mass * HAND_MASS_FRAC
             m_x_elbow = m_forearm + m_hand

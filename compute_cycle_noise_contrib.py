@@ -1,3 +1,10 @@
+"""サイクル仕事を「信号 × 信号」「交差項」「ノイズ × ノイズ」に分解する。
+
+分解する仕事はスコア（``compute_cycle_energy_elbow_wrist.py``）と同じもの: トルクと関節の相対角速度を
+同じ局所 y 軸に射影した積（``_joint_projections``）。かつてこちらだけ、角度（``arctan2``）を
+経由して微分した角速度に fps を掛けており（30 倍、KNOWN_ISSUES §1-1 と同じ誤り）、
+トルクとは別の軸の角速度を掛けていた（§5-2）。スコア側を直したときに取り残されていた（§1-6）。
+"""
 from __future__ import annotations
 
 import argparse
@@ -6,6 +13,8 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+
+from compute_cycle_energy_elbow_wrist import HAND, _joint_projections
 
 DEFAULT_FPS = 30.0
 
@@ -23,25 +32,6 @@ LEFT = {
 
 def _col_triplet(idx: int) -> List[str]:
     return [f"joint_{idx}_x", f"joint_{idx}_y", f"joint_{idx}_z"]
-
-
-def _angle_about_y(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-    cross = np.cross(v1, v2)
-    cross_y = cross[:, 1]
-    dot = np.einsum("ij,ij->i", v1, v2)
-    return np.arctan2(cross_y, dot)
-
-
-def _angle_from_xz_plane(v: np.ndarray) -> np.ndarray:
-    vy = v[:, 1]
-    vxz = np.linalg.norm(v[:, [0, 2]], axis=1)
-    return np.arctan2(vy, vxz)
-
-
-def _gradient(series: np.ndarray, dt: float) -> np.ndarray:
-    if len(series) < 2:
-        return np.zeros_like(series)
-    return np.gradient(series, dt)
 
 
 def _unit_scale(unit: str) -> float:
@@ -95,18 +85,6 @@ def _prepare_cycle_map(cycles_df: pd.DataFrame) -> Dict[int, int]:
 def _merge_by_frame(df: pd.DataFrame, frame_map: Dict[int, int]) -> np.ndarray:
     frames = df["frame"].to_numpy(int) if "frame" in df.columns else np.arange(len(df))
     return np.array([frame_map.get(int(f), -1) for f in frames], dtype=int)
-
-
-def _compute_angles(pose_df: pd.DataFrame, side: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray]:
-    p_sh = pose_df[_col_triplet(side["shoulder"])].to_numpy(float)
-    p_el = pose_df[_col_triplet(side["elbow"])].to_numpy(float)
-    p_wr = pose_df[_col_triplet(side["wrist"])].to_numpy(float)
-    v1 = p_sh - p_el
-    v2 = p_wr - p_el
-    elbow_angle = _angle_about_y(v1, v2)
-    forearm = v2
-    wrist_angle = _angle_from_xz_plane(forearm)
-    return elbow_angle, wrist_angle
 
 
 def _split_low_high(x: np.ndarray, fs: float, fc: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -187,6 +165,35 @@ def _noise_contrib_per_cycle(
     return pd.DataFrame(rows)
 
 
+def side_noise_contrib(
+    pose_df: pd.DataFrame,
+    torque_df: pd.DataFrame,
+    side_name: str,
+    dt: float,
+    fps: float,
+    fc: float,
+    cycle_idx: np.ndarray,
+    torque_scale: float = 1.0,
+) -> Dict[str, pd.DataFrame]:
+    """片側の肘・手首について、サイクルごとの仕事の分解を返す（キーは elbow_R など）。"""
+    proj = _joint_projections(pose_df, torque_df, side_name, dt)
+    out: Dict[str, pd.DataFrame] = {}
+    for joint in ("elbow", "wrist"):
+        tau, omg = proj[joint]
+        tau = tau * torque_scale
+        n = len(tau)
+        idx = np.asarray(cycle_idx)[:n]
+        tau_sig, tau_noi = _split_low_high(tau, fps, fc)
+        omg_sig, omg_noi = _split_low_high(omg, fps, fc)
+        df_cycles = _noise_contrib_per_cycle(tau_sig, tau_noi, omg_sig, omg_noi, idx, dt)
+        df_cycles["part"] = f"{joint}_{side_name}"
+        df_cycles["fc_hz"] = fc
+        df_cycles["rho_noise_tau"] = _noise_power_ratio(tau, tau_noi)
+        df_cycles["rho_noise_omega"] = _noise_power_ratio(omg, omg_noi)
+        out[f"{joint}_{side_name}"] = df_cycles
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Estimate per-cycle noise contribution in work (tau*omega)")
     ap.add_argument("--pose-dir", default="output_data/filtered_pose_lpf", help="pose dir with *_with_cycles.csv")
@@ -236,47 +243,21 @@ def main() -> int:
         for side_name, side in ("R", RIGHT), ("L", LEFT):
             pose_scaled = pose_df.copy()
             if pos_scale != 1.0:
-                for idx in (side["shoulder"], side["elbow"], side["wrist"]):
+                for idx in (side["shoulder"], side["elbow"], side["wrist"], *HAND[side_name]):
                     for ax in ("x", "y", "z"):
                         col = f"joint_{idx}_{ax}"
                         if col in pose_scaled.columns:
                             pose_scaled[col] = pose_scaled[col].to_numpy(float) * pos_scale
 
-            elbow_angle, wrist_angle = _compute_angles(pose_scaled, side)
-            elbow_omega = _gradient(elbow_angle, dt) * (args.fps if args.fps > 0 else DEFAULT_FPS)
-            wrist_omega = _gradient(wrist_angle, dt) * (args.fps if args.fps > 0 else DEFAULT_FPS)
-
-            n = min(len(torque_df), len(pose_df))
-            elbow_omega = elbow_omega[:n]
-            wrist_omega = wrist_omega[:n]
-            cycle_idx = torque_cycle[:n]
-
-            elbow_tau_col = f"elbow_{side_name}_local_y"
-            wrist_tau_col = f"wrist_{side_name}_local_y"
-            if elbow_tau_col not in torque_df.columns or wrist_tau_col not in torque_df.columns:
+            needed = [f"{part}_{side_name}_{ax}" for part in ("elbow", "wrist") for ax in "xyz"]
+            if any(col not in torque_df.columns for col in needed):
                 print(f"[SKIP] missing torque columns for {stem} {side_name}")
                 continue
 
-            elbow_tau = torque_df[elbow_tau_col].to_numpy(float)[:n] * args.torque_scale
-            wrist_tau = torque_df[wrist_tau_col].to_numpy(float)[:n] * args.torque_scale
-
-            for part_name, tau, omg in (
-                (f"elbow_{side_name}", elbow_tau, elbow_omega),
-                (f"wrist_{side_name}", wrist_tau, wrist_omega),
-            ):
-                tau_sig, tau_noi = _split_low_high(tau, args.fps, args.fc)
-                omg_sig, omg_noi = _split_low_high(omg, args.fps, args.fc)
-
-                noise_ratio_tau = _noise_power_ratio(tau, tau_noi)
-                noise_ratio_omg = _noise_power_ratio(omg, omg_noi)
-
-                df_cycles = _noise_contrib_per_cycle(tau_sig, tau_noi, omg_sig, omg_noi, cycle_idx, dt)
-                df_cycles["part"] = part_name
+            results = side_noise_contrib(
+                pose_scaled, torque_df, side_name, dt, args.fps, args.fc, torque_cycle, args.torque_scale)
+            for part_name, df_cycles in results.items():
                 df_cycles["subject_id"] = subject_id
-                df_cycles["fc_hz"] = args.fc
-                df_cycles["rho_noise_tau"] = noise_ratio_tau
-                df_cycles["rho_noise_omega"] = noise_ratio_omg
-
                 out_path = out_dir / f"cycle_noise_{stem}_s{subject_id}_{part_name}.csv"
                 df_cycles.to_csv(out_path, index=False)
                 print(f"[OUT] {out_path}")

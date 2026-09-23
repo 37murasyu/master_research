@@ -129,6 +129,17 @@ def hand_point(pinky, index):
 # ---------------------------------------------------------------------------
 
 
+def wrist_hand_mask(elbow, wrist, hand):
+    """手首の軸を手のひらから作れるフレームなら True（手の点が有限で、手首が曲がっている）。"""
+    forearm = np.asarray(elbow, dtype=np.float64) - np.asarray(wrist, dtype=np.float64)
+    palm = np.asarray(wrist, dtype=np.float64) - np.asarray(hand, dtype=np.float64)
+    cross = np.linalg.norm(np.cross(palm, forearm), axis=-1)
+    scale = np.linalg.norm(palm, axis=-1) * np.linalg.norm(forearm, axis=-1)
+    with np.errstate(invalid="ignore"):
+        bent = cross >= MIN_WRIST_BEND_SIN * scale
+    return np.all(np.isfinite(palm), axis=-1) & bent & (scale > 0)
+
+
 def joint_axes(shoulder, elbow, wrist, hand=None, other_shoulder=None):
     """関節ごとの局所軸の材料 (link, parent) を返す。``utils.compute_local_torque`` にそのまま渡す。
 
@@ -154,11 +165,7 @@ def joint_axes(shoulder, elbow, wrist, hand=None, other_shoulder=None):
         wrist_parent = fallback
     else:
         palm = wrist - np.asarray(hand, dtype=np.float64)
-        cross = np.linalg.norm(np.cross(palm, forearm), axis=-1)
-        scale = np.linalg.norm(palm, axis=-1) * np.linalg.norm(forearm, axis=-1)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            bent = cross >= MIN_WRIST_BEND_SIN * scale
-        usable = np.all(np.isfinite(palm), axis=-1) & bent & (scale > 0)
+        usable = wrist_hand_mask(elbow, wrist, hand)
         wrist_parent = np.where(np.expand_dims(usable, -1), palm, fallback)
 
     shoulder_parent = None

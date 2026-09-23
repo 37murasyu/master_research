@@ -167,6 +167,59 @@ class TestLiftingTheTrunk:
         assert float(np.sum(np.abs(wrist_power)) * DT) < 1e-9, "前腕が静止しているのに手首が仕事をした"
 
 
+def _forearm_tilting_about_the_wrist(n: int = 20, omega: float = 0.3, theta0: float = 0.05):
+    """手首を固定し、鉛直に近い前腕が x-z 面（腕の面）内で手首まわりに ω で傾く。肘角は一定。
+
+    前腕 r = L (sin θ, 0, cos θ) なので r × ṙ / |r|² = (0, ω, 0)。
+    """
+    theta = theta0 + omega * DT * np.arange(n)
+    wrist = np.zeros((n, 3))
+    elbow = FOREARM * np.stack([np.sin(theta), np.zeros(n), np.cos(theta)], axis=1)
+    shoulder = elbow + UPPER_ARM * np.stack([np.sin(theta + 0.8), np.zeros(n), np.cos(theta + 0.8)], axis=1)
+    return wrist, elbow, shoulder
+
+
+def _wrist_power_with_hand(hand_offset=None, omega: float = 0.3) -> np.ndarray:
+    wrist, elbow, shoulder = _forearm_tilting_about_the_wrist(omega=omega)
+    n = len(wrist)
+    pose = _pose_df(RIGHT, wrist, elbow, shoulder)
+    if hand_offset is not None:
+        # 右小指 18・右人差指 20。中点が wrist + hand_offset になるよう少しずらして置く
+        for jid, jitter in ((18, -0.01), (20, 0.01)):
+            point = wrist + np.asarray(hand_offset) + np.array([jitter, 0.0, 0.0])
+            for axis, label in enumerate("xyz"):
+                pose[f"joint_{jid}_{label}"] = point[:, axis]
+    torque = _torque_df("R", np.zeros((n, 3)), np.tile([0.0, 2.0, 0.0], (n, 1)))
+    _, wrist_power = _joint_powers(pose, torque, "R", DT)
+    return wrist_power
+
+
+class TestWristAxis:
+    """§5-1 手首の仕事率は手首の屈曲軸で取る。
+
+    かつて手首の局所軸は、前腕リンクと全体座標の基準軸（z → x → y の順）から作っていた。
+    前腕が鉛直に近いと局所 y が水平の面内方向を向き、腕の面内で前腕が倒れる動き
+    （プッシュアップの手首の屈曲そのもの）の仕事が 0 になっていた。
+    """
+
+    def test_without_hand_points_the_arm_plane_normal_is_used(self):
+        # τ = (0, 2, 0)、ω_前腕 = (0, 0.3, 0)、手は固定 → P = 0.6 W
+        power = _wrist_power_with_hand(None)
+        assert float(np.median(power[2:-2])) == pytest.approx(0.6, rel=0.01), (
+            "手の点が無いとき、手首の軸が腕の面の法線（肘と同じ屈曲軸）になっていない")
+
+    def test_hand_points_set_the_axis_from_the_palm(self):
+        """手が腕の面から 45° 横へ出ていれば、手首の軸（前腕と手に直交）も 45° 回る。
+
+        手 = (a, a, 0)、前腕 ≈ ẑ のとき y ∝ 手 × 前腕 ∝ (−a, a, 0)/√2。τ_y と ω_y がそれぞれ
+        1/√2 倍になるので P ≈ 0.6 / 2 = 0.3 W（前腕の傾き分だけわずかに小さい）。
+        腕の面の法線なら 0.6 W、全体座標の基準軸なら 0 W になる。
+        """
+        power = _wrist_power_with_hand([0.06, 0.06, 0.0])
+        assert float(np.median(power[2:-2])) == pytest.approx(0.3, rel=0.03), (
+            "手の点があるのに手のひら（前腕と手に直交する軸）から軸を作っていない")
+
+
 class TestMirrorSymmetry:
     """左右を鏡映した動きなら、左の仕事率は右と同じ。"""
 
