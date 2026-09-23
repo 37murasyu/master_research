@@ -246,8 +246,16 @@ class TestJointPower:
         使う。かつて部位の絶対角速度との内積 τ·ω を使っており、腕を振るだけで仕事が出ていた
         （計画メモ A-4 (2)、H-B）。当時は部位の並びが 1 つずれており、肘の値は wrist_R の名前で
         出ていた（KNOWN_ISSUES §5-7）。
+
+        EKF は切る（2026-09-24 に混成へ EKF を入れた）。この合成は全身を 1.2 Hz・奥行き 15 cm で揺らしており、
+        同梱の既定値の EKF が追える帯域（約 0.65 Hz）の外で、点ごとの遅れの違いが肘角の見かけの変化になる
+        （1 サイクル 0.1〜0.35 J）。ここで確かめたいのは仕事率の式（相対角速度）なので、三角測量の値をそのまま使う。
         """
-        measurement = _measurement()
+        from app.hybrid.ekf import EkfSettings
+
+        P0, P1 = _stereo_projections()
+        measurement = NetworkMeasurement(
+            P0, P1, POSE_KEYPOINTS, MeasurementConfig(body_mass_kg=60.0, ekf=EkfSettings(enabled=False)))
         for index in range(150):
             t = index / 30.0
             truth = _body_points_rotating_right_arm(t)

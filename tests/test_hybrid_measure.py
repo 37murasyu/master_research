@@ -66,10 +66,12 @@ def test_distortion_corrected_3d_and_outside_nan():
     result = m.process(_pair_from_pixels(1, a, b))
     expected = truth[:, [0, 2, 1]] * -0.01
     assert np.max(np.linalg.norm(result.points_3d - expected, axis=1)) < 0.005
-    # 余白（幅・高さの 10%）より遠く外の点は、歪みの多項式の外挿が暴れるので使わない
+    # 余白（幅・高さの 10%）より遠く外の点は、歪みの多項式の外挿が暴れるので使わない。
+    # EKF はその点を予測で埋めるので、三角測量の結果は EKF の手前（points_raw）で見る（T7 で EKF を入れた）
     a[0] = [-400, 30]
     result = m.process(_pair_from_pixels(2, a, b))
-    assert np.isnan(result.points_3d[0]).all()
+    assert np.isnan(result.points_raw[0]).all()
+    assert np.isfinite(result.points_3d[0]).all()
 
 
 def test_edge_points_survive_undistortion():

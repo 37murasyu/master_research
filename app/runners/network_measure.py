@@ -71,7 +71,8 @@ from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transfor
 
 from energy_pipeline import angle_between
 
-from app.hybrid.rep_work import RepAccumulator, WorkSample
+from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
+from app.hybrid.rep_work import MAX_STEP_S, RepAccumulator, WorkSample
 from app.net.sync_buffer import PairedSample
 
 # 歪み補正で扱う画像の外側の余白（幅・高さに対する比）。NetworkMeasurement._undistort を参照。
@@ -136,6 +137,9 @@ class MeasurementConfig:
     # 初期フレームの体幹の向きから決める。
     gravity_mode: str = "axis"
 
+    # EKF（app.hybrid.ekf）。既定は有効・同梱の既定値の雑音。計測の子は EkfSettings.from_env() を渡す
+    ekf: EkfSettings = field(default_factory=EkfSettings)
+
     # 保持するフレーム数の上限。長時間の計測でメモリを食い潰さないため。
     # 物理計算が実際に見るのは直近 2 フレームだけ（LinkVectorCalculator は
     # i と i-1、calculate_M_and_F は [-1] しか使わない）。
@@ -151,6 +155,7 @@ class FrameResult:
     """1 フレーム分の計算結果。"""
 
     t_ns: int
+    # EKF の後の 3D 点（m、ランドマーク ID の昇順）。EKF が無効なら points_raw と同じ
     points_3d: np.ndarray
     local_torques: dict[str, np.ndarray] = field(default_factory=dict)
     cycle_detected: bool = False
@@ -160,6 +165,12 @@ class FrameResult:
     dt_s: float = 1.0 / 30.0
     # 関節ごとの仕事率 P = τ_y × ω_rel·y [W]（キーは local_torques と同じ）
     powers: dict[str, float] = field(default_factory=dict)
+    # EKF の手前の 3D 点（三角測量の直後）。None なら points_3d と同じ（EKF を通していない記録）
+    points_raw: np.ndarray | None = None
+    # 同期バッファの格子の番号 round((t_ns − 最初の組の t_ns) / 33.3 ms)。抜けた組の分だけ飛ぶ
+    grid_index: int = 0
+    # EKF の速度 [m/s]（点 × 3）。EKF が無効なら None
+    velocity: np.ndarray | None = None
 
 
 class NetworkMeasurement:
@@ -196,17 +207,16 @@ class NetworkMeasurement:
                 _translate_image(self.P1, self._shift["cam1"]),
             )
 
-        self.storage = BodyPartDataStorage()
-        self.calculators = {
-            part: LinkVectorCalculator(
-                spec["start"], spec["end"], spec.get("com_fraction", 0.5))
-            for part, spec in part_calculations.items()
-        }
-
-        # 直近 2 フレームだけ持つ。物理計算はそれ以上遡らない。
-        self._recent_points: list[np.ndarray] = []
+        self._restart_dynamics()
         self.frame_index = 0
         self._prev_t_ns: int | None = None
+        self._t0_ns: int | None = None
+        self._prev_grid: int | None = None
+        # 100 ms を超える抜けで速度の計算をやり直した回数
+        self.dynamics_restarts = 0
+
+        # EKF（app.hybrid.ekf）。無効なら None
+        self.ekf = GridEkf(self.config.ekf, self.pose_keypoints) if self.config.ekf.enabled else None
 
         self._inertia: dict[str, np.ndarray] = {}
         self._inertia_samples: list[np.ndarray] = []
@@ -239,18 +249,32 @@ class NetworkMeasurement:
 
     def process(self, pair: PairedSample) -> FrameResult | None:
         """1 ペアを処理する。まだ計算できない段階では None を返す。"""
-        points = self.points_3d(pair)
-        if points is None:
+        raw = self.points_3d(pair)
+        if raw is None:
             return None
+        grid = self._grid_index(pair.t_ns)
+        missing = 0 if self._prev_grid is None else max(0, grid - self._prev_grid - 1)
+        self._prev_grid = grid
+
+        dt = self._timestep(pair.t_ns)
+        if self.frame_index > 0 and dt > MAX_STEP_S:
+            # 長い抜けの後は、抜ける前のフレームとの差で速度・加速度を作らない（トルクが跳ねる）
+            self._restart_dynamics()
+            self.dynamics_restarts += 1
+        if self.ekf is None:
+            points, velocity = raw, None
+        else:
+            points, velocity = self.ekf.step(raw, missing)
+
         self._recent_points.append(points)
         if len(self._recent_points) > self._REQUIRED_FRAMES:
             del self._recent_points[0]
 
-        dt = self._timestep(pair.t_ns)
         self._update_links(dt)
-        self._update_baseline(points)
+        self._update_baseline(raw)
 
-        result = FrameResult(t_ns=pair.t_ns, points_3d=points, dt_s=dt)
+        result = FrameResult(t_ns=pair.t_ns, points_3d=points, dt_s=dt, points_raw=raw,
+                             grid_index=grid, velocity=velocity)
 
         if not self._inertia:
             self._inertia_samples.append(points)
@@ -319,6 +343,27 @@ class NetworkMeasurement:
         return compute_triangulate_transform_native(
             P0, P1, keypoints0, keypoints1, scale=0.01
         )
+
+    def _restart_dynamics(self) -> None:
+        """リンクの速度の計算器・部位データ・直近の点を作り直す（最初と、100 ms を超える抜けの後）。"""
+        self.storage = BodyPartDataStorage()
+        self.calculators = {
+            part: LinkVectorCalculator(
+                spec["start"], spec["end"], spec.get("com_fraction", 0.5))
+            for part, spec in part_calculations.items()
+        }
+        # 直近 2 フレームだけ持つ。物理計算はそれ以上遡らない。
+        self._recent_points: list[np.ndarray] = []
+
+    def _grid_index(self, t_ns: int) -> int:
+        """同期バッファの格子の番号（最初の組を 0 とする）。"""
+        if self._t0_ns is None:
+            self._t0_ns = t_ns
+        return round((t_ns - self._t0_ns) / GRID_NS)
+
+    def ekf_provenance(self) -> dict:
+        """EKF の出どころ（meta.json・サイドカー用）。"""
+        return {"enabled": False} if self.ekf is None else self.ekf.provenance()
 
     def _timestep(self, t_ns: int) -> float:
         """前フレームとの実時間差。
