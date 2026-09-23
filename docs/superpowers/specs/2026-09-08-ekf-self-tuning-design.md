@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| 状態 | **未着手**（計画のみ。コードは 1 行も変更していない） |
-| 更新 | 2026-09-13（現状のコードに合わせて再計画） |
+| 状態 | S1〜S5・S7〜S11 実装済み。**S6（実機の収録）と S9b（受け入れ判定）が残り**（下の「2026-09-23 の実装」） |
+| 更新 | 2026-09-23（S9〜S11 のうち実機の要らない部分を実装） |
 | 基準コミット | `3a6a48c`（本文の行番号はこの時点のもの。**ずれていたらシンボル名で探すこと**） |
 | 起点ブランチ | `murayama/app-framework` |
 | 想定ブランチ | `murayama/ekf-self-tuning` |
@@ -319,6 +319,31 @@ app/runners/tune_ekf.py        生 CSV からプロファイルを書く CLI（G
   （`resolve_module` がドット名を素通しする。`app/entry.py:95-98`）
 
 ---
+
+## 2026-09-23 の実装（S9〜S11 のうち実機の要らない部分）
+
+S6 を待たずに入れた。S6 に依存するのは同梱既定値・`max_gap` の既定値・S9 の受け入れ判定（S9b）だけ。
+
+- **S9a 配線**: `app.tuning.ekf_profile.runtime_noise` が雑音パラメータを決める純粋関数。`EKF_PROFILE` が
+  無ければ環境変数のスカラー（今までの挙動のまま）、解決できればプロファイルが勝つ、dt 不一致・BPF 有効なら
+  同梱既定値。`master_research_code.py` は EKF を `_DYN_DT` の後に作り（`fs = 1/_DYN_DT`）、系列は ID の昇順、
+  サイドカーに `ekf_noise` を残す。体格の比は先頭 `INERTIA_LENGTH_FRAMES` フレームの肩–肘の中央値で決めて
+  `LandmarkEKF.set_noise` で掛け直す（EKF は最初のフレームから step するので、測り終わるまでは比 1）。
+  人体としてありえない長さ（0.10〜0.60 m の外）なら計測を止める。ディレクトリからは `ekf_profile_*.json` だけを
+  探し、`read_profile` は `series` の無いファイル（生 CSV のサイドカー）を拒否する。step の except は
+  `FloatingPointError` と `LinAlgError` だけにした。`EKF_PROFILE` は GUI の設定に出した（`CURATED`）
+- **S10 ロバスト更新**: 実装 2 の「S' = y²/c²（等価に r' = r·(|y|/(c√S))²）」の 2 式は、S = P00 + r なので
+  P00 = 0 のときしか一致しない。門の上で正規化イノベーションがちょうど c になる S' = y²/c²（r' = S' − P00）に揃えた。
+  補正量 P00·c²/y は |y| に反比例して縮む（Huber の「一定で頭打ち」ではなく再降下型）。`EKFConfig.robust_gate`
+  （既定オフ。`run_ekf` の契約は変えない）と `LandmarkEKF(robust_gate=...)`、実行時は `EKF_ROBUST_GATE`（既定オン）。
+  合成データ（振幅 0.1 m・0.5 Hz の往復、観測雑音 5 mm、版 2 の中央値）で、捨てる方式は誤差 RMS 1.08 m まで発散し、
+  ロバスト更新は 5.5 mm。0.2 m の段差でも、捨てる方式は 2.4 m 行き過ぎて 83 フレーム、ロバスト更新は最大 0.35 m・35 フレーム。
+  `max_gap_s`（`EKF_MAX_GAP_S`）の仕組みも入れたが、NaN が下流に流れるので**既定は 0（無制限）**のまま。
+  値は S6 の欠測長で決める。サイクルの基準値（`z_value`）だけは NaN を避けるようにした
+- **S11**: 解析ページの `TASKS` に「EKF の較正プロファイルを作る」（`app.runners.tune_ekf`、生 CSV を位置引数で渡す）
+
+テスト: `tests/test_landmark_ekf.py`（`TestRobustUpdate`・`TestMaxGap`・`TestSetNoise`）、`tests/test_ekf_runtime.py`、
+`tests/test_shell_smoke.py::TestEkfCalibrationTask`。
 
 ## 実装順序
 

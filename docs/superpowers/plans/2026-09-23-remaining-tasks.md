@@ -56,8 +56,8 @@
   - `SegmentState`, `segment_from_storage`, `push_up_torques(forearm, upper_arm, wrist, elbow, shoulder, gravity, load_mass, hand_mass_kg) -> {"wrist","elbow","shoulder"}`
 - Test: `tests/test_push_up_model.py`（静止姿勢のトルクを「重さ × 水平のてこの腕」で手計算して比較）
 
-### Task A3: オフラインのトルク（`compute_torque_from_pose.py`）
-- 重力を初期フレームの体幹から推定（`--gravity-mode axis|trunk`、`--gravity-frames 30`、`--gravity-axis` で明示指定も可）
+### Task A3: オフラインのトルク（`compute_torque_from_pose.py`） ✅
+- 重力を初期フレームの体幹から推定（`--gravity-mode axis|trunk`、`--gravity-frames 30`）
 - `--wrist-base` を既定オンに（`--no-wrist-base` で旧来の自由振りの鎖だけ）。手首・肘・肩は `push_up_torques`
 - 局所軸は `joint_axes`（手の点 17〜20 があれば手のひら、無ければ肘の屈曲軸）、フォールバック軸は重力の逆向き
 - `--torque-scale` の既定を 1.0 に（m 入力で 1/100 になっていた。新規の発見）
@@ -65,47 +65,47 @@
 - meta.json に重力の推定結果・規約の版・フォールバック件数
 - Test: `tests/test_offline_torque.py`（y 下向きと z 上向きの同じ動きで同じ |τ|、静止姿勢で `push_up_torques` と一致、手の点ありなしで手首軸が変わる、meta の中身）
 
-### Task A4: スコア（`compute_cycle_energy_elbow_wrist.py`）と §1-6
+### Task A4: スコア（`compute_cycle_energy_elbow_wrist.py`）と §1-6 ✅
 - `_joint_powers` の局所軸を `joint_axes` から取る（手首は手の点または肘の屈曲軸）。射影した τ_y・ω_y を返す関数を分けて §1-6 から使う
 - 分母は変えない（手を含める、§2-2 決定）。理由をコメントに残す
 - `compute_cycle_noise_contrib.py` は fps 掛けと角度経由の ω をやめ、スコアと同じ τ_y・ω_y を使う
 - Test: `tests/test_cycle_energy_angles.py` に手首軸のテスト、`tests/test_cycle_noise_contrib.py`（ω が rad/s、スコアと同じ仕事になる）
 
-### Task A5: `recalc_elbow_local_torque.py` を `joint_axes` に揃える
+### Task A5: `recalc_elbow_local_torque.py` を `joint_axes` に揃える ✅
 
-### Task A6: 規約の版（§5-6）
+### Task A6: 規約の版（§5-6） ✅
 - `config.OUTPUT_SCHEMA_VERSION = 2`（v1 = タグ無し）。オフラインの meta、USB 経路の npy・CSV 名に入れる
 
 ## Phase B: リアルタイム表示（§5-7・§5-8・§5-1）
 
-### Task B1: スマホ経路（`app/runners/network_measure.py`）を `push_up_model` に
+### Task B1: スマホ経路（`app/runners/network_measure.py`）を `push_up_model` に ✅
 - 鎖を前腕 → 上腕＋体幹荷重に。胴体・大腿・地面反力は鎖から外す
 - 重力は慣性テンソルを確定する初期フレームの体幹から推定
 - 仕事率: 手首 = 前腕（手は固定）、肘 = 上腕 − 前腕、肩 = 上腕 − 上胴体
 - Test: 既存 `tests/test_network_measure.py` の肘の仕事のテストをラベル修正後の `elbow_R` に、静止姿勢でオフラインと一致、鏡映テストは緑のまま
 
-### Task B2: USB 経路（`master_research_code.py`）を同じ関数に
+### Task B2: USB 経路（`master_research_code.py`）を同じ関数に ✅
 - `run_specs` の胴体・大腿を外し、`push_up_torques` を呼ぶ。手首の仕事（ゲージ）は正の仕事 ∫max(P,0)dt に
-- Test: AST テスト（`push_up_torques` と `joint_axes` を呼んでいる、`wrist_R` の値が鎖の 0 番）と py_compile
+- Test: AST テスト（`push_up_torques`・`arm_axes`・`segment_from_storage` を呼び、旧来の鎖の関数を呼んでいない）と py_compile
 
 ## Phase C: 再計算と照合
 
-### Task C1: スコアの通し再計算（§6-1）— スクラッチに全被験者を流し、表にする
+### Task C1: スコアの通し再計算（§6-1）— スクラッチに全被験者を流し、表にする ✅
 ### Task C2: 論文本文との照合（§1-4、R-5 の積分範囲、§2-3〜§2-5）— 本文は編集せず、要修正箇所を KNOWN_ISSUES に
 
 ## Phase D: 運用とコード品質
 
-### Task D1: §3-2 GUI 停止で CSV が書かれない — 停止ファイルでループを抜ける（OS 非依存）
-### Task D2: §4-1 ネイティブ描画 — 既定はスプライト（今の実挙動）、`USE_NATIVE_DRAW=1` のときだけネイティブ
-### Task D3: §4-2 ラベル描画の二重実装を `utils.put_text_jp` に集約
-### Task D4: §4-4 計時変数の統一と `config.env_flag`
-### Task D5: §5-5 定義の出典（大腿 COM は Winter、手の慣性行は未使用の理由）
+### Task D1: §3-2 GUI 停止で CSV が書かれない — 停止ファイルでループを抜ける（OS 非依存） ✅
+### Task D2: §4-1 ネイティブ描画 ✅（実施時に変更: 到達不能で Windows 専用のネイティブ分岐を外し、スプライトに一本化）
+### Task D3: §4-2 ラベル描画の二重実装を `utils.put_text_jp` に集約 ✅
+### Task D4: §4-4 計時変数の統一と `config.env_flag` ✅
+### Task D5: §5-5 定義の出典（大腿 COM は Winter、手の慣性行は未使用の理由） ✅
 
 ## Phase E: EKF（S6 を待たない部分）
 
-### Task E1: S9a 配線（プロファイルが無ければ環境変数のスカラー＝今の挙動、候補を `ekf_profile_*.json` に限定、生成を `_DYN_DT` の後へ、`fs = 1/_DYN_DT`、`sorted(pose_keypoints)`）
-### Task E2: S10 ロバスト更新（S' = y²/c²、`max_gap` 秒、既定は仮置き）
-### Task E3: S11 解析ページに「EKF の較正プロファイルを作る」
+### Task E1: S9a 配線（プロファイルが無ければ環境変数のスカラー＝今の挙動、候補を `ekf_profile_*.json` に限定、生成を `_DYN_DT` の後へ、`fs = 1/_DYN_DT`、`sorted(pose_keypoints)`） ✅
+### Task E2: S10 ロバスト更新（S' = y²/c²、`max_gap` 秒） ✅（`max_gap` の既定は 0 = 無制限。S6 で決める）
+### Task E3: S11 解析ページに「EKF の較正プロファイルを作る」 ✅
 
 ## Phase F: 仕上げ
 - KNOWN_ISSUES.md を更新（対応状況・残タスク・新規の発見）
