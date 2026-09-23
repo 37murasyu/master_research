@@ -69,6 +69,9 @@ from push_up_model import (
 from utils import PushCycleDetector, compute_local_torque
 from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transform_native
 
+from energy_pipeline import angle_between
+
+from app.hybrid.rep_work import RepAccumulator, WorkSample
 from app.net.sync_buffer import PairedSample
 
 # 歪み補正で扱う画像の外側の余白（幅・高さに対する比）。NetworkMeasurement._undistort を参照。
@@ -153,6 +156,10 @@ class FrameResult:
     cycle_detected: bool = False
     # サイクルごとの仕事 [J]。詳細はモジュール docstring の「揃っていない点」を参照。
     cycle_work_j: dict[str, float] = field(default_factory=dict)
+    # 前の組からの実時間差 [s]。仕事はこの dt で積む（app.hybrid.rep_work）
+    dt_s: float = 1.0 / 30.0
+    # 関節ごとの仕事率 P = τ_y × ω_rel·y [W]（キーは local_torques と同じ）
+    powers: dict[str, float] = field(default_factory=dict)
 
 
 class NetworkMeasurement:
@@ -210,7 +217,8 @@ class NetworkMeasurement:
         self._baseline_samples = 0
         self._detector = None
         self.cycle_work: dict[str, list[float]] = {k: [] for k in PART_KEYS}
-        self._power_history: dict[str, list[float]] = {k: [] for k in PART_KEYS}
+        # 今の回の仕事。フレームごとの dt で積む（かつては確定したフレームの dt を全体に掛けていた）
+        self.rep_work = RepAccumulator(PART_KEYS)
 
         self.results: list[FrameResult] = []
 
@@ -242,7 +250,7 @@ class NetworkMeasurement:
         self._update_links(dt)
         self._update_baseline(points)
 
-        result = FrameResult(t_ns=pair.t_ns, points_3d=points)
+        result = FrameResult(t_ns=pair.t_ns, points_3d=points, dt_s=dt)
 
         if not self._inertia:
             self._inertia_samples.append(points)
@@ -251,9 +259,10 @@ class NetworkMeasurement:
                 self._inertia_samples = []
 
         if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
-            torques = self._compute_local_torques(points)
-            if torques is not None:
-                result.local_torques = torques
+            dynamics = self._dynamics(points)
+            if dynamics is not None:
+                result.local_torques, result.powers, theta, tau_y = dynamics
+                self.rep_work.add(WorkSample(dt=dt, powers=result.powers, theta=theta, tau_y=tau_y))
                 self._accumulate_cycle(points, dt, result)
 
         self.frame_index += 1
@@ -404,6 +413,11 @@ class NetworkMeasurement:
             self.gravity = DEFAULT_GRAVITY.copy()
 
     def _compute_local_torques(self, points: np.ndarray) -> dict[str, np.ndarray] | None:
+        dynamics = self._dynamics(points)
+        return None if dynamics is None else dynamics[0]
+
+    def _dynamics(self, points: np.ndarray):
+        """局所トルク・仕事率・肘角 θ・肘の τ_y。部位データが揃わなければ None。"""
         data = {name: self.storage.get_data(name) for name in PART_LINKS}
         needed = [part for parts in ARM_PARTS.values() for part in parts.values()] + ["both_shoulder"]
         if any(not data[name] for name in needed):
@@ -416,6 +430,9 @@ class NetworkMeasurement:
         up = -gravity
 
         local: dict[str, np.ndarray] = {}
+        powers_by_key: dict[str, float] = {}
+        theta: dict[str, float] = {}
+        tau_y: dict[str, float] = {}
         for side, parts in ARM_PARTS.items():
             forearm = segment_from_storage(
                 data[parts["forearm"]][-1], self._inertia[f"forearm_{side}"], mass * SEGMENT_MASS_FRACTIONS["forearm"])
@@ -435,8 +452,12 @@ class NetworkMeasurement:
             powers = push_up_joint_powers(
                 torques, axes, forearm, upper_arm, data["both_shoulder"][-1].get("omega"), up)
             for joint, power in powers.items():
-                self._power_history[f"{joint}_{side}"].append(power)
-        return {key: local[key] for key in PART_KEYS}
+                powers_by_key[f"{joint}_{side}"] = float(power)
+            # 肘の濾波 E± の材料（USB と同じ θ = 肩→肘 と 肘→手首 のなす角、τ_y は肘の局所トルクの y）
+            shoulder, elbow, wrist = (points[slot_of(f"{side}_{n}")] for n in ("SHOULDER", "ELBOW", "WRIST"))
+            theta[f"elbow_{side}"] = angle_between(elbow - shoulder, wrist - elbow)
+            tau_y[f"elbow_{side}"] = float(local[f"elbow_{side}"][1])
+        return {key: local[key] for key in PART_KEYS}, powers_by_key, theta, tau_y
 
     def _accumulate_cycle(self, points: np.ndarray, dt: float, result: FrameResult) -> None:
         """サイクルを検出し、その区間の仕事を積む。"""
@@ -448,14 +469,14 @@ class NetworkMeasurement:
             return
 
         if self._detector.update(value, self.frame_index):
-            result.cycle_detected = True
-            for key in PART_KEYS:
-                series = self._power_history[key]
-                if series:
-                    work = float(np.sum(series) * dt)
-                    self.cycle_work[key].append(work)
-                    result.cycle_work_j[key] = work
-                series.clear()
+            self._close_rep(result)
+
+    def _close_rep(self, result: FrameResult) -> None:
+        """今の回を確定する。仕事はフレームごとの dt で積んだ値（``rep_work``）。"""
+        result.cycle_detected = True
+        for key, work in self.rep_work.reset().items():
+            self.cycle_work[key].append(work.net)
+            result.cycle_work_j[key] = work.net
 
     # -- メモリ管理 --------------------------------------------------------
     def _append_result(self, result: FrameResult) -> None:
