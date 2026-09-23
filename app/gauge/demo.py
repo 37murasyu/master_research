@@ -2,7 +2,7 @@
 
 計測の子プロセス（別セッションが実装）が無くても、被験者ゲージ（GUI）と
 行の形式 v2（``app.gauge.protocol``）を単体で確かめられるようにするための
-道具。3 つの使い方がある:
+道具。4 つの使い方がある:
 
 1. 引数なし: ``GaugeWindow`` を開き、接続待ち 2 秒 → 8 回（うち 1 回は過負荷、
    1 回は不足）→ 終了、を ``QTimer`` で流す。目で見て確かめる用。
@@ -11,8 +11,9 @@
 3. ``--emit``: 標準出力へ ``@@GAUGE `` の行を 1 行ずつ書く。GUI 側（``QProcess``
    で子プロセスの標準出力を読む経路）を、実機・実測が無くても確かめられる。
 
-``--via-worker``（実測と同じ経路で demo を流す）は Task 12 で worker の
-振り分けが入ったあとに別に足す（今回は作らない）。
+4. ``--via-worker``: ``--emit`` を子プロセスとして ``WorkerRunner`` で起動し、
+   親に届いたフレームの数・ログに漏れたゲージの行・終了コード・頻度を 1 行で出す。
+   凍結版（.app）で、実測と同じ経路が通ることを確かめる用。
 
 ``SCENARIOS`` は ``app.gauge.model``・``app.gauge.protocol`` だけで組み立てて
 あり、Qt には依存しない（``--emit`` や ``test_scenario_covers_every_state`` が
@@ -244,12 +245,68 @@ def _emit_frame(i: int) -> GaugeFrame:
 
 
 def _cmd_emit(*, count: int, interval: float, exit_code: int) -> int:
+    # 「毎回 interval 寝る」ではなく「i 回目は開始から i·interval の時刻まで寝る」。
+    # macOS の time.sleep(0.033) は 1 回 8 ms ほど寝過ごし、固定で寝ると 30 Hz が
+    # 24 Hz に落ちる。締め切りで寝れば、寝過ごしを次の回で取り返せる。
+    start = time.perf_counter()
     for i in range(count):
         sys.stdout.write(encode(_emit_frame(i)))
         sys.stdout.flush()
         if interval > 0 and i < count - 1:
-            time.sleep(interval)
+            time.sleep(max(0.0, start + (i + 1) * interval - time.perf_counter()))
     return exit_code
+
+
+# ---------------------------------------------------------------------------
+# --via-worker: 実測と同じ経路（WorkerRunner → 子の --emit → gauge_frame）で流す
+# ---------------------------------------------------------------------------
+
+_VIA_WORKER_TIMEOUT_MS = 30000
+
+
+def _cmd_via_worker(*, count: int, interval: float, exit_code: int) -> int:
+    """子に ``--emit`` を走らせ、親の ``WorkerRunner`` にフレームが届くかを数える。
+
+    凍結版では子も凍結版の実行ファイルを ``--role script`` で呼び直すので、
+    「子の標準出力 → QProcess → LineDemux → gauge_frame」の経路を、実機が無くても
+    .app のまま確かめられる。最後の 1 行に要約を書き、届いた数・ログに漏れた
+    ゲージの行・子の終了コードが期待どおりなら 0 を返す。
+    """
+    from app.core.qt import QtCore
+    from app.core.settings import Settings
+    from app.runners.worker import WorkerRunner
+
+    app = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
+    runner = WorkerRunner(role="script")
+    stamps: list[float] = []
+    leaked = {"n": 0}
+    result = {"code": None}
+
+    def on_output(text: str) -> None:
+        leaked["n"] += text.count("@@GAUGE")
+
+    def on_finished(code: int) -> None:
+        result["code"] = code
+        app.quit()
+
+    runner.gauge_frame.connect(lambda _frame: stamps.append(time.perf_counter()))
+    runner.output.connect(on_output)
+    runner.finished.connect(on_finished)
+    QtCore.QTimer.singleShot(_VIA_WORKER_TIMEOUT_MS, app.quit)
+
+    passthrough = ["--emit", "--count", str(count), "--interval", str(interval), "--exit-code", str(exit_code)]
+    if not runner.start(Settings(), passthrough, module="app.gauge.demo"):
+        print("via-worker: 子を起動できなかった")
+        return 1
+    app.exec()
+
+    rate = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) >= 2 and stamps[-1] > stamps[0] else 0.0
+    print(
+        f"via-worker frames={len(stamps)}/{count} gauge_in_log={leaked['n']} "
+        f"exit={result['code']} rate_hz={rate:.1f}"
+    )
+    ok = len(stamps) == count and leaked["n"] == 0 and result["code"] == exit_code
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -318,12 +375,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count", type=int, default=8, help="--emit で出す行数（既定 8）")
     parser.add_argument("--interval", type=float, default=1.0, help="--emit の行の間隔 [秒]（既定 1.0）")
     parser.add_argument("--exit-code", type=int, default=0, help="--emit の終了コード（既定 0）")
+    parser.add_argument(
+        "--via-worker",
+        action="store_true",
+        help="--emit を子プロセスで走らせ、WorkerRunner に届いたフレームを数える（--count などはそのまま子へ）",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.via_worker:
+        return _cmd_via_worker(count=args.count, interval=args.interval, exit_code=args.exit_code)
     if args.emit:
         return _cmd_emit(count=args.count, interval=args.interval, exit_code=args.exit_code)
     if args.snapshot:
