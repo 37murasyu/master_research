@@ -1,6 +1,7 @@
 import textwrap
 import os
 import time
+import warnings
 
 # pylint: disable=no-member
 import cv2 as cv
@@ -319,8 +320,26 @@ def display_choices(question, a, _=None):
 # P1 = get_projection_matrix(1)
 
 
+class LocalFrameFallbackWarning(RuntimeWarning):
+    """局所座標系を作れず、全体座標の値をそのまま返したことを知らせる。
+
+    リンクが非有限・長さ 0 のときに出る。値はそのまま返す（2026-09-23 に決定、
+    KNOWN_ISSUES §5-4）。100 N·m 級の全体座標の値が ``*_local_*`` 列に黙って紛れ込むのを
+    見逃さないための警告で、Python の既定では呼び出し箇所ごとに 1 回だけ表示される。
+    """
+
+
+def _global_value_with_warning(torque_global, reason):
+    warnings.warn(
+        f"局所座標系を作れない（{reason}）ので、全体座標の値をそのまま返す",
+        LocalFrameFallbackWarning,
+        stacklevel=3,
+    )
+    return torque_global
+
+
 # ローカル座標系に変換する関数
-def compute_joint_power(torque_global, omega_link, omega_parent, link_vec, parent_vec=None):
+def compute_joint_power(torque_global, omega_link, omega_parent, link_vec, parent_vec=None, up_axis=None):
     """関節の仕事率を、局所トルクの y 軸まわりで求める。
 
         P = τ_y × ((ω_link − ω_parent) · y)
@@ -342,7 +361,7 @@ def compute_joint_power(torque_global, omega_link, omega_parent, link_vec, paren
     omega_parent : ndarray, shape (3,) or None
         親部位の角速度（全体座標）。None は親が動かないことを表す
         （例: アームレストを押す手を固定端とみなしたときの手首）。
-    link_vec, parent_vec : ndarray, shape (3,)
+    link_vec, parent_vec, up_axis : ndarray, shape (3,)
         ``compute_local_torque`` と同じ。
 
     Returns
@@ -356,26 +375,34 @@ def compute_joint_power(torque_global, omega_link, omega_parent, link_vec, paren
     # compute_local_torque の中身は「局所座標系への回転」なので角速度にもそのまま使える。
     # τ と ω を必ず同じ関数・同じ引数で射影する。軸を作れず全体座標のまま返るとき
     # （KNOWN_ISSUES §5-4）も、両者の扱いが揃う。
-    tau_local = compute_local_torque(np.asarray(torque_global, dtype=np.float64), link_vec, parent_vec)
-    omega_local = compute_local_torque(omega_rel, link_vec, parent_vec)
+    tau_local = compute_local_torque(np.asarray(torque_global, dtype=np.float64), link_vec, parent_vec, up_axis)
+    omega_local = compute_local_torque(omega_rel, link_vec, parent_vec, up_axis)
     return float(tau_local[1] * omega_local[1])
 
 
-def compute_local_torque(torque_global, link_vec, parent_vec=None):
+def compute_local_torque(torque_global, link_vec, parent_vec=None, up_axis=None):
     """
     グローバル座標系のトルクをリンク基準の右手系に変換する。
 
     - z 軸: リンク方向。
     - y 軸: 親リンク parent_vec が与えられた場合は parent×z を採用し、
       前腕と上腕の法線（肘面）など、両リンクに直交する軸を優先する。
-      parent_vec が無い/退化する場合は従来の基準軸外積にフォールバック。
+      parent_vec が無い/退化する場合は基準軸との外積にフォールバックする。
+      このとき y は「基準軸のうちリンクに直交する成分」になる。
     - x 軸: y×z。
+
+    up_axis は、フォールバックで最初に試す基準軸（鉛直上向き）。省略すると全体座標の z。
+    z が上のリアルタイム経路では省略してよいが、y が鉛直で z が奥行きのカメラ座標
+    （オフラインの入力 CSV）では重力の逆向きを渡すこと（KNOWN_ISSUES §1-5）。
+
+    リンクが非有限・長さ 0 で軸を作れないときは、torque_global をそのまま返して
+    LocalFrameFallbackWarning を出す（§5-4）。
     """
     if not np.all(np.isfinite(link_vec)):
-        return torque_global
+        return _global_value_with_warning(torque_global, "リンクが非有限")
     norm_link = np.linalg.norm(link_vec)
     if norm_link < 1e-12:
-        return torque_global
+        return _global_value_with_warning(torque_global, "リンクの長さが 0")
 
     z_axis = link_vec / norm_link
 
@@ -401,6 +428,11 @@ def compute_local_torque(torque_global, link_vec, parent_vec=None):
         np.array([1.0, 0.0, 0.0]),
         np.array([0.0, 1.0, 0.0]),
     )
+    if up_axis is not None:
+        up = np.asarray(up_axis, dtype=np.float64)
+        up_norm = np.linalg.norm(up)
+        if np.all(np.isfinite(up)) and up_norm > 1e-12:
+            reference_axes = (up / up_norm,) + reference_axes
     x_axis = None
     for ref in reference_axes:
         if abs(np.dot(z_axis, ref)) >= 0.95:
@@ -412,14 +444,14 @@ def compute_local_torque(torque_global, link_vec, parent_vec=None):
         x_axis = candidate / candidate_norm
         break
 
+    # 直交する 3 軸のうち 2 本と同時に |cos| >= 0.95 にはなれないので、ここへは来ないはず。
     if x_axis is None:
-        # どうしても決まらない場合は元の値を返す
-        return torque_global
+        return _global_value_with_warning(torque_global, "基準軸がすべてリンクと平行")
 
     y_axis = np.cross(z_axis, x_axis)
     y_norm = np.linalg.norm(y_axis)
     if y_norm < 1e-12:
-        return torque_global
+        return _global_value_with_warning(torque_global, "y 軸が潰れた")
     y_axis /= y_norm
 
     rotation = np.stack((x_axis, y_axis, z_axis), axis=1)
