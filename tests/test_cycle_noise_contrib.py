@@ -62,3 +62,29 @@ class TestSameWorkAsTheScore:
         row = side_noise_contrib(pose, torque, "R", DT, fps=30.0, fc=3.0,
                                  cycle_idx=np.ones(60, dtype=int))["elbow_R"].iloc[0]
         assert row["work_sig"] + row["work_cross"] + row["work_noi"] == pytest.approx(row["work_J_signed"])
+
+
+@pytest.mark.parametrize("excluded", [False, True])
+def test_subject_four_is_only_excluded_when_requested(tmp_path, monkeypatch, excluded):
+    """論文のノイズ評価は被験者4を含むため、コードに固定した除外で落とさない。"""
+    import sys
+    import compute_cycle_noise_contrib as noise
+
+    pose_dir, torque_dir, out = (tmp_path / name for name in ("pose", "torque", "out"))
+    pose_dir.mkdir()
+    torque_dir.mkdir()
+    pose, torque = _frames(60, omega=1.5)
+    pose["frame"] = torque["frame"] = np.arange(60)
+    pose["cycle_index"] = 1
+    pose.to_csv(pose_dir / "4_0stereo_pose_lpf_with_cycles.csv", index=False)
+    torque.to_csv(torque_dir / "4_0stereo_pose_torque_lpf.csv", index=False)
+    args = ["noise", "--pose-dir", str(pose_dir), "--torque-dir", str(torque_dir),
+            "--out-dir", str(out), "--pose-unit", "m"]
+    if excluded:
+        args += ["--exclude-subjects", "4"]
+    monkeypatch.setattr(sys, "argv", args)
+    assert noise.main() == 0
+    files = sorted(out.glob("*.csv"))
+    assert len(files) == (0 if excluded else 2)
+    if not excluded:
+        assert all(pd.read_csv(path).subject_id.eq(4).all() for path in files)

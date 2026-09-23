@@ -203,6 +203,8 @@ def main() -> int:
     ap.add_argument("--torque-scale", type=float, default=1.0, help="scale torque (e.g., 0.01 if N*cm -> N*m)")
     ap.add_argument("--fc", type=float, default=3.0, help="cutoff frequency [Hz] for noise split")
     ap.add_argument("--out-dir", default="output_data/cycle_energy_noise", help="output directory")
+    ap.add_argument("--exclude-subjects", type=int, nargs="*", default=[],
+                    help="除外する被験者 ID。既定は除外なし（論文のノイズ評価は4を含む）")
     args = ap.parse_args()
 
     pose_dir = Path(args.pose_dir)
@@ -214,7 +216,7 @@ def main() -> int:
     for pose_path in pose_files:
         stem = pose_path.stem.replace("_with_cycles", "")
         subject_id = _parse_subject_id(stem)
-        if subject_id is None or subject_id == 4:
+        if subject_id is None or subject_id in args.exclude_subjects:
             continue
 
         torque_path = _map_torque_csv(torque_dir, pose_path)

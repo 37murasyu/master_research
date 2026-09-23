@@ -162,7 +162,7 @@ def _detect_in_range(
         mask = (frames >= start_frame) & (frames <= end_frame)
     idx = np.where(mask)[0]
     if idx.size == 0:
-        return [], idx
+        return [], idx, 0, 0.0, 0.0
 
     y_sel = y_m[idx]
     # robust clip to reduce outliers

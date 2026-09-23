@@ -228,6 +228,7 @@ COM_FRACTIONS = {
 #
 # ただし上腕の 0.0227 は Winter（0.028）ではなく、config.m1 と慣性回帰式の行（utils_dynamic の
 # _SEGMENT_MASS_FRACTION）に合わせた値。出典は未確認（KNOWN_ISSUES §5-5）。
+# 初期コミットの参考URLのサンプルコードは 0.027 であり、0.0227 の根拠にはならない。
 #
 # 手の慣性テンソル（慣性係数 CSV の行 5）はどこでも使わない。プッシュアップの鎖では手を
 # アームレストに置いた固定端とし、腕を肩から吊る鎖では手首の質点とする（push_up_model）。
@@ -397,19 +398,19 @@ G_SCALAR = float(np.linalg.norm(g))
 THEORETICAL_WORK_COEFF = WORK_INTEGRAL_K * G_SCALAR
 
 # 部位別の等価質量係数（体重に対する比）。
-# wrist: 上腕 0.026 + 上肢 (0.276 + 0.19) + 太もも 0.123
-# elbow: 上肢 (0.276 + 0.19) + 太もも 0.123
+# wrist: 上腕 0.026 + 体幹（上胴体＋下胴体、0.276 + 0.19） + 太もも 0.123
+# elbow: 体幹（上胴体＋下胴体、0.276 + 0.19） + 太もも 0.123
 # master_research_code.py が和を組み立て、offline_wrist_energy.py が潰した値を
 # 直書きしており、片方だけ直すと食い違う状態だった。
 EFFECTIVE_MASS_COEFFS = {
     "upper_arm": 0.026,
-    "upper_limb": 0.276 + 0.19,
+    "torso": 0.276 + 0.19,
     "thigh": 0.123,
 }
 EFFECTIVE_MASS_BY_JOINT = {
     "wrist": (EFFECTIVE_MASS_COEFFS["upper_arm"]
-              + EFFECTIVE_MASS_COEFFS["upper_limb"]
+              + EFFECTIVE_MASS_COEFFS["torso"]
               + EFFECTIVE_MASS_COEFFS["thigh"]),
-    "elbow": EFFECTIVE_MASS_COEFFS["upper_limb"] + EFFECTIVE_MASS_COEFFS["thigh"],
+    "elbow": EFFECTIVE_MASS_COEFFS["torso"] + EFFECTIVE_MASS_COEFFS["thigh"],
     "shoulder": 0.0,   # 仕様未定
 }

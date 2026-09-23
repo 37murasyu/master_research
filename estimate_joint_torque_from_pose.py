@@ -4,6 +4,9 @@
 本版では `compute_torque_from_pose` の逆動力学パイプラインを呼び出し、慣性・遠心/コリオリ・重力・
 セグメント間の力伝播を含む完全な剛体モデルでトルクを算出します。
 出力CSVの列構成は従来と同じ (frame + 各部位の x/y/z トルク) です。
+
+旧CLIの互換用です。手首の簡易推定と支持荷重の式は旧方式を維持しています。
+論文の再計算には共有プッシュアップモデルを使う compute_torque_from_pose.py を使用してください。
 """
 
 from __future__ import annotations
@@ -14,12 +17,12 @@ import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import pandas as pd
 
 from compute_torque_from_pose import (
     LEFT_SEGMENTS,
     OUTPUT_PART_ORDER,
     RIGHT_SEGMENTS,
+    SEGMENT_TO_OUTPUT,
     build_output,
     compute_side_torques,
     interpolate_and_smooth,
@@ -363,7 +366,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     wrist_R_local = compute_local_from_global(wrist_R_global, wrist_R_link)
     wrist_L_local = compute_local_from_global(wrist_L_global, wrist_L_link)
 
-    df_all, meta_shapes = build_output(frames, tau_g_right, tau_l_right, tau_g_left, tau_l_left)
+    # 現行の出力 API は関節名をキーに取る。配列の順序だけで列に割り当てると、
+    # 肩と肘が入れ替わるので、共有の対応表を使う。
+    global_map, local_map = {}, {}
+    for segments, tau_g, tau_l in (
+        (RIGHT_SEGMENTS, tau_g_right, tau_l_right),
+        (LEFT_SEGMENTS, tau_g_left, tau_l_left),
+    ):
+        for index, segment in enumerate(segments):
+            part = SEGMENT_TO_OUTPUT[segment.name]
+            global_map[part] = tau_g[:, index, :]
+            local_map[part] = tau_l[:, index, :]
+    df_all = build_output(frames, global_map, local_map)
+    meta_shapes = {
+        "tau_global_right": tau_g_right.shape,
+        "tau_local_right": tau_l_right.shape,
+        "tau_global_left": tau_g_left.shape,
+        "tau_local_left": tau_l_left.shape,
+    }
 
     for side, g_vals, l_vals in (("R", wrist_R_global, wrist_R_local), ("L", wrist_L_global, wrist_L_local)):
         df_all[f"wrist_{side}_x"] = g_vals[:, 0]
