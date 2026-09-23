@@ -20,6 +20,7 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 
 from app.hybrid.calibration_io import load_session_calibration, write_json
+from app.hybrid.ekf import EkfSettings
 from app.hybrid.measurement import MeasurementSession
 from app.hybrid.retriangulate import read_landmarks
 from app.net.protocol import LandmarkFrame
@@ -77,8 +78,10 @@ def replay(session_dir: str | Path, *, root: str | Path, start_s: float = 0.0, e
     source_meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
     calibration = load_session_calibration(session_dir)
     if config is None:
+        # 計測の子と同じく EKF の設定は環境変数から読む（MeasurementConfig の既定は環境変数を見ない）
         config = MeasurementConfig(body_mass_kg=float(source_meta.get("body_mass_kg", 65.0)),
-                                   gravity_mode=source_meta.get("gravity_mode", "axis"))
+                                   gravity_mode=source_meta.get("gravity_mode", "axis"),
+                                   ekf=EkfSettings.from_env())
     measurement = MeasurementSession(
         calibration, root=Path(root), config=config,
         metadata={"replay_of": str(session_dir), "replay_from_s": start_s, "replay_to_s": end_s,

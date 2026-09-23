@@ -21,6 +21,8 @@ import pandas as pd
 import pytest
 
 import app.hybrid.replay as rp
+from app.hybrid.ekf import EkfSettings
+from app.runners.network_measure import MeasurementConfig
 from app.hybrid.retriangulate import read_landmarks
 from test_hybrid_verification import _expected, make_body_run
 
@@ -47,8 +49,11 @@ class TestMergedFrames:
 
 class TestReplay:
     def test_replay_reproduces_the_measurement_through_the_sync_buffer(self, tmp_path):
+        """配管の検査なので EKF は切る（この体は 1.2 Hz で奥行きに速く揺れ、Pixel 12 Hz の補間の点を EKF の門が
+        外れ値と見て 20 cm 級の飛びを作る。押し上げの速さでは起きない。2026-09-24 の検証、KNOWN_ISSUES §6-10）。"""
         session = make_body_run(tmp_path, seconds=3.0)
-        out = rp.replay(session, root=tmp_path / "replay", speed=0)
+        out = rp.replay(session, root=tmp_path / "replay", speed=0,
+                        config=MeasurementConfig(body_mass_kg=65.0, ekf=EkfSettings(enabled=False)))
         stamp, meta = _outputs(out)
         assert out.parent == tmp_path / "replay", "再生の記録は計測の記録と混ざらない場所に書く"
         assert meta["status"] == "complete"
