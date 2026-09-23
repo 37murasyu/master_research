@@ -234,6 +234,16 @@ def test_done_shows_prev_ticks_without_values():
     assert scene.find("state", "elbow_L") == []
 
 
+def test_done_keeps_prev_tick_when_last_now_is_null():
+    # 最後のフレームで今回値が NaN（null）でも、終了後の前回の目盛りは残す。
+    parts = {"elbow_L": PartReading(now=None, prev=70.0, band=BAND)}
+    state = gm.finish(_running_state(parts), exit_code=0)
+    scene = sc.build_scene(state)
+
+    assert len(scene.find("prev", "elbow_L")) == 1
+    assert scene.find("value", "elbow_L") == []
+
+
 def test_failed_keeps_previous_dials():
     parts = {"elbow_L": PartReading(now=90.0, prev=70.0, band=BAND)}
     running = _running_state(parts)
