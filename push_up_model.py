@@ -91,7 +91,7 @@ def estimate_gravity(trunk_up, magnitude: float, mode: str = "axis") -> GravityE
         up = trunk.copy()
     lean = float(np.degrees(np.arccos(np.clip(np.dot(trunk, up), -1.0, 1.0))))
     return GravityEstimate(
-        vector=-float(magnitude) * up, up=up, trunk_up=trunk,
+        vector=-float(magnitude) * up + 0.0, up=up + 0.0, trunk_up=trunk,
         lean_deg=lean, mode=mode, samples=int(usable.sum()))
 
 

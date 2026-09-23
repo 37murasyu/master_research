@@ -22,6 +22,10 @@ QThread から呼ぶと "Unknown C++ exception from OpenCV code" になる（実
 
 from __future__ import annotations
 
+import shutil
+import tempfile
+from pathlib import Path
+
 from app import entry
 from app.core.qt import QtCore
 from app.core.settings import Settings
@@ -48,6 +52,8 @@ class WorkerRunner(QtCore.QObject):
         self._process.readyReadStandardOutput.connect(self._drain_output)
         self._process.finished.connect(self._on_finished)
         self._process.errorOccurred.connect(self._on_error)
+        # 停止要求のファイルを置くディレクトリ。実行ごとに作り直すので前回の残りを考えなくてよい
+        self._stop_dir: str | None = None
 
     # -- 操作 --------------------------------------------------------------
     @property
@@ -72,7 +78,8 @@ class WorkerRunner(QtCore.QObject):
             return False
 
         command = entry.worker_command(self.role, passthrough, module=module)
-        environment = entry.worker_environment(settings, role=self.role)
+        self._stop_dir = tempfile.mkdtemp(prefix="wt_stop_")
+        environment = entry.worker_environment(settings, role=self.role, stop_file=self._stop_file())
 
         process_env = QtCore.QProcessEnvironment()
         for key, value in environment.items():
@@ -103,12 +110,22 @@ class WorkerRunner(QtCore.QObject):
 
         計測終了時に 3D 座標とトルクの CSV を書き出すので、
         いきなり kill すると成果物が失われる。
+
+        計測（realtime）には停止ファイルを置いて知らせる。スクリプトはループの先頭でそれを見て抜け、
+        終了時の書き出しをする（``app.core.stop_request``）。かつては ``terminate()`` だけで、
+        POSIX の SIGTERM ではハンドラが無く即死し、Windows では WM_CLOSE がコンソールに届かず、
+        どちらでも CSV が書かれなかった（KNOWN_ISSUES §3-2）。停止ファイルを見ない役割
+        （キャリブレーション・解析スクリプト）には従来どおり ``terminate()`` を送る。
         """
         if not self.is_running:
             return
 
         self.output.emit("[停止] 終了を要求しました。CSV の書き出しを待ちます。\n")
-        self._process.terminate()
+        stop_file = self._stop_file()
+        if self.role == "realtime" and stop_file is not None:
+            Path(stop_file).touch()
+        else:
+            self._process.terminate()
 
         if not self._process.waitForFinished(self.GRACE_MS):
             self.output.emit("[停止] 応答が無いため強制終了します。\n")
@@ -116,6 +133,9 @@ class WorkerRunner(QtCore.QObject):
             self._process.waitForFinished(2000)
 
     # -- 内部 --------------------------------------------------------------
+    def _stop_file(self) -> str | None:
+        return None if self._stop_dir is None else str(Path(self._stop_dir) / "stop")
+
     def _drain_output(self) -> None:
         data = self._process.readAllStandardOutput()
         text = bytes(data).decode("utf-8", errors="replace")
@@ -124,6 +144,9 @@ class WorkerRunner(QtCore.QObject):
 
     def _on_finished(self, exit_code: int, _status) -> None:
         self._drain_output()
+        if self._stop_dir is not None:
+            shutil.rmtree(self._stop_dir, ignore_errors=True)
+            self._stop_dir = None
         self.output.emit(f"[終了] 終了コード {exit_code}\n")
         self.state_changed.emit("stopped")
         self.finished.emit(exit_code)

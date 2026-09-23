@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 
 from app.core import resources
 from app.core.settings import Settings
+from app.core.stop_request import STOP_FILE_ENV
 
 __all__ = [
     "ParsedArgs",
@@ -124,7 +125,9 @@ def worker_command(
     return [sys.executable, "-m", "app", *role_args, *extra]
 
 
-def worker_environment(settings: Settings, role: str = "realtime") -> dict[str, str]:
+def worker_environment(
+    settings: Settings, role: str = "realtime", stop_file: str | None = None
+) -> dict[str, str]:
     """ワーカーに渡す環境変数。
 
     親の環境を引き継いだうえで、アプリの設定で**上書きする**。
@@ -133,10 +136,16 @@ def worker_environment(settings: Settings, role: str = "realtime") -> dict[str, 
 
     設定は全件を明示的に渡す（``Settings.as_env`` を参照）。差分だけ渡すと、
     渡さなかった項目は既存スクリプト側の既定値が効いてしまう。
+
+    ``stop_file`` は停止要求のファイルのパス（``app.core.stop_request``）。親の環境に
+    残った古い値を引き継がないよう、渡さないときは消す。
     """
     env = dict(os.environ)
     env.update(settings.as_env())
     env["APP_ROLE"] = role
+    env.pop(STOP_FILE_ENV, None)
+    if stop_file:
+        env[STOP_FILE_ENV] = str(stop_file)
     return env
 
 

@@ -24,6 +24,7 @@ import cv2 as cv
 # japanize_matplotlib は distutils.version を import するため Python 3.12 で動かない
 # （distutils が標準ライブラリから削除された）。
 from app.core.resources import configure_matplotlib_japanese
+from app.core.stop_request import StopRequest
 
 configure_matplotlib_japanese()
 import matplotlib.pyplot as plt
@@ -2731,7 +2732,7 @@ _dyn_dt_warned = False
 # ===================== EKF 較正用の生 3D 座標 =====================
 # 三角測量の直後・EKF の手前の値を、処理したフレームごとに追記する
 # （docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md の「実装 0」）。
-# 終了時にまとめて書かないのは、GUI の停止が SIGTERM で終了時処理が走らないため。
+# 終了時にまとめて書かないのは、停止の猶予（10 秒）を過ぎて kill されても残すため。
 # 3D 点の並びはランドマーク ID の昇順（config.py の pose_keypoints の説明を参照）。
 # frame 列はカメラのフレーム番号（skip_counter）なので、差から間引き幅が読める。
 _raw_capture = RawCaptureWriter(
@@ -2782,7 +2783,18 @@ _dyn_active = (not RT_DYN_ON_RISE_ONLY)
 _dyn_sit_consec = 0
 _dyn_start_frame = None
 
+# GUI からの停止要求（KNOWN_ISSUES §3-2）。GUI は停止ファイルを置き、ここでそれを見てループを抜ける。
+# 抜ければループの後の CSV の書き出しが走る。SIGTERM（Windows は SIGBREAK）も同じ扱い。
+# ループの直前で入れるのは、初期化中（カメラやモデルの読み込み）のシグナルは従来どおり即死させるため。
+_stop_request = StopRequest.from_environment()
+_stop_request.install_signal_handlers()
+
 while True:
+    # ループの先頭で見る。途中に continue が多く（間引き・慣性テンソルの暖機・姿勢が取れない間）、
+    # 末尾の 'q' 判定まで届かない周回がある。
+    if _stop_request.requested():
+        print("[STOP] 停止要求を受けました。ループを抜けて CSV を書き出します", flush=True)
+        break
     start_time = time.perf_counter()
     _perf.begin_loop()
     # 総ループ数（grabベースで進める）

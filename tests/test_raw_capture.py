@@ -6,10 +6,11 @@ EKF の ``(q_acc, r)`` を最尤推定するには、EKF を通す**前**の 3D 
 既存の ``kpts3d_{timestamp}.csv`` は EKF 後の値を 4 桁に丸めたもので、
 しかも計測ループを抜けた後にまとめて書いている（``master_research_code.py`` の終了時処理）。
 
-GUI の停止は ``QProcess.terminate()``（``app/runners/worker.py``）で、macOS/Linux では
-SIGTERM になる。リポジトリに SIGTERM ハンドラは無く、Python の既定ではこのとき
-終了時処理も atexit も走らない。**終了時にまとめて書く方式では、GUI から止めた試技の
-生データが残らない。** そこで 1 行ごとに flush し、由来を記すサイドカー JSON は起動時に書く。
+かつて GUI の停止は ``QProcess.terminate()``（SIGTERM）だけで、ハンドラが無く終了時処理も
+atexit も走らなかった。いまは停止ファイルでループを抜けて終了時処理を走らせる
+（``app.core.stop_request``、KNOWN_ISSUES §3-2）が、応答が無ければ猶予 10 秒の後に kill される。
+**終了時にまとめて書く方式では、そのとき生データが残らない。** そこで 1 行ごとに flush し、
+由来を記すサイドカー JSON は起動時に書く。
 
 設計: ``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` の「実装 0」（S1）。
 """
@@ -103,10 +104,11 @@ class TestStreaming:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM の既定動作は POSIX の前提")
 class TestTermination:
-    """GUI の停止（SIGTERM）で落ちても、そこまでの行が残ること。
+    """ハンドラの無いプロセスが SIGTERM で落ちても、そこまでの行が残ること。
 
-    同時に「SIGTERM では終了時処理が走らない」という設計の前提そのものも確かめる。
-    この前提が崩れたら（誰かがハンドラを入れたら）、終了時保存でも足りるようになる。
+    計測スクリプトは停止要求を受けてループを抜けるようになった（``tests/test_stop_request.py``）が、
+    応答が無ければ kill される。そのときも flush 済みの行は残る、という保険をここで確かめる。
+    子は停止要求を見ないので、SIGTERM では終了時処理が走らない。
     """
 
     def test_rows_survive_sigterm_while_end_of_run_code_never_runs(self, tmp_path):
