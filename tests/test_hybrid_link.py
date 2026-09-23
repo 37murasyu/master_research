@@ -261,3 +261,14 @@ class TestPhoneLink:
                 link.start()
         finally:
             listener.close()
+
+
+def test_mode_switch_does_not_use_delayed_preview_for_calibration():
+    link = PhoneLink(capture_mode=PREVIEW)
+    old = link._scheduler.next_request()
+    link.set_capture_mode(CALIBRATION)
+    link._handle_capture(p.CalibrationFrame('cam1', old.id, 1, 640, 360, b'jpeg'))
+    assert link.take_capture() is None
+    current = link._scheduler.next_request()
+    link._handle_capture(p.CalibrationFrame('cam1', current.id, 2, 1280, 720, b'jpeg'))
+    assert link.take_capture().id == current.id

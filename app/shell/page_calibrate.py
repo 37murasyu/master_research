@@ -14,6 +14,7 @@ from __future__ import annotations
 from app.core.platform_compat import enumerate_camera_device_names, is_macos
 from app.core.qt import QtCore, QtWidgets
 from app.core.settings import Settings
+from app.hybrid import paths as hybrid_paths
 from app.shell.widgets import RunnerPage
 
 __all__ = ["CalibratePage"]
@@ -63,7 +64,7 @@ class CalibratePage(RunnerPage):
 
     # -- 骨格への差し込み --------------------------------------------------
     def widgets_disabled_while_running(self) -> list[QtWidgets.QWidget]:
-        return [self._start_button, self._detect_button]
+        return [self._start_button, self._detect_button, self._input_mode]
 
     def widgets_enabled_while_running(self) -> list[QtWidgets.QWidget]:
         return [self._stop_button]
@@ -72,6 +73,14 @@ class CalibratePage(RunnerPage):
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        self._input_mode = QtWidgets.QComboBox()
+        self._input_mode.addItems(["入力: USB カメラ 2 台", "入力: Mac＋Pixel（混成）"])
+        self._input_mode.currentIndexChanged.connect(self._change_input)
+        layout.addWidget(self._input_mode)
+        self._output_label = QtWidgets.QLabel("出力先: camera_parameters")
+        self._output_label.setWordWrap(True)
+        layout.addWidget(self._output_label)
 
         box = QtWidgets.QGroupBox("接続されているカメラ")
         box_layout = QtWidgets.QVBoxLayout(box)
@@ -104,6 +113,11 @@ class CalibratePage(RunnerPage):
         layout.addWidget(steps)
         layout.addStretch(1)
         return panel
+
+    def _change_input(self, index: int) -> None:
+        self._runner.role = "hybrid_calibrate" if index else "calibrate"
+        directory = hybrid_paths.calibration_root() if index else "camera_parameters"
+        self._output_label.setText(f"出力先: {directory}")
 
     # -- カメラ検出 --------------------------------------------------------
     def _detect_cameras(self) -> None:

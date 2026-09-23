@@ -47,6 +47,8 @@ __all__ = [
 WORKER_MODULES = {
     "realtime": "master_research_code",
     "calibrate": "calib",
+    "hybrid_calibrate": "app.runners.hybrid_calibrate",
+    "hybrid_measure": "app.runners.hybrid_measure",
 }
 
 # オフライン解析用の汎用役割。実行するモジュール名は --module で指定する。
@@ -103,6 +105,10 @@ def resolve_module(role: str, module: str | None = None) -> str:
         valid = ", ".join((*WORKER_MODULES, SCRIPT_ROLE))
         raise ValueError(f"ワーカーの役割が不正: {role}（有効: {valid}）")
     return resolved
+
+
+def uses_stop_file(role: str) -> bool:
+    return role in {"realtime", "hybrid_calibrate", "hybrid_measure"}
 
 
 def worker_command(

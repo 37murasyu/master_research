@@ -135,6 +135,8 @@ class SessionHandler:
         on_hello: Callable[[p.Hello], str | None] | None = None,
         remote_roles: Sequence[str] = p.ROLES,
         on_landmarks: Callable[[p.LandmarkFrame], None] | None = None,
+        accept_frame: Callable[[p.LandmarkFrame], bool] | None = None,
+        require_hello: bool = False,
     ):
         self._buffer = buffer
         self._clock = clock
@@ -144,6 +146,8 @@ class SessionHandler:
         # 端末に許す役割。混成構成では cam0 を PC のカメラが受け持つので cam1 だけになる。
         self._remote_roles = tuple(remote_roles)
         self._on_landmarks = on_landmarks
+        self._accept_frame = accept_frame
+        self._require_hello = require_hello
         self.role: str | None = None
         self.device: str | None = None
         self.device_id: str | None = None
@@ -165,6 +169,8 @@ class SessionHandler:
 
     def _accepts(self, role: str) -> bool:
         """この接続から来た ``role`` の電文を使ってよいか。"""
+        if self._require_hello and self.hello is None:
+            return False
         if role not in self._remote_roles:
             return False
         # 名乗った役割と違う点は使わない。混ざると補間が 2 台の間を行き来する。
@@ -196,6 +202,8 @@ class SessionHandler:
                 return None
             self.role = message.role
             self.frames_received += 1
+            if self._accept_frame is not None and not self._accept_frame(message):
+                return None
             self._buffer.push(message)
             if self._on_landmarks is not None:
                 self._on_landmarks(message)
@@ -246,9 +254,15 @@ class LandmarkServer:
         on_hello: Callable[[p.Hello], str | None] | None = None,
         remote_roles: Sequence[str] = p.ROLES,
         on_landmarks: Callable[[p.LandmarkFrame], None] | None = None,
+        accept_frame: Callable[[p.LandmarkFrame], bool] | None = None,
+        require_hello: bool = False,
+        close_timeout: float = 10.0,
     ):
         self.host = host
         self._requested_port = port
+        # 閉じるときに相手の応答を待つ上限（秒）。websockets の既定は 10 秒。
+        # 応答しない端末が 1 台いると、stop() がこの時間だけ戻らない。
+        self._close_timeout = close_timeout
         self.buffer = buffer if buffer is not None else SyncBuffer()
         self._on_pairs = on_pairs
         self._clock = clock
@@ -263,7 +277,10 @@ class LandmarkServer:
         self.remote_roles = tuple(remote_roles)
         # 受信した点も注入した点も、組になる前にここへ流す（生 2D の記録と表示用）。
         self._on_landmarks = on_landmarks
+        self._accept_frame = accept_frame
+        self._require_hello = require_hello
         self._injected = 0
+        self._finished_counts = dict(frames_received=0, errors=0, rejected=0)
 
         self._server: Server | None = None
         self._handlers: dict[int, SessionHandler] = {}
@@ -291,6 +308,7 @@ class LandmarkServer:
             self.host,
             self._requested_port,
             max_size=p.MAX_CALIBRATION_BYTES * 2,
+            close_timeout=self._close_timeout,
         )
 
     async def stop(self) -> None:
@@ -318,6 +336,8 @@ class LandmarkServer:
             on_hello=self._on_hello,
             remote_roles=self.remote_roles,
             on_landmarks=self._on_landmarks,
+            accept_frame=self._accept_frame,
+            require_hello=self._require_hello,
         )
         key = id(connection)
         self._handlers[key] = handler
@@ -339,6 +359,8 @@ class LandmarkServer:
         except websockets.exceptions.ConnectionClosed:
             pass  # 端末が離脱しただけ。計測は続行する
         finally:
+            for name in self._finished_counts:
+                self._finished_counts[name] += getattr(handler, name)
             self._handlers.pop(key, None)
             self._connections.pop(key, None)
 
@@ -348,7 +370,7 @@ class LandmarkServer:
         アプリを入れ直したり QR を読み直したりすると、古い接続は相手が消えたことに
         気づくまで（数十秒）残る。先勝ちにすると、その間は読み直した端末が使えない。
 
-        閉じ終わるのは**待たない**。相手が応答しないと close は close_timeout（10 秒）
+        閉じ終わるのは**待たない**。相手が応答しないと close は close_timeout（既定 10 秒）
         まで戻らず、その間、新しい端末の時刻同期が止まる。役割は ``retire`` で
         すぐ外れるので、閉じ終わる前に届いた電文も使われない。
         """
@@ -375,6 +397,8 @@ class LandmarkServer:
         注入は電文の検証を通らないので、ここで同じ条件を確かめる（``check_injectable``）。
         """
         check_injectable(frame, self.remote_roles, self.buffer.roles)
+        if self._accept_frame is not None and not self._accept_frame(frame):
+            return
         self.buffer.push(frame)
         self._injected += 1
         if self._on_landmarks is not None:
@@ -439,10 +463,10 @@ class LandmarkServer:
         return {
             "clients": len(self._handlers),
             "roles": self.connected_roles,
-            "frames_received": sum(h.frames_received for h in self._handlers.values()),
+            "frames_received": self._finished_counts["frames_received"] + sum(h.frames_received for h in self._handlers.values()),
             "frames_injected": self._injected,
-            "protocol_errors": sum(h.errors for h in self._handlers.values()),
-            "role_mismatches": sum(h.rejected for h in self._handlers.values()),
+            "protocol_errors": self._finished_counts["errors"] + sum(h.errors for h in self._handlers.values()),
+            "role_mismatches": self._finished_counts["rejected"] + sum(h.rejected for h in self._handlers.values()),
             **self.buffer.stats,
         }
 

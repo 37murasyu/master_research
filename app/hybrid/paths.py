@@ -1,0 +1,26 @@
+"""混成ステレオの出力先。
+
+GUI（``app.shell``）からも使うので、cv2 などの重いモジュールを読まない。出力先を決めるのは
+ここだけにする。以前は校正・計測・GUI の 2 画面で同じパスを別々に書いていて、片方だけ
+変えると画面の表示と実際の書き込み先が食い違う。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from app.core.platform_compat import user_output_dir
+from app.core.settings import APP_NAME
+
+
+def hybrid_root() -> Path:
+    """USB 経路の出力（``user_output_dir(APP_NAME)``）と同じ場所の下に置く。"""
+    return user_output_dir(APP_NAME) / "hybrid"
+
+
+def calibration_root() -> Path:
+    return hybrid_root() / "calibration"
+
+
+def measurement_root() -> Path:
+    return hybrid_root() / "measure"

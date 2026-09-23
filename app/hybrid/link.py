@@ -83,13 +83,23 @@ class CaptureScheduler:
         self._outstanding: int | None = None
         self._issued_at: float | None = None
         self.timeouts = 0
+        self._revision = 0
+        self._request_revisions: dict[int, int] = {}
 
     @property
     def mode(self) -> CaptureMode:
         return self._mode
 
     def set_mode(self, mode: CaptureMode) -> None:
+        if mode != self._mode:
+            self._revision += 1
+            self._outstanding = None
+            self._issued_at = None
         self._mode = mode
+
+    def accepts_capture(self, capture_id: int) -> bool:
+        """切替前の縮小 JPEG を全解像度の校正画像として使わない。"""
+        return self._request_revisions.get(capture_id) == self._revision
 
     def next_request(self) -> p.CaptureRequest | None:
         """今出すべき要求があれば作って返す（出したものとして記録する）。"""
@@ -108,6 +118,9 @@ class CaptureScheduler:
         request = p.CaptureRequest(
             id=self._next_id, max_width=self._mode.max_width, quality=self._mode.quality
         )
+        self._request_revisions[request.id] = self._revision
+        if len(self._request_revisions) > 64:
+            del self._request_revisions[next(iter(self._request_revisions))]
         self._next_id += 1
         self._outstanding = request.id
         self._issued_at = now
@@ -174,8 +187,13 @@ class PhoneLink:
         capture_mode: CaptureMode = OFF,
         capture_timeout_s: float = 1.0,
         history: int = 90,
+        accept_frame: Callable[[p.LandmarkFrame], bool] | None = None,
+        on_tick: Callable[[], None] | None = None,
+        on_stop: Callable[[], None] | None = None,
     ):
         self.remote_role = remote_role
+        self._user_on_tick = on_tick
+        self._user_on_stop = on_stop
         self._advertise_host = advertise_host
         self._user_on_pairs = on_pairs
         self._user_on_landmarks = on_landmarks
@@ -192,6 +210,11 @@ class PhoneLink:
             on_calibration_frame=self._handle_capture,
             on_hello=self._check_hello,
             remote_roles=(remote_role,),
+            accept_frame=accept_frame,
+            require_hello=True,
+            # GUI からの停止は 2 秒以内に終える。Pixel が応答しない（画面を消した、
+            # Wi-Fi が切れた）ときに、閉じる挨拶を既定の 10 秒も待たない。
+            close_timeout=0.5,
         )
         self._scheduler = CaptureScheduler(capture_mode, timeout_s=capture_timeout_s)
 
@@ -263,9 +286,16 @@ class PhoneLink:
         """ライブ表示・校正・停止を切り替える。"""
         loop = self._loop
         if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(self._scheduler.set_mode, mode)
+            loop.call_soon_threadsafe(self._set_mode, mode)
         else:
-            self._scheduler.set_mode(mode)
+            self._set_mode(mode)
+
+    def _set_mode(self, mode: CaptureMode) -> None:
+        if mode != self._scheduler.mode:
+            with self._lock:
+                self._latest_capture = None
+                self._capture_taken = True
+        self._scheduler.set_mode(mode)
 
     def take_capture(self) -> p.CalibrationFrame | None:
         """前回から新しく届いた画像があれば返す。無ければ None。"""
@@ -327,8 +357,12 @@ class PhoneLink:
             if remaining:
                 self._deliver_pairs(remaining)
             self._refresh_status()
+            if self._user_on_stop is not None:
+                self._guarded("on_stop", self._user_on_stop)
 
     async def _tick(self) -> None:
+        if self._user_on_tick is not None:
+            self._guarded("on_tick", self._user_on_tick)
         # 端末が名乗るまでは要求を出さない（出すと、繋がる前に時間切れが積み上がる）
         if self._server.devices:
             request = self._scheduler.next_request()
@@ -345,8 +379,8 @@ class PhoneLink:
             captures, errors = self._captures_received, self._callback_errors
         remote_fps = 0.0
         if recent:
-            newest = recent[-1]
-            remote_fps = float(sum(1 for t in recent if newest - t < 1_000_000_000))
+            newest = time.monotonic_ns()
+            remote_fps = float(sum(1 for t in recent if 0 <= newest - t < 1_000_000_000))
         status = LinkStatus(
             url=self.url,
             devices=dict(self._server.devices),
@@ -386,6 +420,8 @@ class PhoneLink:
 
     def _handle_capture(self, frame: p.CalibrationFrame) -> None:
         self._scheduler.complete(frame.id)
+        if not self._scheduler.accepts_capture(frame.id):
+            return
         with self._lock:
             # 時間切れの後に遅れて届いた画像も、画像としては正しいので使う
             self._latest_capture = frame

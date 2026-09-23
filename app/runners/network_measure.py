@@ -40,6 +40,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Sequence
 
+import cv2 as cv
 import numpy as np
 
 # これらはフレームが流れ始める前に払っておく。関数内 import にすると、
@@ -69,6 +70,19 @@ from utils import PushCycleDetector, compute_local_torque
 from utils_dynamic import calculate_inertia_tensor, compute_triangulate_transform_native
 
 from app.net.sync_buffer import PairedSample
+
+# 歪み補正で扱う画像の外側の余白（幅・高さに対する比）。NetworkMeasurement._undistort を参照。
+_UNDISTORT_MARGIN = 0.1
+
+
+def _translate_image(P: np.ndarray, shift: np.ndarray) -> np.ndarray:
+    """画像座標を ``shift`` だけ平行移動したときの射影行列 ``S @ P``。
+
+    像 x = P X を x' = x + shift に移すのは、同次座標で S = [[1, 0, sx], [0, 1, sy], [0, 0, 1]]
+    を左から掛けることに等しい。座標と射影行列の両方に同じ S を掛ければ、三角測量の解 X は変わらない。
+    """
+    S = np.array([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]], [0.0, 0.0, 1.0]])
+    return S @ P
 
 __all__ = ["NetworkMeasurement", "FrameResult", "MeasurementConfig"]
 
@@ -153,6 +167,7 @@ class NetworkMeasurement:
         projection_right: np.ndarray,
         pose_keypoints: Sequence[int],
         config: MeasurementConfig | None = None,
+        lens: dict | None = None,
     ):
         self.P0 = np.asarray(projection_left, dtype=np.float64)
         self.P1 = np.asarray(projection_right, dtype=np.float64)
@@ -160,6 +175,19 @@ class NetworkMeasurement:
         # 取り出し順はランドマーク ID の昇順で固定。毎フレーム並べ替えない。
         self._keypoints_in_id_order = sorted(self.pose_keypoints)
         self.config = config or MeasurementConfig()
+        # 役割 → 内部パラメータ（K、歪み係数、画像寸法）。None なら歪み補正をしない。
+        self.lens = lens
+        # 三角測量に渡す射影行列。歪み補正をするときは平行移動を掛ける（_undistort）。
+        self._triangulation_P = (self.P0, self.P1)
+        self._shift: dict[str, np.ndarray] = {}
+        if lens is not None:
+            self._shift = {
+                role: np.asarray(lens[role].size, dtype=np.float64) for role in ("cam0", "cam1")
+            }
+            self._triangulation_P = (
+                _translate_image(self.P0, self._shift["cam0"]),
+                _translate_image(self.P1, self._shift["cam1"]),
+            )
 
         self.storage = BodyPartDataStorage()
         self.calculators = {
@@ -194,6 +222,9 @@ class NetworkMeasurement:
         if keypoints0 is None or keypoints1 is None:
             return None
 
+        if self.lens is not None:
+            keypoints0 = self._undistort(keypoints0, "cam0")
+            keypoints1 = self._undistort(keypoints1, "cam1")
         points = self._triangulate(keypoints0, keypoints1)
         self._recent_points.append(points)
         if len(self._recent_points) > self._REQUIRED_FRAMES:
@@ -231,6 +262,34 @@ class NetworkMeasurement:
         # pose_keypoints の宣言順ではない（再検算 R-1。根拠は utils.extract_keypoints）。
         return [list(frame.pixel_xy(index)) for index in self._keypoints_in_id_order]
 
+    def _undistort(self, keypoints, role: str) -> np.ndarray:
+        """歪みを除いたピクセル座標に直し、三角測量用に平行移動して返す。
+
+        - 画像の外側は余白（``_UNDISTORT_MARGIN``）までを補正する。MediaPipe は画面の
+          少し外まで点を外挿して返す。それより遠い点は歪みの多項式の外挿が暴れるので NaN
+        - 補正後の座標は、画像の内側の点でも端では負になる（樽型歪みは外へ押し出す）。
+          OpenCV 側の三角測量は負の座標を「未検出」（USB 経路の -1）として捨てるので、
+          画像寸法だけ平行移動して正に保つ。射影行列にも同じ移動を掛けてあるので
+          （``_triangulation_P``）、三角測量の結果は変わらない
+        """
+        lens = self.lens[role]
+        points = np.asarray(keypoints, dtype=np.float64)
+        w, h = lens.size
+        mx, my = w * _UNDISTORT_MARGIN, h * _UNDISTORT_MARGIN
+        x, y = points[:, 0], points[:, 1]
+        with np.errstate(invalid="ignore"):
+            valid = (
+                np.isfinite(points).all(axis=1)
+                & (x >= -mx) & (x < w + mx) & (y >= -my) & (y < h + my)
+            )
+        result = np.full_like(points, np.nan)
+        if valid.any():
+            corrected = cv.undistortPoints(
+                points[valid].reshape(-1, 1, 2), lens.K, lens.distortion, P=lens.K
+            ).reshape(-1, 2)
+            result[valid] = corrected + self._shift[role]
+        return result
+
     def _triangulate(self, keypoints0, keypoints1) -> np.ndarray:
         """三角測量して既存と同じ座標系に変換する。
 
@@ -239,8 +298,9 @@ class NetworkMeasurement:
         0.01 倍のスケール、欠測の扱いを二重に管理することになり、
         ネイティブ DLL の高速経路も使えない。
         """
+        P0, P1 = self._triangulation_P
         return compute_triangulate_transform_native(
-            self.P0, self.P1, keypoints0, keypoints1, scale=0.01
+            P0, P1, keypoints0, keypoints1, scale=0.01
         )
 
     def _timestep(self, t_ns: int) -> float:
