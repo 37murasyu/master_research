@@ -33,6 +33,8 @@ import com.murayama.wheelchairsensor.capture.CaptureRequests
 import com.murayama.wheelchairsensor.capture.JpegResponder
 import java.util.concurrent.atomic.AtomicLong
 import com.murayama.wheelchairsensor.pose.PoseAnalyzer
+import com.murayama.wheelchairsensor.pose.Stage
+import com.murayama.wheelchairsensor.pose.StageCounter
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -67,6 +69,10 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var poseAnalyzer: PoseAnalyzer? = null
+    // 段階ごとの数（カメラ・解析・推論・人・送信）。計測中の画面に 1 秒あたりの数を出し、遅い段を見分ける
+    @Volatile
+    private var stageCounter = StageCounter()
+    private var lastStages: StageCounter.Snapshot? = null
     // 検出器はネイティブモデルを抱えるので、押すたびに作らず 1 個を持ち回す。
     private var barcodeScanner: BarcodeScanner? = null
     private var mode = Mode.IDLE
@@ -111,6 +117,28 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
 
         binding.scanButton.setOnClickListener { ensureCameraThenScan() }
         binding.disconnectButton.setOnClickListener { stopStreaming() }
+        // 30fps 固定（既定はオン）。計測中に切り替えると、その場でカメラを開き直して比べられる
+        binding.pinFpsCheck.isChecked = prefs.getBoolean(KEY_PIN_FPS, true)
+        binding.pinFpsCheck.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(KEY_PIN_FPS, checked).apply()
+            val analyzer = poseAnalyzer
+            if (mode == Mode.STREAMING && analyzer != null) {
+                lastStages = null
+                bindCamera(CameraPurpose.MEASURE, analyzer)
+            }
+        }
+        // GPU 推論（既定はオフ）。計測中に切り替えると、推定器を作り直してその場で比べられる
+        binding.gpuCheck.isChecked = prefs.getBoolean(KEY_GPU, false)
+        binding.gpuCheck.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(KEY_GPU, checked).apply()
+            if (mode == Mode.STREAMING) {
+                val old = poseAnalyzer
+                val analyzer = createAnalyzer()
+                poseAnalyzer = analyzer
+                bindCamera(CameraPurpose.MEASURE, analyzer)
+                old?.close()
+            }
+        }
 
         // QR 読み取り中は、タップした場所にピントを合わせる（計測中は CameraSetup が無視する）
         binding.preview.setOnTouchListener { view, event ->
@@ -251,10 +279,28 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         imagesSent.set(0)
         framesSent.set(0)
         framesDropped.set(0)
-        val analyzer = PoseAnalyzer(this, captureSink = { bitmap, nanos ->
-            val due = captureRequests.takeDue(nanos, timeSync.offsetNanos)
-            if (due.isNotEmpty()) jpegResponder.offer(bitmap, nanos, due)
-        }) { detection ->
+        val analyzer = createAnalyzer()
+        poseAnalyzer = analyzer
+        bindCamera(CameraPurpose.MEASURE, analyzer)
+        scheduleResync()
+        mainHandler.removeCallbacks(statusTicker)
+        mainHandler.post(statusTicker)
+    }
+
+    /** 計測用の推定器を作る。段階の数え直しも始める（GPU の切り替えでも使う） */
+    private fun createAnalyzer(): PoseAnalyzer {
+        val counter = StageCounter()
+        stageCounter = counter
+        lastStages = null
+        return PoseAnalyzer(
+            this,
+            captureSink = { bitmap, nanos ->
+                val due = captureRequests.takeDue(nanos, timeSync.offsetNanos)
+                if (due.isNotEmpty()) jpegResponder.offer(bitmap, nanos, due)
+            },
+            counter = counter,
+            useGpu = prefs.getBoolean(KEY_GPU, false),
+        ) { detection ->
             client.sendLandmarks(
                 captureDeviceNanos = detection.captureDeviceNanos,
                 width = detection.width,
@@ -262,11 +308,6 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
                 landmarks = detection.landmarks,
             )
         }
-        poseAnalyzer = analyzer
-        bindCamera(CameraPurpose.MEASURE, analyzer)
-        scheduleResync()
-        mainHandler.removeCallbacks(statusTicker)
-        mainHandler.post(statusTicker)
     }
 
     private fun stopStreaming() {
@@ -297,7 +338,12 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
-                cameraSetup.start(future.get(), purpose, analyzer) {
+                val measuring = purpose == CameraPurpose.MEASURE
+                cameraSetup.start(
+                    future.get(), purpose, analyzer,
+                    pinFrameRate = measuring && prefs.getBoolean(KEY_PIN_FPS, true),
+                    onSensorFrame = if (measuring) ({ stageCounter.mark(Stage.SENSOR) }) else null,
+                ) {
                     if (purpose == CameraPurpose.SCAN_QR) {
                         runOnUiThread { binding.detailText.text = SCAN_HINT }
                     }
@@ -383,15 +429,28 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         if (client.state != SensorClient.State.STREAMING) return  // 同期中・エラーの表示は onState に任せる
         val sincePerson = (SystemClock.elapsedRealtimeNanos() - analyzer.lastPersonNanos) / 1e9
         val size = if (analyzer.lastFrameWidth > 0) "${analyzer.lastFrameWidth}x${analyzer.lastFrameHeight}" else "—"
+        // 段階ごとの 1 秒あたりの数（前回の表示からの差）。送信は SensorClient の累計を使う
+        val snapshot = stageCounter.snapshot(
+            SystemClock.elapsedRealtimeNanos(), overrides = mapOf(Stage.SENT to framesSent.get())
+        )
+        val rates = lastStages?.let {
+            StageCounter.describe(
+                StageCounter.perSecond(it, snapshot),
+                latencyMs = StageCounter.latencyMs(it, snapshot),
+                delegate = analyzer.delegateName,
+            )
+        }
+        lastStages = snapshot
+        val rateLine = rates?.let { "\n$it" } ?: ""
         if (sincePerson < PERSON_TIMEOUT_SEC) {
             binding.statusText.text = "送信中（人を検出中）"
             binding.detailText.text = "送信 ${framesSent.get()} フレーム / 画像 ${imagesSent.get()} 枚 / " +
                 "破棄 ${framesDropped.get()} / " +
-                String.format("往復 %.2f ms", timeSync.roundTripNanos / 1_000_000.0) + " / 解像度 $size"
+                String.format("往復 %.2f ms", timeSync.roundTripNanos / 1_000_000.0) + " / 解像度 $size" + rateLine
         } else {
             binding.statusText.text = "送信中（人が写っていません）"
             binding.detailText.text = "Pixel を机などに置き、1.5〜2 m 離れて、肩から手までが写るように向けてください。" +
-                "点は人が写っている間だけ送ります"
+                "点は人が写っている間だけ送ります" + rateLine
         }
     }
 
@@ -408,6 +467,10 @@ class MainActivity : AppCompatActivity(), SensorClient.Listener {
         private const val REFOCUS_INTERVAL_MS = 2_500L
         private const val PREFS = "connection"
         private const val KEY_LAST_URL = "last_url"
+        /** 計測でカメラを 30fps に固定するか（CameraSetup.start の pinFrameRate） */
+        private const val KEY_PIN_FPS = "pin_fps"
+        /** 姿勢推定を GPU で行うか（PoseAnalyzer の useGpu） */
+        private const val KEY_GPU = "gpu_inference"
         /** 切れたときにつなぎ直す間隔。 */
         private const val RECONNECT_INTERVAL_MS = 3_000L
         /** 計測中の表示を更新する間隔。 */

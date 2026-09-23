@@ -1,7 +1,10 @@
 package com.murayama.wheelchairsensor.camera
 
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.util.Log
+import android.util.Range
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.Camera
@@ -37,10 +40,18 @@ class CameraSetup(
     private var camera: Camera? = null
     private var purpose: CameraPurpose? = null
 
+    /**
+     * [pinFrameRate] が真なら（光学系を固定する用途のとき）、自動露出の目標フレームレートを 30 fps に固定する。
+     * 暗い室内では自動露出が露光を 1/15 s ほどに延ばし、カメラ自体が 15 fps に落ちる（実機の Pixel 7a で PC に
+     * 10〜15 Hz しか届かなかった原因の候補）。固定すると映像は暗くなる。
+     * [onSensorFrame] はカメラが 1 枚撮るたびに呼ぶ（Camera2 の撮影完了。解析に渡らなかったフレームも数える）。
+     */
     fun start(
         provider: ProcessCameraProvider,
         purpose: CameraPurpose,
         analyzer: ImageAnalysis.Analyzer,
+        pinFrameRate: Boolean = false,
+        onSensorFrame: (() -> Unit)? = null,
         onReady: (String) -> Unit,
     ) {
         this.provider = provider
@@ -68,7 +79,18 @@ class CameraSetup(
             // アロケーションになる。
             .setOutputImageRotationEnabled(true)
 
-        if (purpose.fixOptics) applyFixedOptics(analysisBuilder)
+        if (purpose.fixOptics) applyFixedOptics(analysisBuilder, pinFrameRate)
+        if (onSensorFrame != null) {
+            Camera2Interop.Extender(analysisBuilder).setSessionCaptureCallback(
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult,
+                    ) = onSensorFrame()
+                }
+            )
+        }
 
         val analysis = analysisBuilder.build().also {
             it.setAnalyzer(analysisExecutor, analyzer)
@@ -85,7 +107,11 @@ class CameraSetup(
         // 画面に映した QR のような細かい模様で微妙に外れたまま落ち着くことがある。
         if (!purpose.fixOptics) previewView.post { focusCenter() }
 
-        val optics = if (purpose.fixOptics) "AF・AE・AWB 固定" else "オートフォーカス"
+        val optics = when {
+            purpose.fixOptics && pinFrameRate -> "AF・AE・AWB 固定、${TARGET_FPS} fps 固定"
+            purpose.fixOptics -> "AF・AE・AWB 固定"
+            else -> "オートフォーカス"
+        }
         // 実際の解像度は目標（TARGET_RESOLUTION）と違うことがある（4:3 が選ばれる）。表示は実際のフレームから出す
         onReady(optics)
     }
@@ -99,8 +125,14 @@ class CameraSetup(
      * 機種によっては一部が効かない。効かなくても撮影自体は続けられるので、
      * 例外にはせず警告を出すに留める（ただし精度は落ちる）。
      */
-    private fun applyFixedOptics(builder: ImageAnalysis.Builder) {
+    private fun applyFixedOptics(builder: ImageAnalysis.Builder, pinFrameRate: Boolean) {
         try {
+            if (pinFrameRate) {
+                // 露光を 1/30 s 以内に抑え、カメラが 30 fps を出すようにする（AE のロックはこの範囲で収束した値を固める）
+                Camera2Interop.Extender(builder).setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS),
+                )
+            }
             Camera2Interop.Extender(builder)
                 .setCaptureRequestOption(
                     CaptureRequest.CONTROL_AF_MODE,
@@ -161,5 +193,8 @@ class CameraSetup(
 
         /** PC 側の既存パイプラインが 1280x720 前提（config.frame_shape）。 */
         val TARGET_RESOLUTION = Size(1280, 720)
+
+        /** 30fps 固定のときのフレームレート。PC 側の格子（同期バッファ）と同じ */
+        const val TARGET_FPS = 30
     }
 }

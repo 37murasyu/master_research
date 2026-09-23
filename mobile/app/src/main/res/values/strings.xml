@@ -4,6 +4,8 @@
 
     <string name="scan_qr">PCのQRコードを読み取る</string>
     <string name="disconnect">切断</string>
+    <string name="pin_fps">30fps固定</string>
+    <string name="gpu_inference">GPU推論</string>
     <string name="camera_permission_required">カメラの利用を許可してください。姿勢推定に必要です。</string>
 
     <string name="status_idle">未接続</string>

@@ -54,6 +54,28 @@
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
+        <!-- 計測でカメラを 30fps に固定する。暗い室内でカメラが 15fps に落ちるのを防ぐ（映像は暗くなる） -->
+        <CheckBox
+            android:id="@+id/pinFpsCheck"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_vertical"
+            android:layout_marginEnd="8dp"
+            android:textColor="@android:color/white"
+            android:buttonTint="@android:color/white"
+            android:text="@string/pin_fps" />
+
+        <!-- 姿勢推定を GPU で行う。使えなければ CPU に戻る（計測中の表示の「推論 … ms（CPU/GPU）」で分かる） -->
+        <CheckBox
+            android:id="@+id/gpuCheck"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_vertical"
+            android:layout_marginEnd="8dp"
+            android:textColor="@android:color/white"
+            android:buttonTint="@android:color/white"
+            android:text="@string/gpu_inference" />
+
         <Button
             android:id="@+id/scanButton"
             android:layout_width="wrap_content"

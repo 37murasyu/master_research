@@ -8,6 +8,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
@@ -29,6 +30,10 @@ import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 class PoseAnalyzer(
     context: Context,
     private val captureSink: ((bitmap: Bitmap, captureDeviceNanos: Long) -> Unit)? = null,
+    /** 段階ごとの数（解析・推論・人）。計測中の画面に 1 秒あたりの数を出して、遅い段を見分ける */
+    private val counter: StageCounter? = null,
+    /** GPU で推論する。使えなければ CPU に戻す（[delegateName] で分かる） */
+    useGpu: Boolean = false,
     private val onResult: (Detection) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
@@ -46,6 +51,10 @@ class PoseAnalyzer(
 
     @Volatile
     private var landmarker: PoseLandmarker? = null
+
+    /** 実際に推論に使っているもの（"CPU" / "GPU"）。GPU を頼んでも初期化に失敗すれば CPU */
+    var delegateName: String = "CPU"
+        private set
 
     /** 推定器を閉じるのと、推定器へ画像を渡すのを排他にする（analyze / close）。 */
     private val lifecycleLock = Any()
@@ -85,9 +94,21 @@ class PoseAnalyzer(
     }
 
     init {
-        try {
+        val delegates = if (useGpu) listOf(Delegate.GPU, Delegate.CPU) else listOf(Delegate.CPU)
+        for (delegate in delegates) {
+            landmarker = create(delegate)
+            if (landmarker != null) {
+                delegateName = delegate.name
+                break
+            }
+        }
+    }
+
+    private fun create(delegate: Delegate): PoseLandmarker? {
+        return try {
             val base = BaseOptions.builder()
                 .setModelAssetPath(MODEL_ASSET)
+                .setDelegate(delegate)
                 .build()
 
             val options = PoseLandmarker.PoseLandmarkerOptions.builder()
@@ -101,9 +122,10 @@ class PoseAnalyzer(
                 .setErrorListener { error -> Log.e(TAG, "推論に失敗しました", error) }
                 .build()
 
-            landmarker = PoseLandmarker.createFromOptions(appContext, options)
+            PoseLandmarker.createFromOptions(appContext, options)
         } catch (e: Exception) {
-            Log.e(TAG, "PoseLandmarker を初期化できませんでした", e)
+            Log.e(TAG, "PoseLandmarker を ${delegate.name} で初期化できませんでした", e)
+            null
         }
     }
 
@@ -113,6 +135,7 @@ class PoseAnalyzer(
             return
         }
 
+        counter?.mark(Stage.ANALYZED)
         try {
             val captureNanos = SystemClock.elapsedRealtimeNanos()
             // CameraSetup が setOutputImageRotationEnabled(true) を指定しているので、
@@ -160,9 +183,13 @@ class PoseAnalyzer(
         val pending = synchronized(pendingFrames) {
             pendingFrames.remove(result.timestampMs())
         } ?: return
+        counter?.mark(Stage.INFERRED)
+        // フレームを受け取ってから結果が返るまで（Bitmap への変換を含む）
+        counter?.recordLatency(SystemClock.elapsedRealtimeNanos() - pending.captureNanos)
 
         val poses = result.landmarks()
         if (poses.isEmpty()) return  // 人が写っていないフレームは送らない
+        counter?.mark(Stage.PERSON)
         lastPersonNanos = SystemClock.elapsedRealtimeNanos()
 
         val points = poses[0].map { landmark ->
