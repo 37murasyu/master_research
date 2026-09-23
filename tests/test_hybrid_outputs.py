@@ -28,7 +28,7 @@ from app.net.protocol import LandmarkFrame
 from app.runners.network_measure import MeasurementConfig
 from app.tuning.raw_capture import read_raw_capture
 from config import pose_keypoints
-from hybrid_pushup import PushUp
+from hybrid_pushup import PushUp, calibrated_pairs
 from test_hybrid_measure import calibration
 
 ONE_RM = {"elbow_L": 20.0, "elbow_R": 22.0, "wrist_L": 8.0, "wrist_R": 9.0}
@@ -44,22 +44,7 @@ def _session(tmp_path, *, reps=1, drop=(), **config):
         config=MeasurementConfig(body_mass_kg=65.0, one_rm=ONE_RM, subject_id="00", **config))
     session.on_landmarks(LandmarkFrame("cam1", 0, 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
 
-    from test_hybrid_measure import geometry
-    import cv2 as cv
-    from hybrid_pushup import pushup_cm
-    from test_network_measure import _pair_from_pixels
-
-    intr, stereo = geometry()
-    motion = PushUp(reps=reps)
-    pairs = []
-    for k in range(int(round(motion.duration_s * 30))):
-        if k in drop:
-            continue
-        truth = pushup_cm(k / 30, motion)
-        truth[:, 1] -= 5.0   # 両方の画像に収める
-        a = cv.projectPoints(truth, np.zeros(3), np.zeros(3), intr.K, intr.distortion)[0].reshape(-1, 2)
-        b = cv.projectPoints(truth, np.zeros(3), stereo.T, intr.K, intr.distortion)[0].reshape(-1, 2)
-        pairs.append(_pair_from_pixels(round(k * 1e9 / 30), a, b))
+    pairs = calibrated_pairs(PushUp(reps=reps), drop=drop)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         session.on_pairs(pairs)

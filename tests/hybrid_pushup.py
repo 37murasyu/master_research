@@ -154,3 +154,22 @@ def run(measurement, motion: PushUp = PushUp(), **kw):
         if result is not None:
             results.append(result)
     return results
+
+
+def calibrated_pairs(motion: PushUp = PushUp(), *, drop=(), fps: float = 30.0):
+    """``test_hybrid_measure.calibration`` の校正（歪みつき、基線 35 cm）で撮った押し上げの組。"""
+    import cv2 as cv
+    from test_hybrid_measure import geometry
+    from test_network_measure import _pair_from_pixels
+
+    intr, stereo = geometry()
+    pairs = []
+    for k in range(int(round(motion.duration_s * fps))):
+        if k in drop:
+            continue
+        truth = pushup_cm(k / fps, motion)
+        truth[:, 1] -= 5.0   # 両方の画像に収める
+        a = cv.projectPoints(truth, np.zeros(3), np.zeros(3), intr.K, intr.distortion)[0].reshape(-1, 2)
+        b = cv.projectPoints(truth, np.zeros(3), stereo.T, intr.K, intr.distortion)[0].reshape(-1, 2)
+        pairs.append(_pair_from_pixels(round(k * 1e9 / fps), a, b))
+    return pairs

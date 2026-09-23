@@ -45,6 +45,9 @@ class MeasurementSession:
                     self.metadata,
                     body_mass_kg=self.config.body_mass_kg,
                     gravity_mode=self.config.gravity_mode,
+                    subject_id=self.config.subject_id,
+                    one_rm_kg=None if self.config.one_rm is None else dict(self.config.one_rm),
+                    dyn_gate=self.config.dyn_gate,
                 ),
             )
             self.measurement = NetworkMeasurement(
@@ -56,6 +59,7 @@ class MeasurementSession:
                 # 校正の最後に盤を立てた向き（無ければ None で、重力は体幹から決める）
                 board_up=read_board_up(self.calibration.meta),
             )
+            self.recorder.meta["ekf"] = self.measurement.ekf_provenance()
             if self.tracker is not None:
                 # 記録を始めた＝Pixel の点が届いた
                 self.tracker.set_link("connected")
