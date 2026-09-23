@@ -29,6 +29,13 @@ class SensorClient(
         fun onSynchronized(sample: TimeSync.Sample)
         /** 送信できた累計と、送れなかった累計。画面に出す。 */
         fun onProgress(sent: Long, dropped: Long)
+        /** PC から撮影要求が届いた（OkHttp のスレッドで呼ばれる）。 */
+        fun onCaptureRequested(request: Protocol.CaptureRequest) {}
+        /**
+         * 接続が切れた（OkHttp のスレッドで、状態の通知より先に呼ばれる）。
+         * [retryable] が真なら、同じ接続先へつなぎ直してよい（[isRetryableClose]）。
+         */
+        fun onConnectionLost(retryable: Boolean) {}
     }
 
     enum class State { IDLE, CONNECTING, SYNCING, STREAMING, ERROR }
@@ -40,8 +47,18 @@ class SensorClient(
         .connectTimeout(10, TimeUnit.SECONDS)
         .build()
 
+    @Volatile
     private var socket: WebSocket? = null
     private var target: ConnectionTarget? = null
+
+    /**
+     * 接続ごとの番号。通知が今の接続のものかをこれで見分ける。
+     *
+     * ソケットの同一性で比べると、`newWebSocket` の戻り値を代入し終わる前に届いた
+     * onOpen を「古い接続」と取り違えて hello を送り損ねる。
+     */
+    @Volatile
+    private var generation = 0
 
     private val sequence = AtomicLong(0)
     private val sentCount = AtomicLong(0)
@@ -56,7 +73,10 @@ class SensorClient(
         private set
 
     // -- 接続 ---------------------------------------------------------------
-    fun connect(target: ConnectionTarget, deviceName: String) {
+    /**
+     * @param deviceId 端末ごとに変わらない識別子。PC は校正時の端末との照合に使う。
+     */
+    fun connect(target: ConnectionTarget, deviceName: String, deviceId: String? = null) {
         disconnect()
         this.target = target
         sequence.set(0)
@@ -66,32 +86,61 @@ class SensorClient(
 
         updateState(State.CONNECTING, target.url)
 
+        val myGeneration = generation
         val request = Request.Builder().url(target.url).build()
         socket = http.newWebSocket(request, object : WebSocketListener() {
 
+            // 以下の通知は、今の接続のものかを必ず確かめる。QR を読み直すと古い接続の
+            // 閉じた通知が新しい接続の後から届き、確かめないと新しい接続まで消してしまう。
+            private fun isCurrent() = generation == myGeneration
+
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                webSocket.send(Protocol.hello(target.role, deviceName, target.session))
+                if (!isCurrent()) return
+                webSocket.send(Protocol.hello(target.role, deviceName, target.session, deviceId))
                 beginSync(webSocket)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                handleSyncResponse(webSocket, text)
+                if (!isCurrent()) return
+                when (Protocol.messageType(text)) {
+                    "sync_res" -> handleSyncResponse(webSocket, text)
+                    "capture_req" -> Protocol.parseCaptureRequest(text)?.let(listener::onCaptureRequested)
+                    else -> Unit  // 知らない電文は捨てる。PC 側が新しくても落ちない
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (!isCurrent()) return
                 Log.w(TAG, "接続に失敗しました", t)
-                updateState(State.ERROR, t.message ?: "接続に失敗しました")
                 socket = null
+                // PC 側のツールがまだ起動していない・Wi-Fi が切れた、など。つなぎ直せば戻る
+                listener.onConnectionLost(retryable = true)
+                updateState(State.ERROR, t.message ?: "接続に失敗しました")
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                // PC が閉じ始めた。応じて閉じ返す（そうしないと onClosed が来ない）
+                webSocket.close(code, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                updateState(State.IDLE, reason.ifBlank { null })
+                if (!isCurrent()) return
                 socket = null
+                listener.onConnectionLost(retryable = isRetryableClose(code))
+                if (code == NORMAL_CLOSURE || code == GOING_AWAY) {
+                    updateState(State.IDLE, reason.ifBlank { null })
+                } else {
+                    // 役割の違い・古い QR・別の端末への交代など。理由を画面に出さないと、
+                    // 使う人は「繋がらない」としか分からない。
+                    updateState(State.ERROR, reason.ifBlank { "PC から切断されました（コード $code）" })
+                }
             }
         })
     }
 
     fun disconnect() {
+        // 先に番号を進め、閉じた通知が後から届いても今の状態を書き換えないようにする
+        generation += 1
         socket?.close(1000, "端末側から切断")
         socket = null
         timeSync.reset()
@@ -185,6 +234,34 @@ class SensorClient(
         listener.onProgress(sentCount.get(), droppedCount.get())
     }
 
+    /**
+     * 撮影要求への応答を送る。時刻同期が済むまでは送らない（PC 時計に直せないため）。
+     *
+     * @param captureDeviceNanos 撮影時刻（端末の単調時計）。PC 時計への変換はここで行う。
+     * @return 送信キューに積めたか。
+     */
+    fun sendCalibrationFrame(
+        id: Long,
+        captureDeviceNanos: Long,
+        width: Int,
+        height: Int,
+        jpeg: ByteArray,
+    ): Boolean {
+        val webSocket = socket
+        val role = target?.role
+        if (webSocket == null || role == null || !timeSync.isSynchronized) return false
+        return webSocket.send(
+            Protocol.calibrationFrame(
+                role = role,
+                id = id,
+                captureNanosPcClock = timeSync.toPcClock(captureDeviceNanos),
+                width = width,
+                height = height,
+                jpeg = jpeg,
+            )
+        )
+    }
+
     private fun updateState(next: State, detail: String? = null) {
         state = next
         listener.onState(next, detail)
@@ -192,5 +269,20 @@ class SensorClient(
 
     companion object {
         private const val TAG = "SensorClient"
+
+        private const val NORMAL_CLOSURE = 1000
+        private const val GOING_AWAY = 1001
+        /** PC が名乗りを断った（役割違い・別の session・校正と違う端末）。 */
+        private const val POLICY_VIOLATION = 1008
+        /** 同じ役割の別の接続に席を譲った（app/net/server.py の CLOSE_TAKEN_OVER）。 */
+        private const val TAKEN_OVER = 4000
+
+        /**
+         * PC に閉じられたとき、同じ接続先へ自動でつなぎ直してよいか。
+         *
+         * PC がはっきり断ったときはつなぎ直さない。断られ続け、理由の表示もすぐ消える。
+         * PC 側のツールを終えた（1001）・通信の異常（1006）などは、PC を起動し直せば戻る。
+         */
+        fun isRetryableClose(code: Int): Boolean = code != POLICY_VIOLATION && code != TAKEN_OVER
     }
 }

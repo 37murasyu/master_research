@@ -162,3 +162,94 @@ PC 側のサーバが受信状況を 1 秒ごとに表示する:
 `contract/golden_messages.json` に書き出す。電文の形を変えたらこれを更新し、
 PC 側の `tests/test_protocol_contract.py` も通ることを確認すること。
 片側だけのテストでは、両者が同じものを想定していることを保証できない。
+
+## Mac 内蔵カメラ＋Pixel 1 台の混成ステレオ
+
+Mac を cam0（原点）、Pixel の背面カメラを cam1 とする。Mac と Pixel を同じ Wi-Fi に接続する。
+Mac のビデオエフェクト（Center Stage、ポートレートなど）はオフにし、計測中はカメラの位置と向きを固定する。
+重力 `axis` モードではカメラが水平である必要があるため、Mac の天板を鉛直に開く。
+
+Android は release 版で更新する。debug 版は署名鍵と端末 ID が変わるため、校正を流用できない。
+
+```sh
+cd ../master_research-hybrid/mobile
+JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ./install.sh --build
+cd ..
+../master_research/.venv/bin/python -m app.runners.hybrid_preview --camera 1
+```
+
+**Mac のカメラ番号**: Camo などの仮想カメラが入っていると番号が入れ替わる。2026-09-23 の MacBook Air では
+0 番が Camo、**1 番が内蔵の FaceTime HD** だった。違う映像が出たら番号を変える。
+
+**手順（QR を読むのは最初の 1 回だけ）**
+
+1. Pixel を手に持ち、アプリの「PCのQRコードを読み取る」で、ウィンドウ右側の cam1 の QR を 20〜40 cm 離して読む。
+   ぼけたら画面の QR をタップするとピントが合う。macOS に受信接続の確認が出たら許可する
+2. 「送信中」になったら、Pixel を机などに置き、**1.5〜2 m 離れて肩から手までが写るように**向ける。
+   点は人が写っている間だけ送る。アプリの表示が「送信中（人を検出中）」なら写っている
+3. 左に Mac、右に Pixel の画像と骨格が並ぶ
+
+アプリは送信まで進んだ接続先を覚え、切れたら 3 秒ごとにつなぎ直す。アプリを開き直したときも自動でつなぐ。
+PC 側は session をこの Mac に保存して使い回すので、ライブ表示・校正・計測を起動し直しても QR は読み直さない。
+別の PC に切り替えるときや、古い端末を締め出したいとき（`--new-session`）だけ読み直す。
+PC に断られたとき（役割違い・別の session・校正と違う端末）と「切断」を押したときは、つなぎ直さない。
+
+**QR の接続先が違うとき**: VPN に接続していると、QR に Wi-Fi 以外のアドレス（例 10.x.x.x）が載ることがある。
+`--advertise-host 192.168.1.17`（Mac の Wi-Fi のアドレス。`ipconfig getifaddr en0` で分かる）で指定する。
+
+Pixel の解析解像度は **1280×960（4:3）**（CameraX が 4:3 を選ぶ。目標の 1280×720 ではない）。
+アプリの計測中の表示に実際の解像度が出る。校正も同じ解像度で撮れば三角測量は合う。
+
+終了は q / Esc / ウィンドウを閉じる / Ctrl-C。
+
+### 校正
+
+```sh
+../master_research/.venv/bin/python -m app.runners.hybrid_calibrate --camera 0
+```
+
+向き合わせ後、Space で盤集めに移る。既定は内側交点 4×7、1 マス 3.0 cm。
+必要なら `--rows 4 --cols 7 --square-cm 3.0` で変更する（片方偶数、片方奇数が必須）。
+盤全体を大きく写し、毎回静止させる。採用数が増えたら位置・距離・傾きを変える。
+Pixel の焦点は無限遠固定なので、盤がぼけない距離まで離し、十分な照明を用意する。
+
+単体は各 15 ビュー、ステレオは 12 ペアを集める。端末 ID・解像度が同じ内部パラメータの
+キャッシュがあれば単体の撮り直しを省略する。再校正は `--no-cache`。
+RMS ≤ 1 px、マス寸法誤差 ≤ 1 mm を満たせば自動保存する。
+それ以外は結果を確認して s で保存、r でやり直し、q で中止する。
+保存先は `~/Documents/WheelchairTorque/hybrid/calibration/`。
+混成の並進 T は **cm**。既存 USB 校正のファイルと混在させない。
+
+### 計測
+
+```sh
+../master_research/.venv/bin/python -m app.runners.hybrid_measure \
+  --camera 0 --body-mass 60 --gravity-mode axis --preview-hz 2
+```
+
+既定で最新校正を使用する。別の校正は `--calibration <保存ディレクトリ>`。
+校正した Pixel の端末 ID が違う場合は接続を拒否する。解像度不一致も破棄し、30 フレーム連続で終了する。
+`--cam0-offset-ms` は Mac 側時刻に加える補正量（既定 0）。遅延差の自動推定は未実装。
+表示負荷の比較には `--preview-hz 0` と `--preview-hz 4` を使う。
+
+保存先は `~/Documents/WheelchairTorque/hybrid/measure/`。USB と同じ列の `kpts3d_*.csv`、
+局所トルク、サイクル仕事、時刻、両側の生 2D、校正の写し、メタ情報を保存する。
+CSV は 1 秒ごとに flush し、通常停止時は残ったペアを処理してから閉じる。
+サイクル仕事はスマホ経路の関節仕事率の積分であり、USB の肘専用エネルギー計算との直接比較には使わない。
+
+GUI では校正・計測画面の「入力」を「Mac＋Pixel（混成）」へ切り替えて開始する。
+映像は別ウィンドウで開く。計測画面の CAM0・体重設定が反映される。
+混成経路では USB 用の動画入力・EKF・LPF などの設定は使わない。
+
+### 実機で残る確認
+
+2026-09-23 のライブ表示（MacBook Air M1＋Pixel 7a、同じ Wi-Fi）: Mac 30 fps、Pixel 17 fps、ペア 26/秒、
+平均位相差 15.6 ms（最大 49.9 ms）。Pixel の fps が目安の 20 に届いていない。
+
+- Mac ≥ 25 fps、Pixel ≥ 20 fps、ペア ≥ 20/秒、平均位相差 < 20 ms。
+- Pixel 表示 ≥ 3 Hz、表示 0 Hz と 4 Hz でランドマーク fps の低下 ≤ 10%。
+- 校正 RMS ≤ 1 px、マス誤差 ≤ 1 mm、基線が巻尺の ±5%。
+- 肩幅が巻尺の ±2 cm、押し中の前腕長標準偏差 < 1.5 cm。
+- GUI 停止から 2 秒以内に終了して CSV が残ること。
+
+自動テストは模擬端末と合成座標による検証であり、これらの実機精度・性能を保証するものではない。

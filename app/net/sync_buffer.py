@@ -158,6 +158,9 @@ class SyncBuffer:
     def drain(self) -> list[PairedSample]:
         """今の時点で組めるペアをすべて返す。"""
         if not self._ensure_grid_origin():
+            # 片方しか来ていない間も古いものは捨てる。混成構成では PC のカメラが
+            # 先に流れ始め、スマホが繋がるまで片側だけが溜まり続けるため。
+            self._evict()
             return []
 
         pairs: list[PairedSample] = []

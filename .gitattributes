@@ -1,3 +1,7 @@
 media/cam111_test.mp4 filter=lfs diff=lfs merge=lfs -text
 media/cam000_test.mp4 filter=lfs diff=lfs merge=lfs -text
 media/wheelchair_user.png filter=lfs diff=lfs merge=lfs -text
+
+# 契約サンプルは Windows でも改行を LF に保つ。
+# 改行が変わるだけで、両側のテストが「電文が違う」と言い出すため。
+mobile/contract/*.json text eol=lf

@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
@@ -35,6 +36,9 @@ __all__ = [
     "SyncRequest",
     "SyncResponse",
     "Hello",
+    "CaptureRequest",
+    "CalibrationFrame",
+    "MAX_CALIBRATION_BYTES",
     "ClockOffset",
     "encode",
     "decode",
@@ -51,6 +55,10 @@ LANDMARK_COUNT = 33
 
 # ステレオの左右。既存コードの cam0 / cam1 に対応する。
 ROLES = ("cam0", "cam1")
+
+# 校正用フレーム 1 枚の上限。720p の JPEG は 200〜300KB 程度なので十分な余裕がある。
+# 無線の相手からの入力なので、際限なく受け取らない。
+MAX_CALIBRATION_BYTES = 8 * 1024 * 1024
 
 
 class ProtocolError(ValueError):
@@ -127,9 +135,53 @@ class Hello:
     role: str
     device: str
     session: str
+    # 端末ごとに変わらない識別子。同じ機種を 2 台使うと ``device`` は
+    # どちらも "Google Pixel 7a" になり、内部パラメータの取り違えにも、
+    # 2 台の役割を入れ替えたことにも気づけない。
+    # 古いアプリは送ってこないので省略可能にしてある。
+    device_id: str | None = None
 
 
-Message = LandmarkFrame | SyncRequest | SyncResponse | Hello
+@dataclass(frozen=True)
+class CaptureRequest:
+    """PC → 端末。校正用に 1 枚撮って送り返してもらう。
+
+    ``at_ns`` は PC 時計での目標撮影時刻。両端末に同じ時刻を指定すると、
+    ネットワークの遅延差に関係なく、ほぼ同時のフレームが揃う
+    （端末は時刻同期済みなので、自分の時計へ換算できる）。
+    省略時は「次のフレーム」。
+
+    ``max_width`` と ``quality`` はライブ表示用。向き合わせを見るだけなら 640 px・画質 70 で
+    足り、全解像度の 1/5 程度の大きさで済む。省略時は全解像度・端末の既定画質（校正用）。
+    古い端末は知らない項目を無視するので、省略時は電文に含めない。
+    """
+
+    id: int
+    at_ns: int | None = None
+    max_width: int | None = None
+    quality: int | None = None
+
+
+@dataclass(frozen=True)
+class CalibrationFrame:
+    """端末 → PC。校正用の画像。
+
+    姿勢推定に使っているのと**同じフレーム**を JPEG にして送る。別途
+    静止画を撮ると、解像度や画角の切り出し、焦点の扱いが計測時とずれ、
+    求めた内部パラメータが実際の映像と合わなくなる。
+    """
+
+    role: str
+    id: int
+    t_capture_ns: int
+    width: int
+    height: int
+    jpeg: bytes
+
+
+Message = (
+    LandmarkFrame | SyncRequest | SyncResponse | Hello | CaptureRequest | CalibrationFrame
+)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +215,24 @@ def encode(message: Message) -> str:
             "device": message.device,
             "session": message.session,
         }
+        if message.device_id is not None:
+            payload["device_id"] = message.device_id
+    elif isinstance(message, CaptureRequest):
+        payload = {"type": "capture_req", "id": message.id}
+        for key in ("at_ns", "max_width", "quality"):
+            value = getattr(message, key)
+            if value is not None:
+                payload[key] = value
+    elif isinstance(message, CalibrationFrame):
+        payload = {
+            "type": "calib_frame",
+            "role": message.role,
+            "id": message.id,
+            "t_capture_ns": message.t_capture_ns,
+            "w": message.width,
+            "h": message.height,
+            "jpeg": base64.b64encode(message.jpeg).decode("ascii"),
+        }
     else:  # pragma: no cover - 型で塞いである
         raise TypeError(f"未知のメッセージ型: {type(message)!r}")
 
@@ -191,13 +261,65 @@ def decode(raw: str | bytes) -> Message:
             t3=_require_int(payload, "t3"),
         )
     if kind == "hello":
+        device_id = payload.get("device_id")
+        if device_id is not None and not isinstance(device_id, str):
+            raise ProtocolError(f"device_id は文字列である必要があります: {device_id!r}")
         return Hello(
             role=_require_role(payload),
             device=_require_str(payload, "device"),
             session=_require_str(payload, "session"),
+            device_id=device_id,
         )
+    if kind == "capture_req":
+        at_ns = _optional_int(payload, "at_ns")
+        max_width = _optional_int(payload, "max_width")
+        if max_width is not None and max_width <= 0:
+            raise ProtocolError(f"max_width は正の整数である必要があります: {max_width}")
+        quality = _optional_int(payload, "quality")
+        if quality is not None and not 1 <= quality <= 100:
+            raise ProtocolError(f"quality は 1〜100 である必要があります: {quality}")
+        return CaptureRequest(
+            id=_require_int(payload, "id"), at_ns=at_ns, max_width=max_width, quality=quality
+        )
+    if kind == "calib_frame":
+        return _decode_calibration_frame(payload)
 
     raise ProtocolError(f"未知のメッセージ種別: {kind!r}")
+
+
+def _decode_calibration_frame(payload: dict[str, Any]) -> CalibrationFrame:
+    width = _require_int(payload, "w")
+    height = _require_int(payload, "h")
+    if width <= 0 or height <= 0:
+        raise ProtocolError(f"フレームサイズが不正: w={width}, h={height}")
+
+    encoded = _require_str(payload, "jpeg")
+    # 無線の相手からの入力。大きさを先に見てから復号する。
+    if len(encoded) > MAX_CALIBRATION_BYTES * 2:
+        raise ProtocolError("校正フレームが大きすぎます")
+
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ProtocolError(f"jpeg を base64 として読めません: {exc}") from exc
+
+    if len(image) > MAX_CALIBRATION_BYTES:
+        raise ProtocolError(
+            f"校正フレームが大きすぎます: {len(image)} バイト（上限 {MAX_CALIBRATION_BYTES}）"
+        )
+    # JPEG の先頭は必ず FF D8。画像でないものを掴むと、検出側が
+    # 「1 枚も写っていない」と黙って報告することになる。
+    if not image.startswith(b"\xff\xd8"):
+        raise ProtocolError("jpeg が JPEG のデータではありません")
+
+    return CalibrationFrame(
+        role=_require_role(payload),
+        id=_require_int(payload, "id"),
+        t_capture_ns=_require_int(payload, "t_capture_ns"),
+        width=width,
+        height=height,
+        jpeg=image,
+    )
 
 
 def _decode_landmarks(payload: dict[str, Any]) -> LandmarkFrame:
@@ -239,6 +361,12 @@ def _require_int(payload: dict[str, Any], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ProtocolError(f"{key} は整数である必要があります: {value!r}")
     return value
+
+
+def _optional_int(payload: dict[str, Any], key: str) -> int | None:
+    if payload.get(key) is None:
+        return None
+    return _require_int(payload, key)
 
 
 def _require_str(payload: dict[str, Any], key: str) -> str:

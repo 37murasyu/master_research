@@ -78,8 +78,8 @@ class WorkerRunner(QtCore.QObject):
             return False
 
         command = entry.worker_command(self.role, passthrough, module=module)
-        # 停止ファイルを見るのは計測（master_research_code.py）だけ。ほかの役割には作らない
-        self._stop_dir = tempfile.mkdtemp(prefix="wt_stop_") if self.role == "realtime" else None
+        # 穏やかな停止に対応するワーカーへ停止ファイルを渡す。
+        self._stop_dir = tempfile.mkdtemp(prefix="wt_stop_") if entry.uses_stop_file(self.role) else None
         environment = entry.worker_environment(settings, role=self.role, stop_file=self._stop_file())
 
         process_env = QtCore.QProcessEnvironment()
@@ -125,7 +125,7 @@ class WorkerRunner(QtCore.QObject):
 
         self.output.emit("[停止] 終了を要求しました。CSV の書き出しを待ちます。\n")
         stop_file = self._stop_file()
-        if self.role == "realtime" and stop_file is not None:
+        if entry.uses_stop_file(self.role) and stop_file is not None:
             Path(stop_file).touch()
         else:
             self._process.terminate()

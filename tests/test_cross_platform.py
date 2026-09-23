@@ -38,6 +38,22 @@ IMPORT_SAFE_MODULES = [
     "app.tuning.ekf_likelihood",
     "app.tuning.ekf_estimate",
     "app.tuning.ekf_profile",
+    "app.hybrid.link",
+    "app.hybrid.mac_camera",
+    "app.hybrid.pose_detector",
+    "app.hybrid.display",
+    "app.hybrid.live",
+    "app.hybrid.checkerboard",
+    "app.hybrid.calibration_io",
+    "app.hybrid.collector",
+    "app.hybrid.recorder",
+    "app.hybrid.measurement",
+    "app.hybrid.paths",
+    "app.hybrid.session",
+    "app.runners.hybrid_preview",
+    "app.runners.hybrid_calibrate",
+    "app.runners.hybrid_measure",
+
 ]
 
 # Windows でしか存在しないモジュール。使うなら関数内 import か try で囲むこと。

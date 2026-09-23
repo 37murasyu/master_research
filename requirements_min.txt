@@ -2,7 +2,9 @@
 numpy
 scipy
 pandas
-opencv-python
+# mediapipe が opencv-contrib-python を要求する。opencv-python と両方入れると
+# 同じ cv2 ディレクトリに上書きで入り、どちらが使われるか分からなくなる。
+opencv-contrib-python
 matplotlib
 
 # mediapipe のバージョンは固定する。
@@ -27,6 +29,9 @@ PySide6
 segno
 
 ### Networking / I/O
+# スマホからランドマークを受け取る WebSocket サーバ（app/net/server.py）。
+# websockets.asyncio.server は 13 以降にある。
+websockets>=13
 requests
 boto3
 pyserial

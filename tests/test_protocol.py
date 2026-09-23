@@ -137,3 +137,119 @@ class TestHello:
     def test_hello_rejects_unknown_role(self):
         with pytest.raises(p.ProtocolError):
             p.decode(json.dumps({"type": "hello", "role": "left", "device": "x", "session": "s"}))
+
+
+# JPEG の最小形（SOI + EOI）。中身は見ないので、これで検査の条件を満たす。
+TINY_JPEG = b"\xff\xd8\xff\xd9"
+
+
+class TestCaptureRequest:
+    """PC → 端末の撮影指示。校正用の画像を撮ってもらう。"""
+
+    def test_round_trip(self):
+        original = p.CaptureRequest(id=7, at_ns=1_725_699_123_456_789_000)
+        assert p.decode(p.encode(original)) == original
+
+    def test_target_time_is_optional(self):
+        """時刻を指定しない（次のフレームでよい）場合も読めること。"""
+        decoded = p.decode('{"type": "capture_req", "id": 7}')
+        assert decoded == p.CaptureRequest(id=7, at_ns=None)
+
+    def test_size_and_quality_round_trip(self):
+        """ライブ表示用に小さく軽い JPEG を頼めること。校正は全解像度のまま。"""
+        original = p.CaptureRequest(id=9, max_width=640, quality=70)
+        assert p.decode(p.encode(original)) == original
+
+    def test_size_and_quality_are_omitted_when_unset(self):
+        """古い端末が知らない項目を送らない。"""
+        encoded = p.encode(p.CaptureRequest(id=1))
+        assert "max_width" not in encoded
+        assert "quality" not in encoded
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("max_width", 0),
+            ("max_width", -640),
+            ("max_width", True),
+            ("max_width", 640.5),
+            ("quality", 0),
+            ("quality", 101),
+            ("quality", "90"),
+        ],
+    )
+    def test_rejects_invalid_size_or_quality(self, field, value):
+        payload = {"type": "capture_req", "id": 1, field: value}
+        with pytest.raises(p.ProtocolError):
+            p.decode(json.dumps(payload))
+
+
+class TestCalibrationFrame:
+    """端末 → PC の校正用画像。姿勢推定と同じフレームを JPEG で送る。"""
+
+    def _frame(self, **overrides):
+        values = dict(
+            role="cam0",
+            id=3,
+            t_capture_ns=1_725_699_123_456_789_000,
+            width=1280,
+            height=720,
+            jpeg=TINY_JPEG,
+        )
+        values.update(overrides)
+        return p.CalibrationFrame(**values)
+
+    def test_round_trip(self):
+        original = self._frame()
+        assert p.decode(p.encode(original)) == original
+
+    def test_rejects_data_that_is_not_jpeg(self):
+        """画像でないものを掴むと、検出側が黙って 0 枚になる。"""
+        import base64
+
+        payload = json.dumps({
+            "type": "calib_frame", "role": "cam0", "id": 3,
+            "t_capture_ns": 1, "w": 1280, "h": 720,
+            "jpeg": base64.b64encode("これは画像ではない".encode("utf-8")).decode("ascii"),
+        })
+        with pytest.raises(p.ProtocolError):
+            p.decode(payload)
+
+    def test_rejects_broken_base64(self):
+        payload = json.dumps({
+            "type": "calib_frame", "role": "cam0", "id": 3,
+            "t_capture_ns": 1, "w": 1280, "h": 720, "jpeg": "!!!壊れている!!!",
+        })
+        with pytest.raises(p.ProtocolError):
+            p.decode(payload)
+
+    def test_rejects_an_oversized_image(self):
+        """無線の相手からの入力なので、受け取る大きさに上限を置く。"""
+        import base64
+
+        oversized = TINY_JPEG + b"\x00" * (p.MAX_CALIBRATION_BYTES + 1)
+        payload = json.dumps({
+            "type": "calib_frame", "role": "cam0", "id": 3,
+            "t_capture_ns": 1, "w": 1280, "h": 720,
+            "jpeg": base64.b64encode(oversized).decode("ascii"),
+        })
+        with pytest.raises(p.ProtocolError):
+            p.decode(payload)
+
+
+class TestHelloDeviceId:
+    """同じ機種 2 台を区別するための端末 ID。
+
+    ``Build.MODEL`` は 2 台とも "Pixel 7a" になる。機種名だけでは、
+    内部パラメータを取り違えても、役割を入れ替えても気づけない。
+    """
+
+    def test_device_id_round_trip(self):
+        original = p.Hello(role="cam1", device="Google Pixel 7a", session="ab12", device_id="9f3c1d")
+        assert p.decode(p.encode(original)) == original
+
+    def test_older_apps_without_device_id_still_connect(self):
+        decoded = p.decode(json.dumps({
+            "type": "hello", "role": "cam0", "device": "Google Pixel 7a", "session": "ab12",
+        }))
+        assert decoded.device_id is None

@@ -50,6 +50,19 @@ class ContractSampleTest {
                     landmarks = landmarks,
                 )
             )
+            // 端末 ID 付きの名乗り。同じ機種 2 台を見分け、校正時の端末と照合するのに使う
+            put(Protocol.hello("cam1", "Google Pixel 7a", "3fc590ba", deviceId = "0f3a9c5e21d4b87a"))
+            // 撮影要求への応答。中身は最小の JPEG（SOI + EOI）
+            put(
+                Protocol.calibrationFrame(
+                    role = "cam1",
+                    id = 9L,
+                    captureNanosPcClock = 1_725_699_123_500_000_000L,
+                    width = 640,
+                    height = 360,
+                    jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()),
+                )
+            )
         }
 
         val out = File(OUTPUT_PATH)
