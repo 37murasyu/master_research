@@ -10,11 +10,14 @@
 ゲージの行から取る。
 
 設定は「実験者用の詳細設定」の開示（既定で閉じる。R11-03）にしまう。中身は入力のラジオ、被験者番号、
-体重、「開発・診断用」の入れ子の開示（残りの設定フォーム）。画面に説明文は置かない。出力先は、
-終わった後の「出力フォルダ」リンクで開く。
+体重、使う校正の日時と「変更」リンク（混成のときだけ）、「開発・診断用」の入れ子の開示（残りの
+設定フォーム）。画面に説明文は置かない。出力先は、終わった後の「出力フォルダ」リンクで開く。
 """
 
 from __future__ import annotations
+
+import json
+from datetime import datetime
 
 from app.core.qt import QtCore, QtGui, QtWidgets
 from app.core.settings import Settings, measurement_output_dir
@@ -31,11 +34,30 @@ _HYBRID_ROLE = "hybrid_measure"
 _INPUT_ROLES = ("realtime", _HYBRID_ROLE)
 # 専用の欄を置くので、入れ子の設定フォームには並べない項目
 _DEDICATED_SETTINGS = frozenset({"SUBJECT_ID", "BODY_MASS_KG"})
+# 混成の校正のフォルダ名の書式（校正を保存する側が datetime.now() から付ける名前）
+_CALIBRATION_DIR_FORMAT = "%Y%m%d_%H%M%S_%f"
+
+
+def calibration_time_text() -> str:
+    """混成で使う校正（``latest.json`` が指すもの）の日時。読めなければ「未校正」。
+
+    ``latest.json`` を直接読む。校正の読み書きのモジュールは numpy などを読み込むので、
+    画面の表示のためだけには import しない。
+    """
+    try:
+        latest = json.loads((hybrid_paths.calibration_root() / "latest.json").read_text(encoding="utf-8"))
+        taken = datetime.strptime(latest["directory"], _CALIBRATION_DIR_FORMAT)
+    except (OSError, ValueError, KeyError, TypeError):
+        return "未校正"
+    return taken.strftime("%Y-%m-%d %H:%M")
 
 
 class MeasurePage(RunnerPage):
     TITLE = "リアルタイム計測"
     LOG_LABEL = "計測ログ"
+
+    # 「変更」リンク（校正）。MainWindow がキャリブレーション画面へ移る
+    calibration_requested = QtCore.Signal()
 
     def __init__(self, settings: Settings, parent: QtWidgets.QWidget | None = None):
         # RunnerPage.__init__ が _on_state を呼ぶので、そこで触るものは先に作っておく。
@@ -49,7 +71,7 @@ class MeasurePage(RunnerPage):
         self._last_frame: GaugeFrame | None = None
         super().__init__(settings, "realtime", parent)
         # 見せるかどうかは、ページに入ってから決める（親の無いうちに見せると独立の窓になる）。
-        self._joules_switch.setVisible(self._runner.role == _HYBRID_ROLE)
+        self._sync_input_widgets()
         self._badge.hide()  # 色だけで状態を示すバッジ。代わりに _run_status を出す
 
         self._runner.gauge_frame.connect(self._gauge_window.set_frame)
@@ -104,7 +126,7 @@ class MeasurePage(RunnerPage):
         return panel
 
     def _build_advanced(self) -> QtWidgets.QWidget:
-        """詳細設定の開示の中身。入力・被験者番号・体重の欄と、入れ子の「開発・診断用」。"""
+        """詳細設定の開示の中身。入力・被験者番号・体重・校正の欄と、入れ子の「開発・診断用」。"""
         self._locked_reason = QtWidgets.QLabel("計測中は変更できません")
         self._locked_reason.setVisible(False)
 
@@ -138,12 +160,28 @@ class MeasurePage(RunnerPage):
         mass_layout.addWidget(QtWidgets.QLabel("kg"))  # 単位は欄の直後（R9-08）
         mass_layout.addStretch(1)
 
+        # 使う校正の日時（R13-05）と「変更」リンク（R16-10）。混成の校正なので混成のときだけ出す
+        self._calibration_time = QtWidgets.QLabel(calibration_time_text())
+        self._calibration_link = QtWidgets.QLabel('<a href="#">変更</a>')
+        self._calibration_link.setTextFormat(QtCore.Qt.RichText)
+        self._calibration_link.setTextInteractionFlags(
+            QtCore.Qt.LinksAccessibleByMouse | QtCore.Qt.LinksAccessibleByKeyboard
+        )
+        self._calibration_link.linkActivated.connect(lambda _href: self.calibration_requested.emit())
+        self._calibration_row = QtWidgets.QWidget()
+        calibration_layout = QtWidgets.QHBoxLayout(self._calibration_row)
+        calibration_layout.setContentsMargins(0, 0, 0, 0)
+        calibration_layout.addWidget(self._calibration_time)
+        calibration_layout.addWidget(self._calibration_link)
+        calibration_layout.addStretch(1)
+
         self._editors = QtWidgets.QWidget()
-        rows = QtWidgets.QFormLayout(self._editors)
-        rows.setContentsMargins(0, 0, 0, 0)
-        rows.addRow("入力", inputs)
-        rows.addRow("被験者番号", self._subject_edit)
-        rows.addRow("体重", mass)
+        self._rows = QtWidgets.QFormLayout(self._editors)
+        self._rows.setContentsMargins(0, 0, 0, 0)
+        self._rows.addRow("入力", inputs)
+        self._rows.addRow("被験者番号", self._subject_edit)
+        self._rows.addRow("体重", mass)
+        self._rows.addRow("校正", self._calibration_row)
 
         self._form = SettingsForm(self._settings, exclude=_DEDICATED_SETTINGS)
         self._dev = Disclosure("開発・診断用", self._form)
@@ -159,6 +197,11 @@ class MeasurePage(RunnerPage):
     def shutdown(self) -> None:
         super().shutdown()
         self._gauge_window.close()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802  (Qt の命名規則)
+        # キャリブレーション画面で校正し直して戻ってきたときに、新しい日時を出す
+        super().showEvent(event)
+        self._calibration_time.setText(calibration_time_text())
 
     # -- 開始・停止 --------------------------------------------------------
     def _on_main_button(self) -> None:
@@ -200,7 +243,13 @@ class MeasurePage(RunnerPage):
         if not checked:
             return  # 外れた側の通知。入った側の通知で切り替える
         self._runner.role = _INPUT_ROLES[button_id]
-        self._joules_switch.setVisible(self._runner.role == _HYBRID_ROLE)
+        self._sync_input_widgets()
+
+    def _sync_input_widgets(self) -> None:
+        """入力が Mac＋Pixel のときだけ出すもの（J のスイッチ・校正の行。R15-01）。"""
+        hybrid = self._runner.role == _HYBRID_ROLE
+        self._joules_switch.setVisible(hybrid)
+        self._rows.setRowVisible(self._calibration_row, hybrid)
 
     def _open_output_folder(self, _href: str) -> None:
         folder = (hybrid_paths.measurement_root()

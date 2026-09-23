@@ -481,3 +481,89 @@ class TestAdvancedSettings:
         assert not page._output_link.isHidden(), "異常終了でも途中までの出力はある"
         url = _folder_link_url(page, monkeypatch)
         assert url == QtCore.QUrl.fromLocalFile(str(hybrid_paths.measurement_root()))
+
+
+# ---------------------------------------------------------------------------
+# 使う校正の日時と「変更」リンク
+# ---------------------------------------------------------------------------
+
+
+def _page_with_calibration_root(monkeypatch, root):
+    from app.hybrid import paths as hybrid_paths
+    from app.shell.page_measure import MeasurePage
+
+    monkeypatch.setattr(hybrid_paths, "calibration_root", lambda: root)
+    return MeasurePage(Settings())
+
+
+def _write_latest(root, directory: str) -> None:
+    import json
+
+    (root / "latest.json").write_text(json.dumps({"directory": directory}), encoding="utf-8")
+
+
+class TestCalibrationTime:
+    def test_calibration_time_is_read_from_latest_json(self, qt_app, monkeypatch, tmp_path):
+        _write_latest(tmp_path, "20260923_215130_123456")
+        page = _page_with_calibration_root(monkeypatch, tmp_path)
+        try:
+            assert page._calibration_time.text() == "2026-09-23 21:51"
+        finally:
+            page.shutdown()
+
+    @pytest.mark.parametrize("content", [None, "{", '{"directory": "latest"}', '{"other": 1}'])
+    def test_without_a_readable_calibration_it_says_uncalibrated(self, qt_app, monkeypatch, tmp_path, content):
+        if content is not None:
+            (tmp_path / "latest.json").write_text(content, encoding="utf-8")
+        page = _page_with_calibration_root(monkeypatch, tmp_path)
+        try:
+            assert page._calibration_time.text() == "未校正"
+        finally:
+            page.shutdown()
+
+    def test_calibration_time_is_reread_when_the_page_is_shown(self, qt_app, monkeypatch, tmp_path):
+        page = _page_with_calibration_root(monkeypatch, tmp_path)
+        try:
+            page.show()
+            assert page._calibration_time.text() == "未校正"
+            page.hide()
+            _write_latest(tmp_path, "20260924_080512_000001")  # キャリブレーション画面で校正した
+            page.show()
+            assert page._calibration_time.text() == "2026-09-24 08:05"
+        finally:
+            page.shutdown()
+            page.close()
+
+    def test_calibration_row_only_for_hybrid(self, page):
+        page._advanced.set_open(True)
+        _choose_input(page, USB)
+        assert not page._calibration_time.isVisibleTo(page), "USB の計測は混成の校正を使わない"
+        assert not page._calibration_link.isVisibleTo(page)
+        _choose_input(page, HYBRID)
+        assert page._calibration_time.isVisibleTo(page)
+        assert page._calibration_link.isVisibleTo(page)
+        assert page._advanced.isAncestorOf(page._calibration_link)
+
+    def test_page_reads_latest_json_without_calibration_io(self):
+        from pathlib import Path
+
+        import app.shell.page_measure as module
+
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "calibration_io" not in source, "GUI が校正の読み込み（numpy・cv2 側）を import している"
+
+    def test_change_link_requests_calibration_page(self, qt_app, monkeypatch, tmp_path):
+        from app.shell import main_window as mw
+
+        monkeypatch.setattr(mw.Settings, "default_path", classmethod(lambda cls: tmp_path / "settings.json"))
+        window = mw.MainWindow(Settings())
+        try:
+            page = window._pages[0]
+            requested = []
+            page.calibration_requested.connect(lambda: requested.append(True))
+            page._calibration_link.linkActivated.emit("#")
+            assert requested == [True]
+            assert window._nav.currentRow() == 1
+            assert window._stack.currentIndex() == 1
+        finally:
+            window.close()
