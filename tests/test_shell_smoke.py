@@ -111,3 +111,34 @@ class TestLogView:
         for i in range(view.MAX_BLOCKS + 500):
             view.append_text(f"行 {i}\n")
         assert view.blockCount() <= view.MAX_BLOCKS + 1
+
+
+class TestEkfCalibrationTask:
+    """S11 解析ページから、生 CSV を選んで EKF の較正プロファイルを作れる。
+
+    新しいページは作らず、解析の種類に 1 項目足す（設計メモ 実装 5）。起動は
+    ``--role script --module app.runners.tune_ekf`` の汎用経路で、生 CSV を位置引数で渡す。
+    """
+
+    def test_the_task_passes_the_raw_csv_to_the_tuning_command(self, qt_app, monkeypatch, tmp_path):
+        from app.shell.page_analyze import TASKS, AnalyzePage
+
+        task = next((t for t in TASKS if t.module == "app.runners.tune_ekf"), None)
+        assert task is not None, "解析ページに EKF の較正の項目が無い"
+        assert task.input_kind == "file" and task.input_option is None
+
+        page = AnalyzePage(Settings())
+        calls = []
+        monkeypatch.setattr(page._runner, "start",
+                            lambda settings, args, module=None: calls.append((args, module)) or True)
+        page._task_combo.setCurrentIndex(TASKS.index(task))
+        csv = str(tmp_path / "kpts3d_raw_0923_120000.csv")
+        page._input_edit.setText(csv)
+        page._run()
+        page.shutdown()
+        assert calls == [([csv], "app.runners.tune_ekf")]
+
+    def test_the_module_resolves_as_a_script(self):
+        from app import entry
+
+        assert entry.resolve_module("script", "app.runners.tune_ekf") == "app.runners.tune_ekf"

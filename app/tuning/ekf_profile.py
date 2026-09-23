@@ -29,7 +29,7 @@ import numpy as np
 from app.tuning.ekf_estimate import SeriesFit
 from app.tuning.ekf_likelihood import innovation_loglik
 from app.tuning.raw_capture import RawCapture, git_commit
-from extended_kalman_filter import SeriesNoise
+from extended_kalman_filter import EKFConfig, SeriesNoise
 
 SCHEMA_VERSION = 1
 FRAME = "runtime"  # 三角測量の軸入れ替え後
@@ -44,6 +44,10 @@ GATE_PERCENTILE = 99.7
 DT_TOLERANCE = 0.05
 # スケール不変の基準長に使う組（右肩–右肘）
 SCALE_REF_PAIR = (12, 14)
+# 実行時の基準長（肩–肘）として人体でありうる範囲 [m]。外れたら座標の単位が違う（欠陥 5）
+PLAUSIBLE_REF_LEN = (0.10, 0.60)
+# ディレクトリを渡したときに探すファイル名。生 CSV のサイドカー（kpts3d_raw_*.json）を拾わない
+PROFILE_GLOB = "ekf_profile_*.json"
 
 
 @dataclass(frozen=True)
@@ -187,6 +191,9 @@ def read_profile(path: str | Path) -> dict[str, Any]:
     for key, expected in (("schema_version", SCHEMA_VERSION), ("frame", FRAME), ("unit", UNIT)):
         if profile.get(key) != expected:
             raise ValueError(f"{Path(path).name} の {key} が {profile.get(key)!r}（{expected!r} のはず）")
+    # 生 CSV のサイドカーも schema_version / frame / unit が同じなので、上の検査だけでは通ってしまう
+    if not isinstance(profile.get("series"), dict):
+        raise ValueError(f"{Path(path).name} は較正プロファイルではない（series が無い）")
     return profile
 
 
@@ -198,6 +205,8 @@ class ProfileResolution:
     dt: float
     path: Path | None
     reason: str | None
+    # 較正時の基準長（build_profile の scale_ref）。実行時の長さとの比で q・r を掛け直す
+    scale_ref: dict[str, Any] | None = None
 
     def series_noise(self, landmark_ids: Sequence[int]) -> SeriesNoise:
         """実行時の配列（点 × 3 + 軸）に並べ替える。プロファイルに無い系列だけ落とす。"""
@@ -216,7 +225,7 @@ def _candidates(source: str | Path | None) -> list[Path]:
         return []
     path = Path(source)
     if path.is_dir():
-        return sorted(path.glob("*.json"))
+        return sorted(path.glob(PROFILE_GLOB))
     return [path] if path.is_file() else []
 
 
@@ -248,6 +257,99 @@ def resolve_profile(
             for lid, per_axis in profile["series"].items()
             for axis, entry in per_axis.items()
         }
-        return ProfileResolution(entries=entries, dt=float(profile["dt"]), path=path, reason=None)
+        return ProfileResolution(entries=entries, dt=float(profile["dt"]), path=path, reason=None,
+                                 scale_ref=profile.get("scale_ref"))
 
     return _builtin_resolution(dt, "dt_mismatch")
+
+
+def body_scale_ratio(scale_ref: Mapping[str, Any] | None, run_length: float) -> float:
+    """実行時の基準長と較正時の基準長の比 L_run / L_cal。``q_acc`` と ``r`` に 2 乗で効かせる（欠陥 5）。
+
+    基準長が人体としてありえない範囲なら例外にする。``r`` が小さすぎれば派手に発散するが、
+    大きすぎると静かに素通りするので、黙って使わない。``calib.py`` で校正し直すと座標が
+    m の 1/100 になる経路がある。プロファイルに基準長が無ければ 1（掛け直さない）。
+    """
+    low, high = PLAUSIBLE_REF_LEN
+    if not np.isfinite(run_length) or not (low <= run_length <= high):
+        raise ValueError(
+            f"実行時の肩–肘の長さ {run_length!r} m が人体の範囲 {low}〜{high} m に無い。"
+            " 座標の単位（校正の経路）を確かめること")
+    if not scale_ref:
+        return 1.0
+    return float(run_length) / float(scale_ref["median_len"])
+
+
+@dataclass(frozen=True)
+class RuntimeNoise:
+    """実行時の LandmarkEKF に渡す雑音パラメータと、その出どころ。"""
+
+    cfg: EKFConfig | SeriesNoise
+    origin: str   # "env"（環境変数のスカラー）| "profile" | "builtin"（同梱既定値）
+    resolution: ProfileResolution | None
+    sources: dict[str, int]   # 系列ごとの source の内訳
+    landmark_ids: tuple[int, ...]
+
+    def scaled(self, ratio: float) -> EKFConfig | SeriesNoise:
+        """基準長の比で掛け直した雑音パラメータ。環境変数のスカラーは掛け直さない。"""
+        if self.origin == "env" or self.resolution is None:
+            return self.cfg
+        return replace(self.resolution, entries={
+            key: entry.scaled(ratio) for key, entry in self.resolution.entries.items()
+        }).series_noise(self.landmark_ids)
+
+    def describe(self) -> str:
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(self.sources.items()))
+        where = "" if self.resolution is None or self.resolution.path is None else f" path={self.resolution.path}"
+        reason = "" if self.resolution is None or self.resolution.reason is None else f" reason={self.resolution.reason}"
+        return f"origin={self.origin}{where}{reason} 系列: {breakdown}"
+
+    def provenance(self) -> dict[str, Any]:
+        """サイドカー JSON に残す形。"""
+        return {
+            "origin": self.origin,
+            "path": None if self.resolution is None or self.resolution.path is None else str(self.resolution.path),
+            "reason": None if self.resolution is None else self.resolution.reason,
+            "profile_dt": None if self.resolution is None else self.resolution.dt,
+            "sources": dict(self.sources),
+        }
+
+
+def runtime_noise(
+    source: str | Path | None,
+    *,
+    dt: float,
+    bpf_enabled: bool,
+    landmark_ids: Sequence[int],
+    scalar: EKFConfig,
+) -> RuntimeNoise:
+    """実行時の EKF に渡す雑音パラメータを決める（設計メモ 実装 5、S9）。
+
+    - ``source``（``EKF_PROFILE``）が無ければ、環境変数のスカラー（今までの挙動）
+    - あれば ``resolve_profile`` で解決し、**プロファイルが勝つ**。GUI は ``EKF_Q_ACC`` / ``EKF_R`` を
+      必ず子プロセスに渡すので、スカラーを先にすると GUI 経由ではプロファイルが使われない
+    - dt が合わない・BPF が有効なら同梱既定値（理由は ``resolution.reason``）
+
+    系列はランドマーク ID の**昇順**に並べる（実行時の 3D 点列の並び）。``pose_keypoints`` の宣言順は
+    ID 順ではないので、そのまま並べると系列が黙って取り違えられる。
+    """
+    ids = tuple(sorted(int(lid) for lid in landmark_ids))
+    n_series = len(ids) * len(AXES)
+    if not source:
+        return RuntimeNoise(cfg=scalar, origin="env", resolution=None, sources={"env": n_series}, landmark_ids=ids)
+
+    resolution = resolve_profile(source, dt=dt, bpf_enabled=bpf_enabled)
+    known = list(resolution.entries.values())
+    spare = _median_entry(known, "global_median") if known else builtin_entry(resolution.dt)
+    sources: dict[str, int] = {}
+    for lid in ids:
+        for axis in AXES:
+            entry = resolution.entries.get((lid, axis), spare)
+            sources[entry.source] = sources.get(entry.source, 0) + 1
+    return RuntimeNoise(
+        cfg=resolution.series_noise(ids),
+        origin="profile" if resolution.reason is None else "builtin",
+        resolution=resolution,
+        sources=sources,
+        landmark_ids=ids,
+    )

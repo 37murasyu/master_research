@@ -72,6 +72,19 @@ TASKS: tuple[AnalysisTask, ...] = (
         input_kind="dir",
         input_option="--input-dir",
     ),
+    # EKF の自己チューニング（設計メモ 実装 5、S11）。計測が書き出す生 CSV から、系列ごとの
+    # (q_acc, r, gate_std) を最尤推定する。できたファイルを設定の EKF_PROFILE に指定する。
+    AnalysisTask(
+        label="EKF の較正プロファイルを作る",
+        module="app.runners.tune_ekf",
+        description=(
+            "計測が書き出した kpts3d_raw_*.csv（EKF の手前の 3D 座標）から、ランドマークの"
+            "平滑化の雑音パラメータを推定し、収録の隣に ekf_profile_*.json を書く。"
+            "設定の EKF_PROFILE に指定すると次の計測から使われる。"
+        ),
+        input_kind="file",
+        input_option=None,
+    ),
 )
 
 

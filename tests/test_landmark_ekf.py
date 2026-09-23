@@ -174,3 +174,123 @@ class TestSingleDefinition:
         )
         assert not defined, f"master_research_code.py:{defined} に LandmarkEKF の定義が残っている"
         assert imported, "master_research_code.py が extended_kalman_filter から LandmarkEKF を import していない"
+
+
+def _one_series(values, vectorized: bool = True, dt: float = 1 / 30, **kwargs) -> np.ndarray:
+    """1 点の x だけに意味のある観測を流し、x の推定位置の列を返す（y・z は 0 の定数）。"""
+    cfg = EKFConfig(q_acc=kwargs.pop("q_acc", 1e-3), r=kwargs.pop("r", 1e-4), gate_std=kwargs.pop("gate_std", 3.0))
+    ekf = LandmarkEKF(1, fs=1 / dt, cfg=cfg, vectorized=vectorized, **kwargs)
+    out = []
+    for v in values:
+        frame = np.array([[v, 0.0, 0.0]], dtype=float)
+        out.append(ekf.step(frame, dt)[0][0, 0])
+    return np.array(out)
+
+
+class TestRobustUpdate:
+    """S10 門の外の観測を捨てず、分散を膨らませて取り込む（``robust_gate``）。
+
+    門の外を捨てる方式は、ずれが大きくなるほど捨て続けて戻れない（欠陥 3。版 2 の実測で棄却率 99.87%）。
+    門の外では S' = y²/c² として更新する。補正量は P00·c²/y で |y| に反比例して縮むので、
+    外れ値 1 発には小さく反応し、段差が続けば少しずつ追いつく。
+    """
+
+    # 版 2 で推定した中央値。r は観測雑音 5 mm に相当する
+    CALIBRATED = {"q_acc": 0.122, "r": 2.59e-5}
+
+    @staticmethod
+    def _sine(n: int = 900, seed: int = 0):
+        """振幅 0.1 m・0.5 Hz の往復に 5 mm の観測雑音。プッシュアップの肩の上下に近い。"""
+        rng = np.random.default_rng(seed)
+        truth = 0.1 * np.sin(2 * np.pi * 0.5 * np.arange(n) / 30)
+        return truth, truth + rng.normal(0, 0.005, n)
+
+    def test_rejecting_gate_loses_track_of_a_smooth_motion(self):
+        # 比較の前提: 捨てる方式は、ずれるほど捨て続けて戻れない（死のスパイラル）
+        truth, meas = self._sine()
+        est = _one_series(meas, **self.CALIBRATED)
+        rms = np.sqrt(np.mean((est[30:] - truth[30:]) ** 2))
+        assert rms > 0.1, f"前提が崩れている: 捨てる方式でも追従した（誤差 RMS {rms * 1000:.1f} mm）"
+
+    def test_robust_gate_tracks_a_smooth_motion(self):
+        truth, meas = self._sine()
+        est = _one_series(meas, robust_gate=True, **self.CALIBRATED)
+        rms = np.sqrt(np.mean((est[30:] - truth[30:]) ** 2))
+        assert rms < 0.01, f"往復に追従できていない（誤差 RMS {rms * 1000:.1f} mm）"
+
+    def test_robust_gate_settles_after_a_level_shift(self):
+        """0.2 m の段差。捨てる方式は 2.4 m まで行き過ぎて 83 フレームかかる（実測）。"""
+        est = _one_series(np.r_[np.zeros(60), np.full(300, 0.2)], robust_gate=True, **self.CALIBRATED)[60:]
+        settled = next(i for i in range(len(est)) if np.all(np.abs(est[i:] - 0.2) < 0.01))
+        assert settled <= 60, f"段差の後 ±1 cm に収まるまで {settled} フレームかかった"
+        assert est.max() < 0.4, f"段差 0.2 m に対して {est.max():.2f} m まで行き過ぎた"
+
+    def test_a_single_outlier_barely_moves_the_estimate(self):
+        values = np.zeros(120)
+        values[60] = 0.5
+        est = _one_series(values, q_acc=1e-3, r=1e-4, robust_gate=True)
+        assert abs(est[60]) < 0.05, f"外れ値 1 発で {est[60]:.3f} m 引きずられた"
+        assert abs(est[-1]) < 1e-3, "外れ値の後に元へ戻らない"
+
+    @pytest.mark.parametrize("dt", DTS.values(), ids=DTS.keys())
+    def test_sequential_and_vectorized_agree(self, dt):
+        cfg = EKFConfig(q_acc=1e-3, r=1e-3, gate_std=3.0)
+        meas = _measurements()
+        runs = []
+        for vectorized in (True, False):
+            ekf = LandmarkEKF(N_POINTS, fs=30.0, cfg=cfg, vectorized=vectorized, robust_gate=True)
+            runs.append(np.stack([ekf.step(frame, dt)[0] for frame in meas]))
+        v, s = runs
+        np.testing.assert_array_equal(np.isnan(v), np.isnan(s))
+        finite = np.isfinite(s)
+        rel = np.abs(v[finite] - s[finite]) / (1.0 + np.abs(s[finite]))
+        assert rel.max() <= 1e-12, f"ロバスト更新で 2 実装が食い違う（最大相対差 {rel.max():.2e}）"
+
+    def test_the_default_keeps_the_rejecting_gate(self):
+        """``run_ekf`` などの既存の契約は変えない。ロバスト更新は指定したときだけ。"""
+        assert EKFConfig().robust_gate is False
+
+
+class TestMaxGap:
+    """S10 欠測が上限（秒）を超えたら外挿をやめて NaN を返し、次の観測でやり直す（欠陥 4）。"""
+
+    @staticmethod
+    def _with_gap(n_missing: int) -> np.ndarray:
+        return np.r_[np.full(30, 0.1), np.full(n_missing, np.nan), np.full(10, 0.3)]
+
+    @pytest.mark.parametrize("vectorized", [True, False], ids=["vectorized", "sequential"])
+    def test_a_long_gap_returns_nan_then_restarts(self, vectorized):
+        est = _one_series(self._with_gap(30), vectorized, max_gap_s=0.5)   # 30 フレーム = 1.0 s
+        # 0.5 s ちょうど（15 フレーム目）は浮動小数の足し上げで揺れるので、判定はその前後で見る
+        assert np.all(np.isfinite(est[30:44])), "上限（0.5 s = 15 フレーム）までは外挿を返す"
+        assert np.all(np.isnan(est[46:60])), "上限を超えても外挿を返し続けている"
+        assert est[60] == pytest.approx(0.3), "欠測の後の最初の観測で初期化し直していない"
+
+    @pytest.mark.parametrize("vectorized", [True, False], ids=["vectorized", "sequential"])
+    def test_a_short_gap_keeps_predicting(self, vectorized):
+        est = _one_series(self._with_gap(10), vectorized, max_gap_s=0.5)
+        assert np.all(np.isfinite(est))
+
+    def test_the_limit_is_in_seconds_not_frames(self):
+        # dt = 8/30 s なら 0.5 s は 2 フレーム弱。3 フレームの穴で NaN になる
+        est = _one_series(self._with_gap(3), dt=8 / 30, max_gap_s=0.5)
+        assert np.isnan(est[32])
+
+    def test_zero_means_no_limit(self):
+        est = _one_series(self._with_gap(60))
+        assert np.all(np.isfinite(est))
+
+
+class TestSetNoise:
+    """S9 実行時に基準長の比が分かった時点で、雑音パラメータを差し替えられる。"""
+
+    @pytest.mark.parametrize("vectorized", [True, False], ids=["vectorized", "sequential"])
+    def test_matches_a_filter_built_with_the_new_values(self, vectorized):
+        meas = _measurements(200)
+        new = SeriesNoise.uniform(N_POINTS * 3, EKFConfig(q_acc=0.05, r=4e-5, gate_std=2.5))
+        swapped = LandmarkEKF(N_POINTS, fs=30.0, cfg=EKFConfig(), vectorized=vectorized)
+        fresh = LandmarkEKF(N_POINTS, fs=30.0, cfg=new, vectorized=vectorized)
+        swapped.set_noise(new)
+        a = np.stack([swapped.step(f, 1 / 30)[0] for f in meas])
+        b = np.stack([fresh.step(f, 1 / 30)[0] for f in meas])
+        np.testing.assert_array_equal(a, b)

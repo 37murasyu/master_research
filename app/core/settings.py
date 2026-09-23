@@ -145,6 +145,17 @@ CURATED: dict[str, dict[str, Any]] = {
         "group": "診断",
         "description": "入出力まわりの詳細ログを出す。カメラが開かないときの切り分けに使う。",
     },
+    # 較正プロファイル（設計メモ 実装 5、S9）。指定するとプロファイルが EKF_Q_ACC / EKF_R より
+    # 優先する。EKF_Q_ACC / EKF_R は UI に出さない（widgets の小数 4 桁で推定値 r≈2.6e-5 が 0 に丸まる）
+    "EKF_PROFILE": {
+        "type": "str",
+        "ui_visible": True,
+        "group": "カルマンフィルタ",
+        "description": (
+            "EKF の較正プロファイル（ファイルかフォルダ）。フォルダなら ekf_profile_*.json のうち"
+            "処理の間隔が合うものを使う。空なら従来の固定値。プロファイルは解析ページで生 CSV から作れる。"
+        ),
+    },
 }
 
 

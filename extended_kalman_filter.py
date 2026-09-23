@@ -37,6 +37,12 @@ class EKFConfig:
     q_acc: float = 1e-3  # continuous accel noise intensity
     r: float = 1e-3      # measurement noise variance
     gate_std: float = 3.0  # outlier gate in sigma (<=0 to disable)
+    # 門の外の観測を捨てずに、分散を S' = y²/c² に膨らませて取り込む（Huber 型の縮小）。
+    # 捨てる方式は、ずれるほど捨て続けて戻れない（設計メモ 欠陥 3）。既存の run_ekf の挙動を
+    # 変えないよう既定はオフ。LandmarkEKF の実行時は master_research_code.py がオンにする。
+    robust_gate: bool = False
+    # 欠測がこの秒数を超えたら外挿をやめて NaN を返し、次の観測で初期化し直す（欠陥 4）。0 は無制限。
+    max_gap_s: float = 0.0
 
     # custom measurement model (optional)
     h_fn: Optional[Callable[[np.ndarray], float]] = None
@@ -97,6 +103,16 @@ def constant_acceleration_model(dt: float) -> Tuple[np.ndarray, np.ndarray]:
     return F, q_unit
 
 
+def gap_expired(gap_s, max_gap_s: float):
+    """欠測の長さが上限を超えたか。0 以下の上限は無制限。
+
+    欠測の長さは dt の足し上げなので、ちょうど上限のところで丸め誤差に揺れないよう少し余裕を持たせる。
+    """
+    if max_gap_s <= 0:
+        return np.zeros_like(gap_s, dtype=bool) if isinstance(gap_s, np.ndarray) else False
+    return gap_s > max_gap_s * (1.0 + 1e-9)
+
+
 class ExtendedKalman1D:
     """1D EKF with constant-acceleration process and configurable measurement."""
 
@@ -111,6 +127,7 @@ class ExtendedKalman1D:
         self.x = np.zeros(3, dtype=float)  # [x, v, a]
         self.P = np.eye(3, dtype=float)
         self.initialized = False
+        self._gap_s = 0.0  # 連続した欠測の長さ [s]
 
     def _predict(self, dt: float) -> None:
         F, q_unit = constant_acceleration_model(dt)
@@ -136,26 +153,38 @@ class ExtendedKalman1D:
             self.x[0] = float(z)
             self.P = np.eye(3, dtype=float)
             self.initialized = True
+            self._gap_s = 0.0
             return float(self.x[0]), float(self.x[1]), float(self.x[2])
 
         self._predict(dt)
         if z is None:
+            self._gap_s += dt
+            if gap_expired(self._gap_s, self.cfg.max_gap_s):
+                self.initialized = False
+                return float("nan"), float("nan"), float("nan")
             return float(self.x[0]), float(self.x[1]), float(self.x[2])
+        self._gap_s = 0.0
 
         z_pred, H = self._measure(self.x)
         y = float(z) - z_pred
         # H P H^T は (1,1) 配列。NumPy 2 は float() に 0 次元以外を渡すと TypeError にする
-        S = float((H @ self.P @ H.T)[0, 0] + self.cfg.r)
+        HPH = float((H @ self.P @ H.T)[0, 0])
+        S = HPH + self.cfg.r
         if S <= 0:
             return float(self.x[0]), float(self.x[1]), float(self.x[2])
+        r_eff = self.cfg.r
         if self.cfg.gate_std > 0 and abs(y) > self.cfg.gate_std * np.sqrt(S):
-            return float(self.x[0]), float(self.x[1]), float(self.x[2])
+            if not self.cfg.robust_gate:
+                return float(self.x[0]), float(self.x[1]), float(self.x[2])
+            # 門の外: 正規化イノベーションがちょうど c になるまで観測分散を膨らませて取り込む
+            S = y * y / (self.cfg.gate_std * self.cfg.gate_std)
+            r_eff = S - HPH
 
         K = (self.P @ H.T) / S  # (3x1)
         self.x = self.x + (K[:, 0] * y)
         I = np.eye(3, dtype=float)
         KH = K @ H
-        self.P = (I - KH) @ self.P @ (I - KH).T + K * self.cfg.r * K.T
+        self.P = (I - KH) @ self.P @ (I - KH).T + K * r_eff * K.T
         return float(self.x[0]), float(self.x[1]), float(self.x[2])
 
 
@@ -244,6 +273,8 @@ class LandmarkEKF:
         bpf_high: float = 0.0,
         bpf_order: int = 2,
         vectorized: bool = True,
+        robust_gate: bool = False,
+        max_gap_s: float = 0.0,
     ) -> None:
         if isinstance(cfg, EKFConfig) and (cfg.h_fn is not None or cfg.h_jac_fn is not None):
             raise ValueError(
@@ -252,6 +283,9 @@ class LandmarkEKF:
             )
         self.n_points = int(n_points)
         self.cfg = cfg
+        # 門の外の扱い（捨てる／分散を膨らませて取り込む）と、欠測の上限 [s]。EKFConfig の同名の項目を参照
+        self.robust_gate = bool(robust_gate)
+        self.max_gap_s = float(max_gap_s)
         # 系列（点 × 軸）ごとの (q_acc, r, gate_std)。スカラー設定なら全系列同値にする。
         # 並びは point*3 + axis で、観測の (n_points, 3) を reshape(-1) した順と一致する。
         n_series = self.n_points * 3
@@ -267,6 +301,7 @@ class LandmarkEKF:
             self._X = np.zeros((_n, 3), dtype=float)
             self._P = np.tile(self._I3, (_n, 1, 1))
             self._init = np.zeros(_n, dtype=bool)
+            self._gap = np.zeros(_n, dtype=float)  # 連続した欠測の長さ [s]
             # F/Q は dt にしか依存しないので (dt, F, Q) を1件キャッシュする
             self._fq = None
             # Joseph 形式の (I - KH)。列1,2 は常に単位行列のままなので使い回す
@@ -274,16 +309,7 @@ class LandmarkEKF:
             self.filters = None
         else:
             self.filters = [
-                [
-                    ExtendedKalman1D(
-                        EKFConfig(
-                            q_acc=float(self._q_acc[i * 3 + j]),
-                            r=float(self._r[i * 3 + j]),
-                            gate_std=float(self._gate_std[i * 3 + j]),
-                        )
-                    )
-                    for j in range(3)
-                ]
+                [ExtendedKalman1D(self._series_config(i * 3 + j)) for j in range(3)]
                 for i in range(self.n_points)
             ]
         # streaming band-pass (optional)
@@ -300,6 +326,32 @@ class LandmarkEKF:
                 zi = lfilter_zi(self._bpf_b, self._bpf_a)
                 self._bpf_state = np.tile(zi, (self.n_points, 3, 1))
                 self._bpf_enabled = True
+
+    @property
+    def bandpass_enabled(self) -> bool:
+        """前処理のバンドパスが実際に有効か（SciPy が無い・帯域が不正なら無効）。"""
+        return self._bpf_enabled
+
+    def _series_config(self, k: int) -> EKFConfig:
+        """逐次版の系列 k の設定。ベクトル化版と同じ値・同じ門の扱いにする。"""
+        return EKFConfig(
+            q_acc=float(self._q_acc[k]), r=float(self._r[k]), gate_std=float(self._gate_std[k]),
+            robust_gate=self.robust_gate, max_gap_s=self.max_gap_s,
+        )
+
+    def set_noise(self, noise) -> None:
+        """雑音パラメータ（SeriesNoise か EKFConfig）を差し替える。状態はそのまま引き継ぐ。
+
+        実行時に基準長の比（L_run / L_cal）が分かった時点で、較正値を体格に合わせて掛け直すのに使う。
+        """
+        n_series = self.n_points * 3
+        noise = noise if isinstance(noise, SeriesNoise) else SeriesNoise.uniform(n_series, noise)
+        self._q_acc, self._r, self._gate_std = noise.as_arrays(n_series)
+        self._fq = None  # Q は q_acc に比例するので作り直す
+        if not self.vectorized:
+            for i in range(self.n_points):
+                for j in range(3):
+                    self.filters[i][j].cfg = self._series_config(i * 3 + j)
 
     def _apply_bpf(self, arr: np.ndarray) -> np.ndarray:
         if not self._bpf_enabled:
@@ -323,7 +375,7 @@ class LandmarkEKF:
           - 未初期化 かつ 観測あり  -> x=[z,0,0], P=I で初期化（predict も update もしない）
           - 初期化済み              -> predict。欠測 / S<=0 / ゲート外 なら predict のみ
         """
-        X, P, init = self._X, self._P, self._init
+        X, P, init, gap = self._X, self._P, self._init, self._gap
         z = arr.reshape(-1)
         valid = np.isfinite(z)
 
@@ -334,6 +386,7 @@ class LandmarkEKF:
             X[new, 0] = z[new]
             P[new] = self._I3
             init[new] = True
+            gap[new] = 0.0
 
         # 2) 既に初期化済みだったものだけ predict（今回初期化した分は除く）
         pred = init & ~new
@@ -348,16 +401,33 @@ class LandmarkEKF:
             X[pi] = X[pi] @ F.T
             P[pi] = F @ P[pi] @ F.T + Q[pi]
 
+            # 欠測の上限（秒）。超えたら未初期化に戻し、NaN を返して次の観測でやり直す
+            if self.max_gap_s > 0:
+                missing = pi[~valid[pi]]
+                gap[missing] += dt
+                gap[pi[valid[pi]]] = 0.0
+                expired = missing[gap_expired(gap[missing], self.max_gap_s)]
+                init[expired] = False
+
             # 3) 観測がある行だけ update（H = [1,0,0] なので行列積は不要）
             ui = pi[valid[pi]]
             if ui.size:
                 y = z[ui] - X[ui, 0]
-                S = P[ui, 0, 0] + self._r[ui]
+                HPH = P[ui, 0, 0]
+                S = HPH + self._r[ui]
+                r_eff = self._r[ui].copy()
                 ok = S > 0.0
                 gate = self._gate_std[ui]
                 gated = ok & (gate > 0.0)  # gate_std <= 0 の系列はゲート無効（逐次版と同じ）
                 if gated.any():
-                    ok[gated] = np.abs(y[gated]) <= gate[gated] * np.sqrt(S[gated])
+                    outside = np.zeros_like(ok)
+                    outside[gated] = np.abs(y[gated]) > gate[gated] * np.sqrt(S[gated])
+                    if self.robust_gate:
+                        # 門の外: 正規化イノベーションがちょうど c になるまで観測分散を膨らませる
+                        S = np.where(outside, y * y / np.where(outside, gate * gate, 1.0), S)
+                        r_eff = np.where(outside, S - HPH, r_eff)
+                    else:
+                        ok &= ~outside
                 si = ui[ok]
                 if si.size:
                     Ps = P[si]
@@ -370,7 +440,7 @@ class LandmarkEKF:
                     np.negative(K, out=A[:, :, 0])
                     A[:, 0, 0] += 1.0
                     P[si] = A @ Ps @ np.transpose(A, (0, 2, 1)) \
-                        + self._r[si][:, None, None] * (K[:, :, None] * K[:, None, :])
+                        + r_eff[ok][:, None, None] * (K[:, :, None] * K[:, None, :])
 
         # 未初期化のものは NaN（逐次版と同じ）
         out = X if init.all() else np.where(init[:, None], X, np.nan)
@@ -407,5 +477,6 @@ __all__ = [
     "LandmarkEKF",
     "SeriesNoise",
     "constant_acceleration_model",
+    "gap_expired",
     "run_ekf",
 ]

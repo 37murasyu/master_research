@@ -32,6 +32,7 @@ import pandas as pd
 import csv
 import json
 from extended_kalman_filter import EKFConfig, LandmarkEKF
+from app.tuning.ekf_profile import SCALE_REF_PAIR, body_scale_ratio, runtime_noise
 from app.tuning.raw_capture import RawCaptureWriter, git_commit
 from pose_runtime import PoseEstimator
 from logging_setup import setup_logging, get_logger
@@ -183,6 +184,14 @@ EKF_BPF_HIGH = float(os.getenv('EKF_BPF_HIGH', '0'))
 EKF_BPF_ORDER = int(os.getenv('EKF_BPF_ORDER', '2'))
 # n_points x 3 本のスカラーEKFを配列演算で一括処理する（0 で従来のPythonループ）
 EKF_VECTORIZED = env_flag('EKF_VECTORIZED', True)
+# 較正プロファイル（ファイルかディレクトリ）。解決できれば EKF_Q_ACC / EKF_R より優先する
+# （app.tuning.ekf_profile.runtime_noise。設計メモ 実装 5、S9）
+EKF_PROFILE = os.getenv('EKF_PROFILE', '').strip()
+# 門の外の観測を捨てずに分散を膨らませて取り込む（S10）。捨てる方式は往復運動で追従を失う
+EKF_ROBUST_GATE = env_flag('EKF_ROBUST_GATE', True)
+# 欠測がこの秒数を超えたら外挿をやめて NaN を返す（S10）。0 は無制限。
+# TODO(S6): 実機の欠測長の分布から既定値を決める。NaN が下流に流れるので、決めるまでは無制限
+EKF_MAX_GAP_S = float(os.getenv('EKF_MAX_GAP_S', '0'))
 
 # 肘の角度・トルクのフレーム蓄積バッファ（1サイwクル分）
 _E_buffers = {
@@ -1737,15 +1746,8 @@ if not writer1.isOpened():
 kpts_3d = []  # 3Dキーポイントデータを格納するリスト
 mono3d_records = []  # 単眼(Mediapipe world) 3D 座標の記録
 
+# EKF は処理の間隔 _DYN_DT が決まってから作る（下の「EKF（ランドマークの平滑化）」）
 landmark_ekf = None
-if EKF_ENABLE:
-    try:
-        _ekf_cfg = EKFConfig(q_acc=EKF_Q_ACC, r=EKF_R, gate_std=EKF_GATE_STD)
-        landmark_ekf = LandmarkEKF(len(pose_keypoints), fs=fps, cfg=_ekf_cfg, bpf_low=EKF_BPF_LOW, bpf_high=EKF_BPF_HIGH, bpf_order=EKF_BPF_ORDER, vectorized=EKF_VECTORIZED)
-        print(f"[EKF] enabled: q_acc={EKF_Q_ACC} r={EKF_R} gate={EKF_GATE_STD} bpf=({EKF_BPF_LOW},{EKF_BPF_HIGH})")
-    except Exception as _ekf_init_e:
-        print(f"[EKF] disabled (init failed): {_ekf_init_e}")
-        landmark_ekf = None
 
 DEBUG_LOGS = env_flag('DEBUG_LOGS', False)
 # 追加: 動力学＆姿勢デバッグの詳細トグル（必要時のみON）
@@ -2643,6 +2645,29 @@ print(f"[DT] dt={_DYN_DT:.5f}s ({_dyn_dt_source})"
 _dyn_dt_prev_start = None
 _dyn_dt_warned = False
 
+# ===================== EKF（ランドマークの平滑化） =====================
+# _DYN_DT が決まってから作る。かつてはカメラの fps で BPF を設計しており、間引き（既定で 8 フレームに
+# 1 回）の分だけ帯域が 8 倍ずれていた（設計メモ 欠陥 2）。雑音パラメータは較正プロファイル
+# （EKF_PROFILE）が解決できればそれが勝ち、指定が無ければ環境変数のスカラー、dt が合わない・BPF が
+# 有効なら同梱既定値（app.tuning.ekf_profile.runtime_noise）。系列はランドマーク ID の昇順。
+_ekf_noise = None
+_ekf_scale_pending = False
+_ekf_ref_lengths = []
+if EKF_ENABLE:
+    _ekf_scalar = EKFConfig(q_acc=EKF_Q_ACC, r=EKF_R, gate_std=EKF_GATE_STD)
+    landmark_ekf = LandmarkEKF(
+        len(pose_keypoints), fs=1.0 / _DYN_DT, cfg=_ekf_scalar,
+        bpf_low=EKF_BPF_LOW, bpf_high=EKF_BPF_HIGH, bpf_order=EKF_BPF_ORDER, vectorized=EKF_VECTORIZED,
+        robust_gate=EKF_ROBUST_GATE, max_gap_s=EKF_MAX_GAP_S)
+    _ekf_noise = runtime_noise(
+        EKF_PROFILE or None, dt=_DYN_DT, bpf_enabled=landmark_ekf.bandpass_enabled,
+        landmark_ids=pose_keypoints, scalar=_ekf_scalar)
+    landmark_ekf.set_noise(_ekf_noise.cfg)
+    # 体格の比（L_run / L_cal）は先頭 INERTIA_LENGTH_FRAMES フレームの肩–肘の中央値で決めて掛け直す
+    _ekf_scale_pending = _ekf_noise.origin == "profile" and bool(_ekf_noise.resolution.scale_ref)
+    print(f"[EKF] enabled: {_ekf_noise.describe()} robust_gate={EKF_ROBUST_GATE} "
+          f"max_gap={EKF_MAX_GAP_S}s bpf=({EKF_BPF_LOW},{EKF_BPF_HIGH}) fs={1.0 / _DYN_DT:.3f}Hz")
+
 # ===================== EKF 較正用の生 3D 座標 =====================
 # 三角測量の直後・EKF の手前の値を、処理したフレームごとに追記する
 # （docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md の「実装 0」）。
@@ -2670,6 +2695,11 @@ _raw_capture = RawCaptureWriter(
         "EKF_BPF_HIGH": EKF_BPF_HIGH,
         "EKF_BPF_ORDER": EKF_BPF_ORDER,
         "EKF_VECTORIZED": bool(EKF_VECTORIZED),
+        "EKF_PROFILE": EKF_PROFILE or None,
+        "EKF_ROBUST_GATE": bool(EKF_ROBUST_GATE),
+        "EKF_MAX_GAP_S": EKF_MAX_GAP_S,
+        # 実際に使った雑音パラメータの出どころ（EKF_Q_ACC / EKF_R はプロファイルがあれば使われない）
+        "ekf_noise": None if _ekf_noise is None else _ekf_noise.provenance(),
         "file_mode": bool(file_mode),
         "CALIB_BASE_DIR": CALIB_BASE_DIR or None,
         "git_commit": git_commit(folder_path),
@@ -2999,10 +3029,26 @@ while True:
     nan_3d = int(np.sum(~np.all(np.isfinite(transformed_p3ds), axis=1)))
     if DEBUG_LOGS and WHILE_COUNT % 30 == 0 and nan_3d:
         print(f"[DBG] frame {WHILE_COUNT}: non-finite 3D points={nan_3d}")
+    if _ekf_scale_pending:
+        # 体格の比で較正値を掛け直す（設計メモ 欠陥 5）。人体としてありえない長さなら座標の単位が
+        # 違うので計測を止める。r が大きすぎると静かに素通りするため、黙って使わない
+        _ref_a, _ref_b = (sorted(pose_keypoints).index(i) for i in SCALE_REF_PAIR)
+        _ekf_ref_lengths.append(float(np.linalg.norm(transformed_p3ds[_ref_a] - transformed_p3ds[_ref_b])))
+        if len(_ekf_ref_lengths) >= INERTIA_LENGTH_FRAMES:
+            _run_len = float(np.nanmedian(_ekf_ref_lengths))
+            try:
+                _ratio = body_scale_ratio(_ekf_noise.resolution.scale_ref, _run_len)
+            except ValueError as _scale_e:
+                print(f"[EKF] {_scale_e}。計測を止めます", flush=True)
+                break
+            landmark_ekf.set_noise(_ekf_noise.scaled(_ratio))
+            _ekf_scale_pending = False
+            print(f"[EKF] 体格の比 L_run/L_cal = {_ratio:.3f}（L_run={_run_len:.3f} m）で較正値を掛け直した")
     if landmark_ekf is not None:
+        # 数値の破綻だけを拾う。形の不整合などバグ由来の例外は握りつぶさない（設計メモ 実装 2）
         try:
             transformed_p3ds, _vel_filt, _acc_filt = landmark_ekf.step(transformed_p3ds, _DYN_DT)
-        except Exception as _ekf_step_e:  # noqa: BLE001
+        except (FloatingPointError, np.linalg.LinAlgError) as _ekf_step_e:
             if WHILE_COUNT % 120 == 0:
                 print(f"[EKF] step failed (frame={WHILE_COUNT}): {_ekf_step_e}")
     kpts_3d.append(transformed_p3ds)
@@ -3015,7 +3061,8 @@ while True:
         break
     _cycle_axis_idx = 1 if RT_CYCLE_AXIS == 'y' else (2 if RT_CYCLE_AXIS == 'z' else 0)
     _cycle_value_now = transformed_p3ds[0][_cycle_axis_idx]
-    if 4 < WHILE_COUNT < 15:
+    if 4 < WHILE_COUNT < 15 and np.isfinite(_cycle_value_now):
+        # 欠測（EKF の欠測上限を超えた NaN を含む）で基準値が NaN になると、以後サイクルが検出されない
         z_value += _cycle_value_now / 10
     elif WHILE_COUNT == 15:
         detector = PushCycleDetector(

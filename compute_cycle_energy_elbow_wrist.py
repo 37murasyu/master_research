@@ -12,14 +12,15 @@ from compute_torque_from_pose import (
     WRIST_BASE_SEGMENTS_RIGHT,
     compute_segment_kinematics,
 )
-from config import THEORETICAL_WORK_COEFF
+from config import COM_FRACTIONS, SEGMENT_MASS_FRACTIONS, THEORETICAL_WORK_COEFF
 from push_up_model import hand_point, joint_axes
 from utils import compute_local_torque
 
-FOREARM_MASS_FRAC = 0.0160
-HAND_MASS_FRAC = 0.0060
-FOREARM_COM_FRAC = 0.430
-HAND_COM_FRAC = 0.506
+# 理論 1RM 仕事量（分母）の体節パラメータ。値は config に集約してある（Winter）
+FOREARM_MASS_FRAC = SEGMENT_MASS_FRACTIONS["forearm"]
+HAND_MASS_FRAC = SEGMENT_MASS_FRACTIONS["hand"]
+FOREARM_COM_FRAC = COM_FRACTIONS["forearm"]
+HAND_COM_FRAC = COM_FRACTIONS["hand"]
 DEFAULT_FPS = 30.0
 
 RIGHT = {
