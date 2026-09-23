@@ -173,3 +173,23 @@ def test_the_demo_moves_the_gauge_without_torque(fakes, capsys, monkeypatch):
     assert max(f.parts["elbow_R"].now or 0.0 for f in frames) > 1.0
     folder = next(line.split("保存: ", 1)[1] for line in captured.out.splitlines() if line.startswith("保存: "))
     assert json.loads((Path(folder) / "meta.json").read_text(encoding="utf-8"))["demo"] is True
+
+
+def test_hybrid_replay_takes_over_before_any_device_opens(monkeypatch):
+    """GUI は子へ引数を渡さないので、``HYBRID_REPLAY`` があれば計測の入口が再生（``app.runners.hybrid_replay``）へ渡す。
+
+    カメラ・姿勢推定・PhoneLink は作らない（再生は記録した 2D を流すだけで、Mac のカメラも Pixel も要らない）。
+    """
+    import app.runners.hybrid_replay as hybrid_replay
+
+    calls = []
+
+    def boom(*args, **kwargs):
+        raise AssertionError("再生のときに機器を開いた")
+
+    monkeypatch.setenv("HYBRID_REPLAY", "/somewhere/measure/20260923_000000_000000")
+    monkeypatch.setattr(hybrid_replay, "main", lambda argv=None: calls.append(argv) or 0)
+    for name in ("MacCamera", "PoseDetector", "PhoneLink", "LiveSession", "load_calibration"):
+        monkeypatch.setattr(hybrid_measure, name, boom)
+    assert hybrid_measure.main([]) == 0
+    assert calls == [[]]

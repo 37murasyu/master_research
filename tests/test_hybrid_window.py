@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import json
-import warnings
 
 import numpy as np
 import pytest
@@ -25,7 +24,7 @@ from app.hybrid.measurement import MeasurementSession
 from app.net.protocol import LandmarkFrame
 from app.runners.network_measure import ImplausibleBodyScale, MeasurementConfig, NetworkMeasurement
 from config import pose_keypoints
-from hybrid_pushup import SLOT, PushUp, body_cm, pushup_pairs, run, runtime_m
+from hybrid_pushup import SLOT, body_cm, runtime_m
 from test_hybrid_ekf import _profile
 from test_network_measure import _pair_from_pixels, _project, _stereo_projections
 

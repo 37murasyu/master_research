@@ -10,7 +10,7 @@
 
 再利用しているもの:
     push_up_model（座位プッシュアップのモデル。USB・オフライン経路と共有）
-        estimate_gravity / joint_axes / push_up_torques / segment_from_storage
+        joint_axes / push_up_torques / segment_from_storage（重力は app.hybrid.gravity 経由で estimate_gravity）
     utils.compute_local_torque / compute_joint_power
     utils_dynamic.calculate_inertia_tensor
     link_vector_calculator_module.LinkVectorCalculator
@@ -67,7 +67,6 @@ from link_vector_calculator_module import LinkVectorCalculator
 from push_up_model import (
     ARM_PARTS,
     arm_axes,
-    estimate_gravity,
     hand_mass,
     push_up_joint_powers,
     push_up_torques,
