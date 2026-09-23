@@ -112,6 +112,8 @@ from push_up_model import (
     torso_load_mass,
     trunk_up_vectors,
 )
+# ゲージの値（どの部位も今のサイクルの正の仕事。KNOWN_ISSUES §6-2）
+from gauge_energy import ElbowGaugeEnergy, gauge_values
 try:
     from Gauge_display import GaugeDisplay
 except Exception:
@@ -1214,6 +1216,23 @@ def _pose_job(pose_estimator, frame_bgr, roi):
 
 
 print(f"✅ Mediapipe・モデル準備 完了 (pose_parallel={'ON' if _pose_pool is not None else 'OFF'})")
+
+# ゲージの閾値 (E_low, E_high) [J]。ゲージの有無によらず計算し、終了時に gauge_energy の記録へ残す
+# （HEADLESS・ファイル再生でも §6-2 を確かめるため）。式は旧来のゲージの式のまま（手首の r_x は 0.30 m 固定。
+# §2-6 で直したスコアの分母とは別物で、見直しは保留）
+GAUGE_BODY_MASS_KG = float(os.getenv('BODY_MASS_KG', '65'))
+# r_x（有効半径[m]）の既定。必要に応じて環境変数や外部ファイル化を検討
+GAUGE_R_X_MAP = {
+    'wrist_R': 0.30, 'wrist_L': 0.30,
+    'elbow_R': 0.28, 'elbow_L': 0.28,
+    'shoulder_R': 0.25, 'shoulder_L': 0.25,
+}
+GAUGE_G_SCALAR = float(os.getenv('G_SCALAR', '9.80665'))
+GAUGE_AUTO_THRESHOLDS = compute_energy_thresholds(
+    M_MAX_PART, _compute_m1_per_part_from_bodymass(GAUGE_BODY_MASS_KG), GAUGE_G_SCALAR, GAUGE_R_X_MAP)
+# ゲージに出す部位（下の gauge.filter_parts と同じ）
+GAUGE_KEYS = ("wrist_R", "elbow_R", "wrist_L", "elbow_L")
+
 ## Gauge / Matplotlib 初期化（環境変数 DISABLE_MPL=1 で完全無効化可能）
 gauge = None  # type: ignore
 if (not env_flag('DISABLE_MPL', False)) and not HEADLESS:
@@ -1266,16 +1285,8 @@ if (not env_flag('DISABLE_MPL', False)) and not HEADLESS:
         try:
             # 既定を ON にする（未指定なら自動適用）
             if env_flag('GAUGE_THRESH_AUTO', True):
-                body_mass = float(os.getenv('BODY_MASS_KG', '65'))
-                # r_x（有効半径[m]）の既定。必要に応じて環境変数や外部ファイル化を検討
-                R_X_MAP = {
-                    'wrist_R': 0.30, 'wrist_L': 0.30,
-                    'elbow_R': 0.28, 'elbow_L': 0.28,
-                    'shoulder_R': 0.25, 'shoulder_L': 0.25,
-                }
-                g_scalar = float(os.getenv('G_SCALAR', '9.80665'))
-                m1_map = _compute_m1_per_part_from_bodymass(body_mass)
-                thr_map = compute_energy_thresholds(M_MAX_PART, m1_map, g_scalar, R_X_MAP)
+                body_mass = GAUGE_BODY_MASS_KG
+                thr_map = dict(GAUGE_AUTO_THRESHOLDS)
                 # Gauge に適用（プロパティ直書き）
                 gauge.energy_thresholds = thr_map
                 # しきい帯も合わせて再描画（統計 mu/sigma から角度に変換）
@@ -2187,9 +2198,11 @@ cycle_energy_debug_rows = []
 # 上腕(=肘トルク)と前腕(=手首トルク)のキー集合（肩・体幹は未定のため除外）
 ELBOW_KEYS = {"elbow_R", "elbow_L"}
 WRIST_KEYS = {"wrist_R", "wrist_L"}
-# 連続表示用 肘エネルギー(J)積算バッファ (Σ τ·dθ)
-_continuous_last_theta = {"elbow_R": None, "elbow_L": None}
-_continuous_energy_J = {"elbow_R": 0.0, "elbow_L": 0.0}
+# 連続表示用 肘の正の仕事 Σmax(τ·dθ, 0) [J]。サイクル確定でリセットする（手首と同じく今のサイクルの分）
+_elbow_gauge = ElbowGaugeEnergy()
+# ゲージの値の記録（処理フレームごと）。終了時に gauge_energy_*.csv へ書く。cycle_index はサイクル確定の回数
+_gauge_rows = []
+_gauge_cycle_index = 0
 _demo_shoulder_base_y = {"R": None, "L": None}
 _demo_elbow_base_deg = {"R": None, "L": None}
 _demo_gauge_ratio = {"R": 0.0, "L": 0.0}
@@ -3290,14 +3303,8 @@ while True:
                 _fc_update_counter = 0
         
         # 連続表示用: 正仕事のみ Σ τ·dθ を積算
-        for _side, _th_now, _tau_now in (("elbow_R", th_R, tau_R), ("elbow_L", th_L, tau_L)):
-            th_prev = _continuous_last_theta[_side]
-            if th_prev is not None and np.isfinite(th_prev) and np.isfinite(_th_now):
-                dth = _th_now - th_prev  # rad
-                work_inc = _tau_now * dth
-                if work_inc > 0:
-                    _continuous_energy_J[_side] += work_inc
-            _continuous_last_theta[_side] = _th_now
+        _elbow_gauge.add("elbow_R", th_R, tau_R)
+        _elbow_gauge.add("elbow_L", th_L, tau_L)
     except Exception as _e_acc:
         if E_DEBUG and (WHILE_COUNT % 60 == 0):
             print(f"[EPIPE] accumulate failed: {_e_acc}")
@@ -3449,6 +3456,9 @@ while True:
             for _kE in _E_buffers.keys():
                 _E_buffers[_kE]['theta'].clear()
                 _E_buffers[_kE]['tau'].clear()
+            # 肘のゲージも今のサイクルの分に戻す（かつて起動からの累積だった。KNOWN_ISSUES §6-2）
+            _elbow_gauge.reset_cycle()
+            _gauge_cycle_index += 1
 
             # （任意）検出ログ出力
             print(f"Cycle impulse appended at frame {WHILE_COUNT}")
@@ -3459,6 +3469,18 @@ while True:
     _perf.add('cycle_energy', time.perf_counter() - t_seg)
 
     t_seg = time.perf_counter()
+    # ゲージの値（今のサイクルの正の仕事 [J]）。ゲージの有無によらず計算して記録する（HEADLESS・
+    # ファイル再生でも §6-2 を確かめるため。かつてはゲージのウィンドウがあるときしか計算しなかった）
+    if not DEMO_MONO_GAUGE_ON:
+        _gauge_now = gauge_values(GAUGE_KEYS, _elbow_gauge, current_energy_component_history,
+                                  current_power_history, _DYN_DT)
+        _gauge_rows.append({
+            "frame": int(WHILE_COUNT),
+            "cam_frame": int(skip_counter),
+            "t": float(start_time - _raw_t0) if _raw_t0 is not None else float("nan"),
+            "cycle_index": int(_gauge_cycle_index),
+            **{k: round(v, 6) for k, v in _gauge_now.items()},
+        })
     # 連続エネルギー値/単眼デモ判定をゲージへ毎フレーム反映
     if gauge is not None:
         if DEMO_MONO_GAUGE_ON:
@@ -3516,17 +3538,7 @@ while True:
                 if DEBUG_LOGS and (WHILE_COUNT % 30 == 0):
                     print(f"[GaugeDemo] set_direct_ratios failed: {_gdir_e}")
         else:
-            keys_now = list(current_power_history.keys())
-            for pk in keys_now:
-                if pk in ELBOW_KEYS:
-                    # 正しいJ単位の連続エネルギー
-                    energy_cont = float(_continuous_energy_J.get(pk, 0.0))
-                elif pk in WRIST_KEYS:
-                    # 正の仕事 ∫max(P, 0)dt [J]。サイクル確定時の値と同じ定義
-                    energy_cont = float(sum(current_energy_component_history.get(pk, [])) * _DYN_DT)
-                else:
-                    energy_cont = float(sum(current_power_history.get(pk, [])) * _DYN_DT)
-                current_impulses[pk] = energy_cont
+            current_impulses.update(_gauge_now)
             gauge.update_impulses(current_impulses)
             try:
                 _gauge_log_state(tag="after_update_impulses")
@@ -3860,6 +3872,34 @@ if cycle_energy_debug_rows:
     print(f"✅ cycle_energy_debug を保存しました: {cycle_dbg_path}")
 else:
     print("[INFO] cycle_energy_debug: 有効サイクルが無いため出力なし")
+
+# -------------------------------
+# ②-3 ゲージの値（今のサイクルの正の仕事）と閾値を保存（§6-2 の確認用。HEADLESS でも書く）
+# -------------------------------
+if _gauge_rows:
+    try:
+        gauge_log_path = os.path.join(save_dir, f"gauge_energy_{timestamp}_s{OUTPUT_SCHEMA_VERSION}{_grav_tag}.csv")
+        pd.DataFrame(_gauge_rows).to_csv(gauge_log_path, index=False, encoding="utf-8-sig")
+        with open(os.path.splitext(gauge_log_path)[0] + ".json", "w", encoding="utf-8") as _gauge_meta:
+            json.dump({
+                "unit": "J",
+                "definition": "今のサイクルの正の仕事。肘は Σmax(τ·dθ, 0)、手首は Σmax(P, 0)·dt。サイクル確定で 0 に戻る",
+                "dt": _DYN_DT,
+                "thresholds_auto": {k: list(v) for k, v in GAUGE_AUTO_THRESHOLDS.items()},
+                "thresholds_gauge": ({k: list(v) for k, v in dict(gauge.energy_thresholds).items()}
+                                     if gauge is not None and getattr(gauge, "energy_thresholds", None) else None),
+                "threshold_formula": "E = r_x·g·(0.42·m1 + {0.3, 0.7}·m_max)·K（旧来のゲージの式）",
+                "body_mass_kg": GAUGE_BODY_MASS_KG,
+                "r_x": GAUGE_R_X_MAP,
+                "g": GAUGE_G_SCALAR,
+                "m_max_part": M_MAX_PART,
+                "cycles": int(_gauge_cycle_index),
+            }, _gauge_meta, ensure_ascii=False, indent=2)
+        print(f"✅ gauge_energy を保存しました: {gauge_log_path}")
+    except Exception as _gauge_log_e:  # noqa: BLE001  診断用の記録。失敗しても後続の保存は続ける
+        print(f"[WARN] gauge_energy の保存に失敗しました: {_gauge_log_e}")
+else:
+    print("[INFO] gauge_energy: 記録なし（デモ表示中か、力学が回る前に終わった）")
 
 # -------------------------------
 # ⑤ Offline wrist capture NPY 保存 (任意)
