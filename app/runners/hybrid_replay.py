@@ -80,9 +80,12 @@ def main(argv=None) -> int:
 
     worker = threading.Thread(target=run, name="hybrid-replay", daemon=True)
     worker.start()
+    # i 回目は開始から i·_TICK_S の時刻まで寝る（固定の sleep だと macOS で 1 回あたり約 8 ms 寝過ごし、30 Hz が 24 Hz に落ちる）
+    started, tick = time.monotonic(), 0
     while worker.is_alive():
         ticker.tick()
-        time.sleep(_TICK_S)
+        tick += 1
+        time.sleep(max(0.0, started + tick * _TICK_S - time.monotonic()))
     ticker.tick(force=True)
     measurement = box.get("session")
     if "error" in box:
