@@ -19,7 +19,7 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
-from app.hybrid.calibration_io import load_session_calibration, write_json
+from app.hybrid.calibration_io import load_session_calibration, update_meta
 from app.hybrid.ekf import EkfSettings
 from app.hybrid.measurement import MeasurementSession
 from app.hybrid.retriangulate import read_landmarks
@@ -138,8 +138,5 @@ def replay(session_dir: str | Path, *, root: str | Path, start_s: float = 0.0, e
         pass  # 理由は meta.json（error・exit_code）に残っている
     directory = measurement.directory
     if directory is not None:
-        meta_path = Path(directory) / "meta.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["replay_timing"] = _timing(samples_ms, pair_count[0])
-        write_json(meta_path, meta)
+        update_meta(directory, replay_timing=_timing(samples_ms, pair_count[0]))
     return None if directory is None else Path(directory)
