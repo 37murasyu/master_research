@@ -95,13 +95,19 @@ def main(argv=None):
                 while not stop.requested() and not measurement.failed.is_set():
                     live.step()
                     if poll_window() in (27, ord("q")):
+                        measurement.stop_reason = "key"
                         break
             except KeyboardInterrupt:
-                pass
+                measurement.stop_reason = "ctrl_c"
             except Exception as exc:
                 measurement.error = str(exc)
                 measurement.exit_code = 1
+                measurement.stop_reason = "error"
                 print(str(exc), file=sys.stderr)
+            # 記録は、この with を抜けるとき（link.stop → measurement.close）に閉じる。何で止まったかを先に決めておく
+            # （GUI の停止ボタンは停止ファイル、端末からは SIGTERM。どちらも stop.requested()）
+            if measurement.stop_reason is None:
+                measurement.stop_reason = "stop_request" if stop.requested() else "failed"
         if measurement.directory is None:
             print("Pixel から点が届かなかったため、記録はありません")
         else:

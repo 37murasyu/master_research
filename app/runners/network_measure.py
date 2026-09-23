@@ -215,8 +215,10 @@ class NetworkMeasurement:
         self.results: list[FrameResult] = []
 
     # -- 入口 --------------------------------------------------------------
-    def process(self, pair: PairedSample) -> FrameResult | None:
-        """1 ペアを処理する。まだ計算できない段階では None を返す。"""
+    def points_3d(self, pair: PairedSample) -> np.ndarray | None:
+        """1 ペアの 3D 点（m、ランドマーク ID の昇順）。状態を持たないので、記録から三角測量し直すのにも使う
+        （``app.hybrid.retriangulate``）。どちらかのロールが無ければ None。
+        """
         keypoints0 = self._pixel_keypoints(pair, "cam0")
         keypoints1 = self._pixel_keypoints(pair, "cam1")
         if keypoints0 is None or keypoints1 is None:
@@ -225,7 +227,13 @@ class NetworkMeasurement:
         if self.lens is not None:
             keypoints0 = self._undistort(keypoints0, "cam0")
             keypoints1 = self._undistort(keypoints1, "cam1")
-        points = self._triangulate(keypoints0, keypoints1)
+        return self._triangulate(keypoints0, keypoints1)
+
+    def process(self, pair: PairedSample) -> FrameResult | None:
+        """1 ペアを処理する。まだ計算できない段階では None を返す。"""
+        points = self.points_3d(pair)
+        if points is None:
+            return None
         self._recent_points.append(points)
         if len(self._recent_points) > self._REQUIRED_FRAMES:
             del self._recent_points[0]

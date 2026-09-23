@@ -125,13 +125,27 @@ class Calibration:
 
 
 def load_calibration(directory="latest", *, root=None):
-    from utils import read_camera_parameters, get_projection_matrix
-
     root = Path(root or calibration_root())
     directory = Path(directory)
     if str(directory) == "latest":
         directory = root / json.loads((root / "latest.json").read_text())["directory"]
     meta = json.loads((directory / "meta.json").read_text())
+    return _calibration_from(directory, meta)
+
+
+def load_session_calibration(session):
+    """計測フォルダ（Recorder が校正ファイル 4 つと ``calibration_meta`` を写したもの）から校正を読む。
+
+    計測に使った校正そのものなので、校正をやり直した後や別の PC でも、記録から三角測量し直せる。
+    """
+    session = Path(session)
+    meta = json.loads((session / "meta.json").read_text(encoding="utf-8"))
+    return _calibration_from(session, meta["calibration_meta"])
+
+
+def _calibration_from(directory, meta):
+    from utils import read_camera_parameters, get_projection_matrix
+
     if meta.get("units") != "cm":
         raise ValueError("混成校正の T は cm で保存されている必要があります")
     intrinsics = []

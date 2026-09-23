@@ -18,6 +18,8 @@ class MeasurementSession:
         self.exit_code = 0
         self.error = None
         self.size_drops = 0
+        # 何で止まったか（stop_request・key・ctrl_c・failed・error）。記録を閉じるときに meta.json へ残す（§3-2 の確認用）
+        self.stop_reason = None
         self.consecutive = {"cam0": 0, "cam1": 0}
 
     @property
@@ -106,6 +108,7 @@ class MeasurementSession:
                 exit_code=self.exit_code,
                 error=self.error,
                 size_drops=self.size_drops,
+                stop_reason=self.stop_reason,
             )
         except Exception as exc:
             self._failure(exc)
