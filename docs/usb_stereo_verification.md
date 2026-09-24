@@ -6,7 +6,8 @@
 
 - `tools/record_stereo.py`: 2 台の全フレームを、計測と同じカメラ設定（`app.core.camera_controls`）で録画する
 - `tools/verify_run.py replay`: 録画を計測に読み込ませる。起動は GUI と同じ `python -m app --role realtime`、設定も GUI の設定を土台にする
-- `tools/verify_run.py check`: 計測の出力フォルダを確かめる（ファイルの有無、行の対応、トルク、ゲージ、処理の速さ、EKF の RMS 差と棄却率）
+- `tools/verify_run.py check`: 計測の出力フォルダを確かめる（ファイルの有無、行の対応、処理の速さ、肩・肘・手首の 3D がそろった行の割合。
+  値としてトルク、ゲージ、骨の長さ、EKF の RMS 差と棄却率）
 
 以下の `python` はプロジェクトの仮想環境の Python を使う。Mac は `.venv/bin/python`、Windows は
 `.venv\Scripts\python.exe`。**リポジトリ直下で実行する**。Windows では論文当時の証拠の `MAINCODE` を動かさず、
@@ -30,6 +31,9 @@ python -m tools.record_stereo --label S07 --duration 90
   `CAM_FOURCC=MJPG` を環境変数で与える（計測も同じ `app.core.camera_controls` で当てる）
 - 4 Hz 間引きで EKF を較正する（S6）には **80 秒以上** 要る（設計メモ :275）。n_eff が 300 に届かない系列は採用されない
 - 終わりに実測の fps を出す。容器の 30 fps と 5% 以上ずれたら警告し、再生で `DT_SEC` を自動で渡す
+- 録画の穴（間隔が中央値の 1.5 倍を超えた所＝USB の取りこぼし）と左右の撮影時刻のずれ（半フレーム超）を `frames.csv` から数え、
+  `meta.json` の `frame_timing` に残して、あれば `[WARN]` を出す。再生はフレームを 1 フレームの間隔で並べ、同じ番号を左右の組にするので、
+  `DT_SEC` では直せない。出たら `CAM_FOURCC=MJPG`・ほかの負荷を確かめて撮り直す
 - ファイルを小さくしたいときは `--codec mp4v`（.mp4）。ただし圧縮の劣化で S6 の雑音の推定が計測とずれうる
 
 ## 2. 録画を計測に読み込ませる（S6 の 2 設定）
@@ -48,7 +52,10 @@ python -m tools.verify_run replay --session recordings/S07_0923_213245 --subject
 - 起動ログの `reason=config: file paths`、`[CALIB] using CALIB_BASE_DIR`、`[DT] dt=0.03333s`（4 Hz なら `0.26667s`）、
   `[INERTIA]` の骨長、`[GRAVITY]` を見る
 - 受け取った `cameras_raw/<試技>/` のように `meta.json` の無い録画は `--cam0 --cam1 --calib --out` で指定する
-- 終わると自動で `check` にかけ、`verify_report.json` を書く
+- 終わると自動で `check` にかけ、`verify_report.json` を書く。録画の穴と左右のずれも `[録画]` の行（`verify_report.json` の
+  `recording`）に出す（`frame_timing` の無い古い録画も `frames.csv` から数え直す）
+- 3D が 1 点も取れない回（人が写っていない・映像が灰色）でも CSV はそろってトルクは 0 のまま書かれるので、構造の検査に
+  「3D: 肩・肘・手首がそろった行 50% 以上」を入れた。骨の長さ（肩幅・上腕・前腕）は `[配置と 3D の質]` に値として出す（合否は混成だけ）
 
 ## 3. EKF の較正（S6）と受け入れ判定（S9b）
 
@@ -59,7 +66,8 @@ python -m app.runners.tune_ekf recordings/S07_.../runs/hz4/kpts3d_raw_<ts>.csv  
 ```
 
 - **端に張り付く系列が過半数、または |ρ1| > 0.3 なら、先へ進まず設計を見直す**（設計メモ :396）
-- `tune_ekf --out` はファイルのパスを取る（フォルダを渡すと落ちる。既定は生 CSV の隣）
+- `tune_ekf --out` はファイルのパスかフォルダを取る（フォルダならその中に `ekf_profile_<dt>.json`）。既定は生 CSV の隣
+- 推定は生 CSV の `frame` 番号の抜け（処理が間に合わず取りこぼした行）を NaN の行に戻してから行う（詰めたままだと q_acc が狂う）
 - S9b: プロファイルを付けて再生し、`check` の「§6-3 EKF」の RMS 差と棄却率を見る。期待範囲は S6 の結果で決める。
   `--ekf-profile` は絶対パスに直して渡し、check は「EKF: 較正プロファイルを使った」を構造の検査に入れる。
   GUI の設定にプロファイルがあるとき、無しで回すには `--ekf-profile ""`

@@ -26,7 +26,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from extended_kalman_filter import EKFConfig, ExtendedKalman1D, constant_acceleration_model, run_ekf
+from extended_kalman_filter import EKFConfig, ExtendedKalman1D, ExtendedKalmanND, constant_acceleration_model, run_ekf
 
 DT = 1 / 30
 
@@ -50,6 +50,39 @@ class TestNumpy2:
         assert pos.shape == data.shape
         assert np.isfinite(pos).all(), "run_ekf が系列の途中で有限でない値を返した"
         assert np.median(np.abs(pos - data)) < 0.01, "ノイズの無い正弦波に追従していない"
+
+
+class TestNanObservation:
+    """NaN の観測は欠測（None と同じ）として扱う。
+
+    ``run_ekf``・``ExtendedKalmanND`` は配列の値をそのまま ``float()`` で ``ExtendedKalman1D.step`` に渡していたので、
+    NaN を観測として取り込み、状態が NaN になって以後ずっと NaN を返した（その列の残りが全部消える）。
+    ``Adjusted 3D Pose/`` の CSV には NaN のセルがあり、``tmp_filter_pose_torque.py`` などはそのまま ``run_ekf`` にかける。
+    ``LandmarkEKF`` は前から NaN を欠測にしていたので、同じ扱いにそろえる。
+    """
+
+    def test_one_nan_does_not_erase_the_rest_of_the_column(self):
+        t = np.arange(100) * DT
+        data = np.column_stack([np.sin(t), np.cos(t)])
+        data[40, 0] = np.nan
+        pos, vel, acc = run_ekf(data, t, EKFConfig(q_acc=1e-3, r=1e-3, gate_std=3.0))
+        assert np.isfinite(pos).all() and np.isfinite(vel).all() and np.isfinite(acc).all()
+
+    def test_a_nan_is_the_same_as_a_missing_observation(self):
+        cfg = EKFConfig(q_acc=0.1, r=1e-4, gate_std=3.0)
+        with_nan, with_none = ExtendedKalman1D(cfg), ExtendedKalman1D(cfg)
+        for k, z in enumerate([np.nan, 0.0, 0.01, np.nan, float("inf"), 0.03, 0.04]):
+            missing = not np.isfinite(z)
+            np.testing.assert_array_equal(with_nan.step(z, DT), with_none.step(None if missing else z, DT),
+                                          err_msg=f"{k} 番目の観測 {z}")
+
+    def test_the_nd_filter_treats_each_axis_on_its_own(self):
+        cfg = EKFConfig(q_acc=0.1, r=1e-4, gate_std=3.0)
+        nd, x_only = ExtendedKalmanND(2, cfg), ExtendedKalman1D(cfg)
+        for z in ([0.0, 1.0], [np.nan, 1.1], [0.02, np.nan], [0.03, 1.3]):
+            pos, _vel, _acc = nd.step(z, DT)
+            assert pos[0] == x_only.step(None if np.isnan(z[0]) else z[0], DT)[0]
+            assert np.isfinite(pos[1])
 
 
 class TestMeasurementModel:

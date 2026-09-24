@@ -10,8 +10,13 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from test_hybrid_verification import make_body_run, make_hybrid_run
 from tools import verify_run as vr
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _stamp(run):
@@ -39,3 +44,29 @@ def test_the_retriangulated_output_is_marked(tmp_path):
     run = make_body_run(tmp_path)
     path = vr.hybrid_raw_capture(run)
     assert path.name == f"kpts3d_raw_{_stamp(run)}_retri.csv"
+
+
+# 手順書が名指す生 CSV の名前は、記録器の kpts3d_raw_<stamp>.csv か hybrid-raw の実際の出力（_retri・_retri_s<N>・_retri_grid）。
+# 以前の手順書は _s3.csv・_grid.csv（_retri の無い、どこにも無い名前）を tune_ekf に渡していた
+DOCS = ("docs/hybrid_verification.md", "docs/hybrid_field_run.md", "docs/usb_stereo_verification.md",
+        "docs/mac_field_checklist.md")
+REAL_NAME = re.compile(r"kpts3d_raw_<(stamp|ts)>(_retri(_grid)?(_s\d+)?)?\.csv")
+
+
+def test_the_docs_name_only_real_raw_captures():
+    for doc in DOCS:
+        text = (REPO_ROOT / doc).read_text(encoding="utf-8")
+        named = re.findall(r"kpts3d_raw_<\w+>\w*\.csv", text)
+        wrong = sorted({name for name in named if not REAL_NAME.fullmatch(name)})
+        assert not wrong, f"{doc} が実際には無い名前を指す: {wrong}"
+
+
+def test_the_docs_do_not_keep_the_old_hybrid_statements():
+    """混成は EKF と腕の長さの安全策を持ち（kpts3d は EKF の後）、回の区切りは肩の中点の高さ、tune_ekf --out はフォルダも
+    取る。古い記述を残さない。"""
+    stale = ("混成の経路は EKF を使っていない", "三角測量した 3D（m、EKF なし）", "フォルダを渡すと落ちる",
+             "kpts3d_raw_<stamp>_s3.csv", "kpts3d_raw_<stamp>_grid.csv", "混成の経路には EKF も外れ値の除き方も無いので",
+             "**外れ値の除き方が無い**", "左肩の奥行き方向を 1 フレームあたりの速さで見ている")
+    for doc in DOCS:
+        text = (REPO_ROOT / doc).read_text(encoding="utf-8")
+        assert not [s for s in stale if s in text], doc

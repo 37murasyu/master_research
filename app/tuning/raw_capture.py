@@ -26,11 +26,29 @@ import numpy as np
 
 STAGE = "pre_ekf"
 SCHEMA_VERSION = 1
+# サイドカーの source。混成の計測の記録器が計測中に書く格子の生 CSV（kpts3d_raw_<stamp>.csv、実行時の EKF の
+# プロファイルの材料）と、tools.verify_run hybrid-raw が記録から作り直した生 CSV（kpts3d_raw_<stamp>_retri*.csv、
+# 比べる用）を分ける
+HYBRID_SOURCE = "hybrid"
+HYBRID_RETRI_SOURCE = "hybrid_retri"
 
 
 def sidecar_path(csv_path: str | Path) -> Path:
     """生 CSV に対応するサイドカー JSON のパス（拡張子だけを替える）。"""
     return Path(csv_path).with_suffix(".json")
+
+
+def is_hybrid_recorder_capture(provenance: Mapping[str, Any]) -> bool:
+    """混成の計測の記録器が書いた格子の生 CSV か（実行時の EKF のプロファイルを作ってよいのはこれだけ）。
+
+    直す前の hybrid-raw の出力も source が ``hybrid`` だったので、hybrid-raw だけが書く ``hybrid_session`` でも見分ける。
+    """
+    return provenance.get("source") == HYBRID_SOURCE and "hybrid_session" not in provenance
+
+
+def is_hybrid_retri_capture(provenance: Mapping[str, Any]) -> bool:
+    """hybrid-raw が記録から作り直した生 CSV か（直す前の source ``hybrid`` の出力も含む）。"""
+    return provenance.get("source") in (HYBRID_SOURCE, HYBRID_RETRI_SOURCE) and not is_hybrid_recorder_capture(provenance)
 
 
 def git_commit(repo_dir: str | Path) -> str | None:

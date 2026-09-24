@@ -245,6 +245,60 @@ class TestMeta:
         assert "measured_fps" in meta and "max_skew_ms" in meta
 
 
+def _fake_times(cameras, *, stall_after=None, stall_ms=200.0, skew_ms=1.0):
+    """grab の完了時刻を決め打ちにする（30 fps。``stall_after`` 枚目の後で ``stall_ms`` 止まる。cam1 は ``skew_ms`` 遅れる）。"""
+    def timed_grab(camera, clock):
+        ok = camera.grab()
+        k = camera.count
+        t_ms = k * 1000.0 / 30.0 + (stall_ms if stall_after is not None and k > stall_after else 0.0)
+        t_ms += skew_ms if camera is cameras[1] else 0.0
+        return ok, int(round(t_ms * 1e6))
+    return timed_grab
+
+
+class TestGapsAndSkew:
+    """USB の取りこぼしで録画が 0.2 s 止まっても、以前は何も言わなかった（frames.csv には間隔が残るが、誰も読まない）。
+    再生は動画のフレームを 1 フレームの間隔で並べ直すので、その区間の時間が詰まる。左右の撮影時刻のずれも、再生は
+    同じ番号のフレームを組にするので三角測量に効く。frames.csv から穴とずれを数えて meta に残し、警告する。"""
+
+    def test_a_stall_is_counted_and_warned(self, tmp_path, monkeypatch, capsys):
+        cameras = [FakeCamera(12), FakeCamera(12)]
+        monkeypatch.setattr(rs, "_timed_grab", _fake_times(cameras, stall_after=6))
+        code, session = _run(tmp_path, cameras)
+        timing = json.loads((session / "meta.json").read_text(encoding="utf-8"))["frame_timing"]
+        assert code == 0
+        assert timing["gaps"] == 1 and timing["missing_frames"] == 6
+        assert timing["max_interval_ms"] == pytest.approx(1000 / 30 + 200, abs=0.01)
+        assert timing["median_interval_ms"] == pytest.approx(1000 / 30, abs=0.01)
+        out = capsys.readouterr().out
+        assert "[WARN]" in out and "穴が 1 か所" in out
+
+    def test_left_right_skew_is_counted_and_warned(self, tmp_path, monkeypatch, capsys):
+        cameras = [FakeCamera(9), FakeCamera(9)]
+        monkeypatch.setattr(rs, "_timed_grab", _fake_times(cameras, skew_ms=20.0))
+        _, session = _run(tmp_path, cameras)
+        meta = json.loads((session / "meta.json").read_text(encoding="utf-8"))
+        assert meta["frame_timing"]["skewed_frames"] == 9 and meta["frame_timing"]["gaps"] == 0
+        assert meta["max_skew_ms"] == pytest.approx(20.0)
+        assert "ずれ" in capsys.readouterr().out
+
+    def test_a_steady_recording_is_not_warned(self, tmp_path, monkeypatch, capsys):
+        cameras = [FakeCamera(9), FakeCamera(9)]
+        monkeypatch.setattr(rs, "_timed_grab", _fake_times(cameras))
+        _, session = _run(tmp_path, cameras)
+        timing = json.loads((session / "meta.json").read_text(encoding="utf-8"))["frame_timing"]
+        assert (timing["gaps"], timing["skewed_frames"]) == (0, 0)
+        assert "[WARN]" not in capsys.readouterr().out
+
+    def test_the_timing_can_be_read_back_from_frames_csv(self, tmp_path, monkeypatch):
+        """古い録画（meta に frame_timing の無いもの）も、再生の報告で frames.csv から数え直せる。"""
+        cameras = [FakeCamera(12), FakeCamera(12)]
+        monkeypatch.setattr(rs, "_timed_grab", _fake_times(cameras, stall_after=6))
+        _, session = _run(tmp_path, cameras)
+        meta = json.loads((session / "meta.json").read_text(encoding="utf-8"))
+        assert rs.read_frame_timing(session) == pytest.approx(meta["frame_timing"])
+
+
 class TestFrameSize:
     def test_a_mismatch_with_the_calibration_stops(self):
         with pytest.raises(rs.FrameSizeMismatch, match="1280x720"):

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ import pytest
 
 from app.core.settings import OUTPUT_DIR_ENV, Settings
 from app.core.stop_request import STOP_FILE_ENV
+from app.tuning.ekf_profile import SeriesEntry, resolve_profile
 from app.tuning.raw_capture import RawCaptureWriter
 from tools import verify_run as vr
 
@@ -41,8 +43,12 @@ def _truth(n: int) -> np.ndarray:
 
 
 def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip=(), log=True,
-             provenance=None) -> Path:
-    """計測 1 回ぶんの出力フォルダ（master_research_code.py が書くものと同じ名前・列）。"""
+             provenance=None, lost_rows=(), dropped_rows=()) -> Path:
+    """計測 1 回ぶんの出力フォルダ（master_research_code.py が書くものと同じ名前・列）。
+
+    ``lost_rows`` の行は、人を見つけられなかったフレームとして生 CSV の 3D を NaN にする。
+    ``dropped_rows`` の行は生 CSV に書かない（取りこぼし。frame 番号が跳ぶ）。
+    """
     out = tmp_path / "run"
     out.mkdir()
     truth = _truth(N)
@@ -50,13 +56,15 @@ def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip
     if raw_offset is not None:
         lid, axis, value = raw_offset
         raw[:, IDS.index(lid), "xyz".index(axis)] += value
+    raw[list(lost_rows)] = np.nan
     meta = {"unit": "m", "dt": DT, "src_fps": 30.0, "file_mode": file_mode, "EKF_ENABLE": True,
             "EKF_Q_ACC": 0.1, "EKF_R": 1e-4, "EKF_GATE_STD": 3.0, "RT_POSE_FIXED_HZ_ON": False,
             "ekf_noise": {"origin": "env", "path": None, "reason": None, "profile_dt": None, "sources": {}}}
     meta.update(provenance or {})
     writer = RawCaptureWriter(out / f"kpts3d_raw_{TS}.csv", IDS, meta)
     for k in range(N):
-        writer.append(k, k * t_step, raw[k])
+        if k not in dropped_rows:
+            writer.append(k, k * t_step, raw[k])
     writer.note(gravity=[0.0, 0.0, -9.80665], gravity_label="Z-", gravity_set=True)
     writer.close()
 
@@ -95,6 +103,16 @@ def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip
             "[STOP] 停止要求を受けました。ループを抜けて CSV を書き出します\n"
             "✅ aim_torque（ベクトル形式）を保存しました: x\n", encoding="utf-8")
     return out
+
+
+def _entry(q_acc: float, r: float, gate_std: float) -> dict:
+    """較正プロファイルの 1 系列（build_profile が書く形）。"""
+    return asdict(SeriesEntry(q_acc=q_acc, r=r, gate_std=gate_std, n_eff=500, rho1=0.0, source="fit"))
+
+
+def _write_profile(path: Path, series: dict, dt: float = DT) -> None:
+    path.write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m", "dt": dt, "series": series}),
+                    encoding="utf-8")
 
 
 def _check(report, name):
@@ -141,11 +159,61 @@ class TestStructure:
                                      "[STOP] 停止要求を受けました。\n✅ aim_torque x\n", encoding="utf-8")
         assert not _check(vr.check_run(out, log=out / "run.log"), "ログ: 指定した入力を読んだ")["ok"]
 
+    def test_a_run_that_processed_no_frame_fails_without_crashing(self, tmp_path):
+        """止めるのが早すぎた・入力がすぐ尽きた回は、本体が中身の無い CSV（pd.DataFrame([]).to_csv、列も無い）を書く。
+        check は EmptyDataError で落ちずに 0 行として扱い、不合格にする。"""
+        out = make_run(tmp_path)
+        raw = out / f"kpts3d_raw_{TS}.csv"
+        raw.write_text(raw.read_text(encoding="utf-8").split("\n", 1)[0] + "\n", encoding="utf-8")
+        pd.DataFrame([]).to_csv(next(out.glob("kpts3d_0923*_gZ-.csv")), index=False)
+        pd.DataFrame([]).to_csv(next(out.glob("aim_torque_vec_*.csv")), index=False, encoding="utf-8-sig")
+        pd.DataFrame([]).to_csv(next(out.glob("gauge_energy_*.csv")), index=False, encoding="utf-8-sig")
+        report = vr.check_run(out, log=out / "run.log")
+        check = _check(report, "行: aim_torque が 1 行以上")
+        assert not check["ok"] and check["detail"].startswith("0 行")
+        assert not _check(report, TRACKED)["ok"]
+        assert report["torque"]["wrist_R"]["n"] == 0
+        vr.format_report(report)
+
     def test_raw_and_filtered_rows_match(self, tmp_path):
         out = make_run(tmp_path)
         kpts = next(out.glob("kpts3d_0923*_gZ-.csv"))
         pd.read_csv(kpts).iloc[:50].to_csv(kpts, index=False)
         assert not _check(vr.check_run(out), "行: 生 CSV と kpts3d が 1 行ずつ対応")["ok"]
+
+
+TRACKED = "3D: 肩・肘・手首がそろった行 50% 以上"
+
+
+class TestTracked3d:
+    """灰色の偽の録画のように 3D が 1 点も取れない回でも、ファイルと行はそろい、トルクは 0 のまま書かれる。
+    以前はこれが「構造の検査はすべて合格」になった。肩・肘・手首がそろった行の割合を構造の検査に入れ、
+    混成と同じ骨の長さの節を USB の報告にも出す。"""
+
+    def test_a_recording_without_any_3d_fails(self, tmp_path):
+        out = make_run(tmp_path, lost_rows=range(N))
+        report = vr.check_run(out, log=out / "run.log")
+        check = _check(report, TRACKED)
+        assert not check["ok"] and f"0 / {N} 行" in check["detail"]
+        assert vr.main(["check", str(out), "--log", str(out / "run.log")]) == 1
+
+    def test_some_lost_frames_still_pass(self, tmp_path):
+        """人が画面に入るまでの数秒などで 3D が抜けるのは普通。半分以上そろっていれば構造は合格のまま。"""
+        report = vr.check_run(make_run(tmp_path, lost_rows=range(40)), log=tmp_path / "run" / "run.log")
+        assert _check(report, TRACKED)["ok"]
+        assert not [c for c in report["checks"] if not c["ok"]]
+
+    def test_the_bone_lengths_are_reported(self, tmp_path):
+        report = vr.check_run(make_run(tmp_path, lost_rows=range(10)))
+        segments = report["quality"]["segments"]
+        truth = _truth(1)[0]
+        forearm = float(np.linalg.norm(truth[IDS.index(16)] - truth[IDS.index(14)]))
+        assert segments["前腕R"]["median_m"] == pytest.approx(forearm)
+        assert segments["肩幅"]["share"] == 0.0, "11–12 は 0.11 m で範囲（0.25〜0.55 m）の外"
+        text = vr.format_report(report)
+        assert "[配置と 3D の質]" in text and "前腕R: 中央値 0.224 m" in text
+        # USB の校正・置き方は混成と違うので、長さは値として並べるだけ（合否は混成だけ）
+        assert not [c for c in report["checks"] if c["name"].startswith(("3D: 肩幅", "3D: 前腕"))]
 
 
 class TestTorqueAndGauge:
@@ -185,11 +253,9 @@ class TestEkf:
 
     def test_rejection_rate_uses_the_profile(self, tmp_path):
         profile = tmp_path / "ekf_profile.json"
-        entry = {"q_acc": 0.1, "r": 1e-4, "gate_std": 1e9}
-        series = {str(lid): {axis: dict(entry) for axis in "xyz"} for lid in IDS}
+        series = {str(lid): {axis: _entry(0.1, 1e-4, 1e9) for axis in "xyz"} for lid in IDS}
         series["13"]["y"]["gate_std"] = 1e-12
-        profile.write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m", "series": series}),
-                           encoding="utf-8")
+        _write_profile(profile, series)
         out = make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": str(profile)}})
         ekf = vr.check_run(out)["ekf"]
         assert ekf["noise_origin"] == "profile"
@@ -200,9 +266,7 @@ class TestEkf:
     def test_the_body_scale_ratio_is_applied_like_the_runtime(self, tmp_path):
         """実行時はプロファイルの q・r に体格比の 2 乗を掛ける（ekf_profile.SeriesEntry.scaled）。"""
         profile = tmp_path / "ekf_profile.json"
-        series = {str(lid): {axis: {"q_acc": 0.1, "r": 1e-4, "gate_std": 3.0} for axis in "xyz"} for lid in IDS}
-        profile.write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m", "series": series}),
-                           encoding="utf-8")
+        _write_profile(profile, {str(lid): {axis: _entry(0.1, 1e-4, 3.0) for axis in "xyz"} for lid in IDS})
         origin, lookup = vr._noise_params({"ekf_noise": {"origin": "profile", "path": str(profile)},
                                            "ekf_scale_ratio": 2.0}, DT)
         assert origin == "profile"
@@ -211,16 +275,46 @@ class TestEkf:
     def test_a_relative_profile_path_is_found_next_to_the_run(self, tmp_path):
         """サイドカーの path は本体の作業フォルダ（再生なら出力フォルダ）からの相対のことがある。"""
         out = make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": "ekf_profile.json"}})
-        series = {str(lid): {axis: {"q_acc": 0.1, "r": 1e-4, "gate_std": 1e9} for axis in "xyz"} for lid in IDS}
-        (out / "ekf_profile.json").write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m",
-                                                          "series": series}), encoding="utf-8")
+        _write_profile(out / "ekf_profile.json",
+                       {str(lid): {axis: _entry(0.1, 1e-4, 1e9) for axis in "xyz"} for lid in IDS})
         assert vr.check_run(out)["ekf"]["noise_origin"] == "profile"
+
+    def test_a_series_missing_from_the_profile_is_filled_like_the_runtime(self, tmp_path):
+        """点を足す前のプロファイル（ここでは 16 が無い）でも実行時は動く（無い系列は全体の中央値で埋める、
+        ProfileResolution.series_noise）。check が KeyError で落ちてはいけない。棄却率も同じ埋め方の値で数える。"""
+        profile = tmp_path / "ekf_profile.json"
+        series = {str(lid): {axis: _entry(0.1 * (1 + i), 1e-4, 3.0) for axis in "xyz"} for i, lid in enumerate(IDS)
+                  if lid != 16}
+        _write_profile(profile, series)
+        provenance = {"ekf_noise": {"origin": "profile", "path": str(profile)}, "ekf_scale_ratio": 2.0}
+        _, lookup = vr._noise_params(provenance, DT)
+        runtime = resolve_profile(profile, dt=DT, scale_ratio=2.0).series_noise([16])
+        assert lookup(16, "y") == pytest.approx((runtime.q_acc[1], runtime.r[1], runtime.gate_std[1]))
+        assert lookup(16, "y")[0] == pytest.approx(0.3 * 4.0), "11〜15 の q の中央値 0.3 に体格比の 2 乗"
+        ekf = vr.check_run(make_run(tmp_path, provenance=provenance))["ekf"]
+        assert all(row["rejection_rate"] is not None for row in ekf["series"] if row["landmark"] == 16)
+
+    def test_a_profile_that_the_runtime_cannot_pick_is_named(self, tmp_path):
+        """dt の合わないプロファイルは実行時も選ばない。check は落ちずに、棄却率を出さない理由を書く。"""
+        profile = tmp_path / "ekf_profile.json"
+        _write_profile(profile, {str(lid): {axis: _entry(0.1, 1e-4, 3.0) for axis in "xyz"} for lid in IDS},
+                       dt=8 / 30)
+        ekf = vr.check_run(make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": str(profile)}}))["ekf"]
+        assert all(row["rejection_rate"] is None for row in ekf["series"])
+        assert "dt" in ekf["note"]
 
     def test_a_missing_profile_does_not_stop_the_check(self, tmp_path):
         out = make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": "/nowhere/ekf_profile.json"}})
         ekf = vr.check_run(out)["ekf"]
         assert all(row["rejection_rate"] is None for row in ekf["series"])
         assert "見つからない" in ekf["note"]
+
+    def test_dropped_frames_do_not_count_as_rejections(self, tmp_path):
+        """取りこぼした行（frame 番号の跳び）は、推定と同じく NaN の行として棄却率を数える。行を詰めたままだと
+        抜けの前後が 1 dt に縮み、なめらかな動きでも正規化イノベーションが門の外に出る（この設定で 4 割）。"""
+        scalar = {"EKF_Q_ACC": 0.1, "EKF_R": 1e-8, "EKF_GATE_STD": 3.0}
+        ekf = vr.check_run(make_run(tmp_path, provenance=scalar, dropped_rows=range(3, N, 10)))["ekf"]
+        assert all(row["rejection_rate"] == 0.0 for row in ekf["series"]), ekf["series"][:3]
 
     def test_no_gate_means_no_rejection_rate(self, tmp_path):
         """EKF_GATE_STD <= 0 なら実行時は門を使わない（extended_kalman_filter）。100% と出さない。"""
@@ -292,6 +386,40 @@ class TestReplayRefusesBadInput:
         code = vr.main(["replay", "--cam0", str(tmp_path / "missing0.mp4"), "--cam1", str(tmp_path / "missing1.mp4"),
                         "--calib", str(tmp_path), "--out", str(tmp_path / "out"), "--subject", "7"])
         assert code == 2
+
+
+class TestReplayReportsTheRecording:
+    """録画の穴（USB の取りこぼし）と左右のずれは、再生の DT_SEC では直せない（再生は 1 フレームの間隔で並べ直す）。
+    record_stereo の frames.csv から数え直して再生の報告に出し、警告する（meta に数の無い古い録画も）。"""
+
+    def test_a_stall_in_the_recording_is_reported(self, tmp_path, monkeypatch, capsys):
+        from test_record_stereo import FakeCamera, _fake_times, _run
+        from tools import record_stereo as rs
+
+        cameras = [FakeCamera(12), FakeCamera(12)]
+        monkeypatch.setattr(rs, "_timed_grab", _fake_times(cameras, stall_after=6))
+        _, session = _run(tmp_path, cameras)
+        meta_path = session / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta.pop("frame_timing")   # 数を meta に残す前の録画
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        class FinishedProcess:
+            stdout = iter(())
+
+            def wait(self):
+                return 0
+
+            def poll(self):
+                return 0
+
+        monkeypatch.setattr(vr.subprocess, "Popen", lambda *args, **kwargs: FinishedProcess())
+        out = tmp_path / "out"
+        vr.main(["replay", "--session", str(session), "--subject", "7", "--out", str(out)])
+        report = json.loads((out / "verify_report.json").read_text(encoding="utf-8"))
+        assert report["recording"]["gaps"] == 1 and report["recording"]["missing_frames"] == 6
+        text = capsys.readouterr().out
+        assert "[録画]" in text and "穴が 1 か所" in text
 
 
 class TestDtOverride:

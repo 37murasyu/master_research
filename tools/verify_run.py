@@ -1,7 +1,8 @@
 """計測の出力を確かめる（§6-2・§6-3・§3-2）。録画を計測に読み込ませる再生もここから行う。
 
 - ``check``: 出力フォルダ（``OUTPUT_DIR``、既定は ``output_data``）を読んで確かめる。合否を出すのは構造
-  （ファイルの有無、行の対応、実機での処理間隔）だけ。値（トルク、ゲージ、EKF の RMS 差・棄却率）は並べて出す。
+  （ファイルの有無、行の対応、実機での処理間隔、肩・肘・手首の 3D がそろった行の割合）だけ。値（トルク、ゲージ、
+  骨の長さ、EKF の RMS 差・棄却率）は並べて出す。
   期待範囲は S6 の実測で決める（``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` :364）
 - ``replay``: 録画（``tools/record_stereo.py`` のフォルダか、受け取った ``cameras_raw/<試技>/``）を計測
   （``python -m app --role realtime``、GUI と同じ起動）に読み込ませ、終わったら ``check`` にかける。
@@ -47,10 +48,13 @@ from app import entry  # noqa: E402
 from app.core.settings import OUTPUT_DIR_ENV, Settings  # noqa: E402
 from app.core.stop_request import STOP_FILE_ENV  # noqa: E402
 from app.hybrid.retriangulate import retriangulate  # noqa: E402
+from app.tuning.ekf_estimate import capture_on_grid  # noqa: E402
 from app.tuning.ekf_likelihood import innovation_loglik  # noqa: E402
-from app.tuning.ekf_profile import builtin_entry, read_profile  # noqa: E402
-from app.tuning.raw_capture import RawCaptureWriter, read_raw_capture, sidecar_path  # noqa: E402
+from app.tuning.ekf_profile import builtin_entry, resolve_profile  # noqa: E402
+from app.tuning.raw_capture import (  # noqa: E402
+    HYBRID_RETRI_SOURCE, RawCaptureWriter, read_raw_capture, sidecar_path)
 from tools.parse_fps_stats import parse_file  # noqa: E402
+from tools.record_stereo import read_frame_timing, timing_warnings  # noqa: E402
 
 JOINTS = ("wrist_R", "elbow_R", "wrist_L", "elbow_L")
 CALIB_FILES = ("c0.dat", "c1.dat", "rot_trans_c0.dat", "rot_trans_c1.dat")
@@ -83,8 +87,17 @@ def _one(out_dir: Path, pattern: str) -> Path | None:
     return found[-1] if found else None
 
 
+def _read_table(path: Path, **kwargs) -> pd.DataFrame:
+    """CSV を読む。USB の本体は処理したフレームが 0 だと列も無い空の CSV（``pd.DataFrame([]).to_csv``）を書くので、
+    そのときは 0 行の表を返す（``EmptyDataError`` で check を落とさず、行の検査で不合格にする）。"""
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
 def _torque_stats(path: Path) -> dict[str, Any]:
-    df = pd.read_csv(path, encoding="utf-8-sig")
+    df = _read_table(path, encoding="utf-8-sig")
     stats = {}
     for joint in JOINTS:
         column = f"{joint}_y"
@@ -100,7 +113,7 @@ def _torque_stats(path: Path) -> dict[str, Any]:
 
 
 def _gauge_stats(path: Path) -> dict[str, Any]:
-    df = pd.read_csv(path, encoding="utf-8-sig")
+    df = _read_table(path, encoding="utf-8-sig")
     meta_path = path.with_suffix(".json")
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
     bands = meta.get("thresholds_gauge") or meta.get("thresholds_auto") or {}
@@ -130,8 +143,10 @@ def _profile_path(path: str, base_dir: Path | None) -> Path | None:
 def _noise_params(provenance: Mapping[str, Any], dt: float, base_dir: Path | None = None):
     """実行時に EKF が使った雑音パラメータの出どころと、系列 (ID, 軸) → (q, r, gate) を返す関数。
 
-    プロファイルが見つからなければ関数の代わりに None を返す。プロファイル由来の q・r は、実行時と同じく
-    体格の比（サイドカーの ``ekf_scale_ratio``）の 2 乗を掛ける（``ekf_profile.SeriesEntry.scaled``）。
+    プロファイルが見つからなければ関数の代わりに None を返す。プロファイル由来の値は実行時と同じ解決で求める:
+    dt で選び（``ekf_profile.resolve_profile``）、q・r に体格の比（サイドカーの ``ekf_scale_ratio``）の 2 乗を掛け
+    （``SeriesEntry.scaled``）、プロファイルに無い系列は全体の中央値で埋める（``ProfileResolution.series_noise``）。
+    実行時が選べないプロファイル（dt が合わない・壊れている）なら ValueError。
     """
     noise = provenance.get("ekf_noise") or {}
     origin = noise.get("origin") or "env"
@@ -139,13 +154,17 @@ def _noise_params(provenance: Mapping[str, Any], dt: float, base_dir: Path | Non
         found = _profile_path(noise["path"], base_dir)
         if found is None:
             return origin, None
-        profile = read_profile(found)
-        series = profile["series"]
-        factor = float(provenance.get("ekf_scale_ratio") or 1.0) ** 2
+        try:
+            resolution = resolve_profile(found, dt=dt, scale_ratio=float(provenance.get("ekf_scale_ratio") or 1.0))
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"{found.name} を較正プロファイルとして読めない（{error!r}）") from error
+        if resolution.reason is not None:
+            raise ValueError(f"{found.name} は dt {dt:.5f} s の実行時に選ばれない（{resolution.reason}）")
 
         def lookup(lid, axis):
-            entry_ = series[str(lid)][axis]
-            return float(entry_["q_acc"]) * factor, float(entry_["r"]) * factor, float(entry_["gate_std"])
+            chosen = resolution.series_noise([int(lid)])
+            k = AXES.index(axis)
+            return float(chosen.q_acc[k]), float(chosen.r[k]), float(chosen.gate_std[k])
         return origin, lookup
     if origin == "builtin":
         builtin = builtin_entry(dt)
@@ -155,8 +174,12 @@ def _noise_params(provenance: Mapping[str, Any], dt: float, base_dir: Path | Non
 
 
 def _noise_lookup(provenance: Mapping[str, Any], dt: float, base_dir: Path | None) -> tuple[str, Any, str]:
-    """``_noise_params`` に、較正プロファイルが見つからないときの注記を添える。"""
-    origin, lookup = _noise_params(provenance, dt, base_dir)
+    """``_noise_params`` に、較正プロファイルが見つからない・使えないときの注記を添える。"""
+    try:
+        origin, lookup = _noise_params(provenance, dt, base_dir)
+    except ValueError as error:
+        origin = (provenance.get("ekf_noise") or {}).get("origin") or "env"
+        return origin, None, f"較正プロファイルを使えないので棄却率は出さない: {error}"
     note = ""
     if lookup is None:
         note = f"較正プロファイル {(provenance.get('ekf_noise') or {}).get('path')} が見つからないので棄却率は出さない"
@@ -170,7 +193,7 @@ def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[s
     外に出た割合。実行時の EKF はロバスト更新で状態が変わるので近似である。門が 0 以下なら実行時は門を
     使わないので、棄却率は出さない。USB の生 CSV と kpts3d は 1 行ずつ対応するので、行の番号で合わせる。
     """
-    kpts = pd.read_csv(kpts_path)
+    kpts = _read_table(kpts_path)
     n = min(capture.points.shape[0], len(kpts))
     dt = float(capture.provenance["dt"])
     origin, lookup, note = _noise_lookup(capture.provenance, dt, base_dir)
@@ -180,13 +203,15 @@ def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[s
 def _ekf_series(capture, raw_rows: np.ndarray, kpts: pd.DataFrame, origin: str, lookup, note: str) -> dict[str, Any]:
     """合わせ済みの行（``raw_rows`` と ``kpts`` の同じ番号が同じ時刻）で、系列ごとの RMS と棄却率を出す。
 
-    棄却率は生の系列の全体（抜けた格子の NaN を含む、dt 一定）で数える。
+    棄却率は生の系列の全体（抜けた格子の NaN を含む、dt 一定）で数える。取りこぼした行（frame 番号の跳び）は、
+    推定（``ekf_estimate``）と同じく NaN の行に戻す（``capture_on_grid``）。
     """
     dt = float(capture.provenance["dt"])
+    grid = capture_on_grid(capture)
     rows = []
     for i, lid in enumerate(capture.landmark_ids):
         for a, axis in enumerate(AXES):
-            raw = capture.points[:, i, a]
+            raw = grid[:, i, a]
             column = f"joint_{i}_{axis}"
             diff = raw_rows[:, i, a] - (kpts[column].to_numpy(float) if column in kpts else np.nan)
             finite = np.isfinite(diff)
@@ -294,6 +319,42 @@ MIN_SEGMENT_SHARE = 0.95
 MAX_FOREARM_STD_M = 0.015
 MIN_RAY_ANGLE_DEG = 15.0
 MIN_INSIDE_SHARE = 0.95
+# USB の構造の検査: 肩・肘・手首の 3D がそろった行の割合の下限。人が画面に入るまでの数秒などで抜けるのは普通なので
+# 半分とする。灰色の映像のように 3D が 1 点も取れない回（トルクが 0 のまま CSV はそろう）を落とすため
+TRACKED_POINTS = (11, 12, 13, 14, 15, 16)
+MIN_TRACKED_SHARE = 0.5
+
+
+def _segment_lengths(points: np.ndarray, ids) -> dict[str, dict[str, Any]]:
+    """部位（肩幅・上腕・前腕）ごとの長さの中央値、範囲に入る割合、範囲内のばらつき。
+
+    ``points`` は (行, 点, 3) [m]、並びは ``ids`` の順。長さが 1 つも有限でなければ中央値と割合は None。
+    """
+    slot = {int(lid): i for i, lid in enumerate(ids)}
+    segments = {}
+    for name, (a, b, low, high) in SEGMENTS.items():
+        if a in slot and b in slot:
+            length = np.linalg.norm(points[:, slot[a]] - points[:, slot[b]], axis=1)
+            length = length[np.isfinite(length)]
+        else:
+            length = np.array([])
+        inside = length[(length >= low) & (length <= high)]
+        segments[name] = {
+            "median_m": float(np.median(length)) if length.size else None,
+            "share": float(inside.size / length.size) if length.size else None,
+            "std_m": float(np.std(inside)) if inside.size > 1 else None,   # 範囲内の値だけのばらつき
+            "range_m": [low, high],
+        }
+    return segments
+
+
+def _tracked_rows(points: np.ndarray, ids) -> tuple[int, int]:
+    """肩・肘・手首（``TRACKED_POINTS``）の 3D がすべて有限の行の数と、全体の行の数。"""
+    slot = {int(lid): i for i, lid in enumerate(ids)}
+    if not all(lid in slot for lid in TRACKED_POINTS):
+        return 0, int(points.shape[0])
+    arm = points[:, [slot[lid] for lid in TRACKED_POINTS]]
+    return int(np.isfinite(arm).all(axis=(1, 2)).sum()), int(points.shape[0])
 
 
 def _camera_centres(folder: Path) -> list[np.ndarray]:
@@ -324,18 +385,7 @@ def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mappin
     else:
         table = pd.read_csv(files["kpts3d"])
         points = table.drop(columns="frame").to_numpy(float).reshape(len(table), len(ids), 3)
-    segments = {}
-    for name, (a, b, low, high) in SEGMENTS.items():
-        length = np.linalg.norm(points[:, slot[a]] - points[:, slot[b]], axis=1)
-        length = length[np.isfinite(length)]
-        inside = length[(length >= low) & (length <= high)]
-        segments[name] = {
-            "median_m": float(np.median(length)) if length.size else None,
-            "share": float(inside.size / length.size) if length.size else None,
-            "std_m": float(np.std(inside)) if inside.size > 1 else None,   # 範囲内の値だけのばらつき
-            "range_m": [low, high],
-        }
-    quality: dict[str, Any] = {"segments": segments}
+    quality: dict[str, Any] = {"segments": _segment_lengths(points, ids)}
     try:
         centres = _camera_centres(folder)
     except (OSError, ValueError):
@@ -363,12 +413,27 @@ def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mappin
     return quality
 
 
+NO_FINITE_LENGTH = "有限の長さが無い"
+NO_FINITE_HINT = "（3D が取れていない。被写体が両方の画面に入っているか、校正を確かめる）"
+
+
 def _quality_checks(quality: Mapping[str, Any], add) -> None:
+    """骨の長さと配置の検査。長さが 1 つも有限でない部位（割合・ばらつきが None）は「有限の長さが無い」で不合格。"""
     segments = quality["segments"]
-    short = [f"{name} {s['share']:.0%}" for name, s in segments.items() if s["share"] is None or s["share"] < MIN_SEGMENT_SHARE]
-    add("3D: 肩幅・上腕・前腕の長さが妥当な範囲に入る割合 95% 以上", not short, "、".join(short))
-    wobbly = [f"{name} {s['std_m'] * 100:.1f} cm" for name in ("前腕R", "前腕L")
-              for s in [segments[name]] if s["std_m"] is None or s["std_m"] >= MAX_FOREARM_STD_M]
+    short = [f"{name} {NO_FINITE_LENGTH}" if s["share"] is None else f"{name} {s['share']:.0%}"
+             for name, s in segments.items() if s["share"] is None or s["share"] < MIN_SEGMENT_SHARE]
+    missing = any(s["share"] is None for s in segments.values())
+    add("3D: 肩幅・上腕・前腕の長さが妥当な範囲に入る割合 95% 以上", not short,
+        "、".join(short) + (NO_FINITE_HINT if missing else ""))
+    wobbly = []
+    for name in ("前腕R", "前腕L"):
+        s = segments[name]
+        if s["share"] is None:
+            wobbly.append(f"{name} {NO_FINITE_LENGTH}")
+        elif s["std_m"] is None:
+            wobbly.append(f"{name} 範囲内の長さが 1 個以下")
+        elif s["std_m"] >= MAX_FOREARM_STD_M:
+            wobbly.append(f"{name} {s['std_m'] * 100:.1f} cm")
     add("3D: 前腕の長さのばらつき（標準偏差）1.5 cm 未満", not wobbly, "、".join(wobbly))
     if "angle_deg" in quality:
         angles = quality["angle_deg"]
@@ -378,9 +443,11 @@ def _quality_checks(quality: Mapping[str, Any], add) -> None:
             ("、".join(narrow) + f"（基線 {quality['baseline_cm']:.1f} cm。被写体を近づけるか 2 台の間を広げ、"
              f"被写体を 2 台の中間の正面に置いて校正し直す。docs/hybrid_field_run.md の表）") if narrow else "")
     if "inside" in quality:
+        # 片方のカメラの点が 1 つも無ければ、残った 1 台だけで「両カメラ」を合格にしない
+        absent = [f"{ROLE_NAMES[role]} の点が無い" for role in ROLE_NAMES if role not in quality["inside"]]
         cut = [f"{ROLE_NAMES.get(role, role)} の{name} {share:.0%}" for role, shares in sorted(quality["inside"].items())
                for name, share in shares.items() if share < MIN_INSIDE_SHARE]
-        add("配置: 肘・手首が両カメラの画面内にある割合 95% 以上", not cut, "、".join(cut))
+        add("配置: 肘・手首が両カメラの画面内にある割合 95% 以上", not absent and not cut, "、".join(absent + cut))
 
 
 def _hybrid_ekf_stats(capture, kpts_path: Path, frames: pd.DataFrame, base_dir: Path | None = None) -> dict[str, Any]:
@@ -526,20 +593,25 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
         steps = _intervals(frames["t_s"])
         role_fps, role_frames = {}, {}
         if files["landmarks2d"] is not None:
-            marks = pd.read_csv(files["landmarks2d"], usecols=["role", "seq", "t_ns"]).drop_duplicates(["role", "seq"])
+            # 1 フレームは 33 行。Pixel はつなぎ直すと seq が 0 に戻るので、撮影時刻も合わせてフレームを見分ける
+            marks = pd.read_csv(files["landmarks2d"], usecols=["role", "seq", "t_ns"]).drop_duplicates(["role", "seq", "t_ns"])
             for role, group in marks.groupby("role"):
                 role_steps = _intervals(np.sort(group["t_ns"].to_numpy(float)) / 1e9)
                 role_frames[role] = int(len(group))
                 role_fps[role] = 1.0 / float(np.median(role_steps)) if role_steps.size else None
+        # 2 台ともそろって初めて「Mac・Pixel とも」。片方の点が 1 つも無い（人を見つけない・別のカメラ）なら不合格
+        absent = [role for role in ROLE_NAMES if role not in role_fps]
         slow = {role: fps for role, fps in role_fps.items() if fps is None or fps < MIN_CAMERA_FPS}
-        detail = "、".join(f"{ROLE_NAMES.get(role, role)}（{role}）{_fmt(fps, '.1f')} fps" for role, fps in sorted(slow.items()))
-        add(f"速さ: Mac・Pixel とも {MIN_CAMERA_FPS:g} fps 以上（30 fps の 8 割）", bool(role_fps) and not slow,
-            detail or ("landmarks2d が無い" if not role_fps else ""))
+        detail = "、".join([f"{ROLE_NAMES[role]}（{role}）の点が無い" for role in absent]
+                          + [f"{ROLE_NAMES.get(role, role)}（{role}）{_fmt(fps, '.1f')} fps" for role, fps in sorted(slow.items())])
+        add(f"速さ: Mac・Pixel とも {MIN_CAMERA_FPS:g} fps 以上（30 fps の 8 割）", not absent and not slow,
+            "landmarks2d が無い" if not role_fps else detail)
         period = float(np.median(steps)) if steps.size else None
         report["fps"] = {
             "processed_fps": 1.0 / period if period else None,
-            # 組のうち、遅い方のカメラの実測に基づく割合。残りは同期バッファの線形補間で作った点
-            "real_share": min(1.0, min(role_frames.values()) / len(frames)) if role_frames and len(frames) else None,
+            # 組のうち、遅い方のカメラの実測に基づく割合。残りは同期バッファの線形補間で作った点（点の無いカメラは 0）
+            "real_share": (min(1.0, min(role_frames.get(role, 0) for role in ROLE_NAMES) / len(frames))
+                           if role_frames and len(frames) else None),
             # 同期バッファが 100 ms を超える穴で組を作らなかった時間（組の間隔が 1.5 倍を超えた分）
             "missing_s": float(steps[steps > 1.5 * period].sum()) if period else None,
             "interval_p05": float(np.percentile(steps, 5)) if steps.size else None,
@@ -570,9 +642,11 @@ RETRI_SUFFIX = "_retri"
 
 def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: str | Path | None = None, *,
                        grid: bool = False, hz: float | None = None) -> Path:
-    """混成の 3D（EKF なし）を生 CSV（``kpts3d_raw_<stamp>_retri*``、``app.tuning.raw_capture`` の形）に直す。
+    """混成の 3D（EKF の手前）を生 CSV（``kpts3d_raw_<stamp>_retri*``、``app.tuning.raw_capture`` の形）に直す。
 
-    S6 の雑音の推定（``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf``）がそのまま使える。
+    S6 の雑音の推定（``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf``）がそのまま使える。サイドカーの source は
+    ``hybrid_retri``（比べる用）。混成の計測（実行時）が読むプロファイルは、記録器が書いた ``kpts3d_raw_<stamp>.csv``
+    （source が ``hybrid``）から作る。tune_ekf は ``hybrid_retri`` のプロファイルを実行時の置き場へ書かず、収録の隣に書く
 
     - 既定は、遅い方のカメラ（実機では Pixel、10〜15 Hz）の実際の撮影時刻で記録の 2D から三角測量し直した 3D
       （``app.hybrid.retriangulate``）。計測中の 3D は 30 Hz の格子へ線形補間した点で、補間の区間が直線になり
@@ -633,7 +707,8 @@ def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: 
         "unit": "m", "frame": "runtime", "dt": float(np.median(steps)),
         "dt_source": f"混成ステレオの {where} の間隔の中央値（{stride} 組おき）",
         "src_fps": real_fps, "file_mode": False,
-        "source": "hybrid", "hybrid_session": str(folder), "times": times, "stride": stride,
+        # 記録器の生 CSV（source が hybrid、tune_ekf が実行時の置き場へ書く）と分ける
+        "source": HYBRID_RETRI_SOURCE, "hybrid_session": str(folder), "times": times, "stride": stride,
         "skipped_pairs": skipped, "t0_s": float(t[index[0]]),
         "interval_p05": float(np.percentile(steps, 5)), "interval_p95": float(np.percentile(steps, 95)),
         "RT_POSE_FIXED_HZ_ON": stride > 1, "EKF_ENABLE": False, "ekf_noise": None,
@@ -690,11 +765,11 @@ def check_run(out_dir: str | Path, log: str | Path | None = None, timestamp: str
 
     capture = read_raw_capture(raw_path) if has_raw else None
     if capture is not None and files["kpts3d"] is not None:
-        n_raw, n_kpts = capture.points.shape[0], len(pd.read_csv(files["kpts3d"]))
+        n_raw, n_kpts = capture.points.shape[0], len(_read_table(files["kpts3d"]))
         # 体格の比で計測を止めたとき（終了コード 3）だけ、生 CSV が 1 行多い
         add("行: 生 CSV と kpts3d が 1 行ずつ対応", n_raw - n_kpts in (0, 1), f"生 {n_raw} 行 / kpts3d {n_kpts} 行")
     if files["aim_torque"] is not None:
-        n_torque = len(pd.read_csv(files["aim_torque"], encoding="utf-8-sig"))
+        n_torque = len(_read_table(files["aim_torque"], encoding="utf-8-sig"))
         add("行: aim_torque が 1 行以上", n_torque > 0, f"{n_torque} 行（慣性の暖機 30 フレームの後から）")
         report["torque"] = _torque_stats(files["aim_torque"])
     if files["gauge_energy"] is not None:
@@ -717,6 +792,13 @@ def check_run(out_dir: str | Path, log: str | Path | None = None, timestamp: str
             ok = interval is not None and abs(interval - dt) / dt <= DT_TOLERANCE
             add("処理間隔: dt と実際の間隔が 20% 以内", ok,
                 f"dt {dt:.4f} s / 実際 {interval:.4f} s" if interval else "間隔が取れない")
+        # 3D が 1 点も取れない回（人が写っていない・灰色の映像）でも、ファイルと行はそろいトルクは 0 のまま書かれる
+        tracked, rows = _tracked_rows(capture.points, capture.landmark_ids)
+        add(f"3D: 肩・肘・手首がそろった行 {MIN_TRACKED_SHARE:.0%} 以上", rows > 0 and tracked / rows >= MIN_TRACKED_SHARE,
+            f"{tracked} / {rows} 行" + ("、処理したフレームが無い" if not rows else
+                                         "" if tracked else "、人を見つけていない。映像と写り方を確かめる"))
+        # 骨の長さは混成と同じ節（値として並べる。USB の置き方・校正の目安は混成と違うので合否にしない）
+        report["quality"] = {"segments": _segment_lengths(capture.points, capture.landmark_ids)}
         if files["kpts3d"] is not None:
             report["ekf"] = _ekf_stats(capture, files["kpts3d"], base_dir=out_dir)
         if expect_profile:
@@ -851,6 +933,12 @@ def format_report(report: Mapping[str, Any]) -> str:
         for role, shares in sorted(q.get("inside", {}).items()):
             lines.append(f"  {ROLE_NAMES.get(role, role)} の画面内: " + "、".join(f"{n} {v:.0%}" for n, v in shares.items()))
         lines.append("  肩幅は巻尺で測った値と比べる（mobile/README.md の目安は ±2 cm）")
+    if report.get("recording"):
+        r = report["recording"]
+        lines.append(f"[録画] 間隔 中央値 {r['median_interval_ms']:.1f} ms / 最大 {r['max_interval_ms']:.0f} ms、"
+                     f"穴 {r['gaps']} か所（取りこぼし約 {r['missing_frames']} フレーム）、左右のずれ 最大 "
+                     f"{_fmt(r['max_skew_ms'], '.1f')} ms / 95% {_fmt(r['p95_skew_ms'], '.1f')} ms")
+        lines.extend(f"  [警告] {warning}" for warning in timing_warnings(r))
     if report.get("kind") == "hybrid":
         h = report.get("hybrid", {})
         lines.append(f"[§3-2 記録] status={h.get('status')}、止まった理由 {h.get('stop_reason')}、"
@@ -996,6 +1084,11 @@ def _replay(args) -> int:
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     base = gui_environment(Settings.load(Settings.default_path()), stop_file)
     dt_sec = dt_override(meta, args.fixed_hz, base) if meta else None
+    # 録画の穴と左右のずれは DT_SEC では直せない（再生は 1 フレームの間隔で並べ、同じ番号を組にする）ので、数えて警告する。
+    # meta に数の無い古い録画もあるので frames.csv から数え直す
+    recording = read_frame_timing(session) if session is not None else None
+    for warning in timing_warnings(recording):
+        print(f"[WARN] {warning}", flush=True)
     env = replay_environment(
         base,
         cam0=Path(cam0).resolve(), cam1=Path(cam1).resolve(), calib=Path(calib).resolve(), out_dir=out_dir,
@@ -1037,6 +1130,7 @@ def _replay(args) -> int:
     report = check_run(out_dir, log=log_path, timestamp=timestamp, expect_stop=bool(args.stop_after_sec),
                        expect_profile=bool(args.ekf_profile))
     report["exit_code"] = code
+    report["recording"] = recording
     report["replay"] = {"cam0": str(cam0), "cam1": str(cam1), "calib": str(calib), "fixed_hz": args.fixed_hz,
                         "dt_sec": dt_sec, "subject": args.subject, "stop_after_sec": args.stop_after_sec,
                         "recording_meta": meta or None}
@@ -1096,7 +1190,8 @@ def main(argv=None) -> int:
         print(f"生 CSV: {path}（{meta['dt_source']}: dt {meta['dt']:.5f} s、間隔の 5〜95%: "
               f"{meta['interval_p05']:.4f}〜{meta['interval_p95']:.4f} s、組を作れなかった点 {meta['skipped_pairs']}）")
         print(f"次: python -m app.tuning.ekf_estimate {path}")
-        print(f"    python -m app.runners.tune_ekf {path}")
+        print(f"    python -m app.runners.tune_ekf {path}   # 比べる用。プロファイルはこの CSV の隣に書く")
+        print("    混成の計測に使うプロファイルは、計測フォルダの kpts3d_raw_<stamp>.csv（記録器の生 CSV）から tune_ekf で作る")
         return 0
     report = check_run(args.out_dir, log=args.log, timestamp=args.timestamp, expect_stop=args.expect_stop)
     print(format_report(report))

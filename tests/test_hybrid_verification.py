@@ -5,13 +5,14 @@
 実際の計測構成は Pixel 7a 1 台＋Mac 内蔵カメラ（``app.hybrid``、``app.runners.hybrid_measure``）で、USB カメラ 2 台の
 経路（``master_research_code.py``）とは出力の形が違う。Pixel の映像は JPEG で毎秒 3〜4 枚しか届かない
 （``app.hybrid.link`` の PREVIEW・CALIBRATION）ので、30 fps で残るのは 2D ランドマーク（``landmarks2d_*``）と
-三角測量した 3D（``kpts3d_*``、EKF なし）。検証はこの記録の上に作る。
+三角測量した 3D（``kpts3d_*``。ここで作る古い版の記録は EKF なし）。検証はこの記録の上に作る。
 
 - §3-2: 停止の要求で止めても記録を正しく閉じる（``meta.json`` の ``status`` が ``complete``）。何で止まったかも
   ``meta.json`` に残す（以前は残しておらず、停止ボタンで止まったのか失敗で止まったのか区別できなかった）
 - §6-2: トルクの大きさ、サイクルごとの仕事、Pixel・Mac・組の実際の速さ
-- §6-3: 混成の経路は EKF を使っていない。S6（雑音の推定）は、3D を生 CSV の形（``kpts3d_raw_*``）に直せば
-  ``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf`` がそのまま使える。4 Hz 間引きは記録を間引いて作る
+- §6-3: 今の記録器は EKF の手前の 3D を ``kpts3d_raw_<stamp>.csv`` に書き、実行時のプロファイルはそこから作る
+  （``tests/test_hybrid_check_extended.py``）。``hybrid-raw`` は記録から比べる用の生 CSV（``kpts3d_raw_<stamp>_retri*``、
+  source は ``hybrid_retri``）を作り、``app.tuning.ekf_estimate`` にそのままかけられる。4 Hz 間引きは記録を間引いて作る
 """
 
 from __future__ import annotations
@@ -143,7 +144,7 @@ class TestHybridRawCapture:
         assert len(capture.points) == N
         assert np.allclose(capture.points.reshape(N, -1), kpts)
         assert capture.provenance["dt"] == pytest.approx(DT_NS / 1e9, rel=1e-6)
-        assert capture.provenance["source"] == "hybrid"
+        assert capture.provenance["source"] == "hybrid_retri", "記録器の生 CSV（source が hybrid）と分ける"
 
     def test_a_stride_emulates_the_fixed_rate(self, tmp_path):
         """混成の経路には間引きの設定が無い。S6 の 2 設定目（4 Hz）は記録を 8 組おきに間引いて作る。"""
@@ -327,6 +328,20 @@ class TestRateCheck:
     def test_both_cameras_at_30fps_pass(self, tmp_path):
         assert _check(vr.check_run(make_hybrid_run(tmp_path)), "速さ: Mac・Pixel とも 24 fps 以上（30 fps の 8 割）")["ok"]
 
+    def test_a_reconnected_pixel_keeps_the_frames_after_the_reconnection(self, tmp_path):
+        """Pixel がつなぎ直すと seq は 0 に戻る（SensorClient.connect）。(role, seq) だけで重複を除くと、つなぎ直した後の
+        フレームが前のフレームの重複として捨てられ、Pixel のフレーム数と実測に基づく割合が小さく出る。"""
+        run = make_hybrid_run(tmp_path)
+        before = vr.check_run(run)["fps"]
+        marks = next(run.glob("landmarks2d_*.csv"))
+        table = pd.read_csv(marks)
+        late = (table.role == "cam1") & (table.seq >= 48)
+        table.loc[late, "seq"] -= 48   # 4 割のところでつなぎ直した
+        table.to_csv(marks, index=False)
+        after = vr.check_run(run)["fps"]
+        assert after["role_frames"] == before["role_frames"] == {"cam0": N, "cam1": N}
+        assert after["real_share"] == pytest.approx(before["real_share"])
+
 
 # ---------------------------------------------------------------------------
 # 配置と 3D の質（本番の前の試し計測で、置き方を直すべきかをその場で決めるため）
@@ -369,6 +384,55 @@ class TestPlacementAndQuality:
         report = vr.check_run(run)
         check = _check(report, QUALITY["segments"])
         assert not check["ok"] and "上腕R" in check["detail"]
+
+    def test_no_finite_length_fails_and_the_report_is_written(self, tmp_path):
+        """右手首の 3D が 1 組も取れていないと、前腕 R の長さが 1 つも有限でなく割合とばらつきが None になる。
+        check は落ちずに「有限の長さが無い」で不合格にし、案内と verify_report.json を出す（以前は TypeError で何も残らなかった）。"""
+        run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
+        kpts = next(p for p in run.glob("kpts3d_*.csv") if not p.name.startswith("kpts3d_raw_"))
+        table = pd.read_csv(kpts)
+        wrist = IDS.index(16)
+        table[[f"joint_{wrist}_{axis}" for axis in "xyz"]] = np.nan
+        table.to_csv(kpts, index=False)
+        assert vr.main(["check", str(run)]) == 1
+        report = json.loads((run / "verify_report.json").read_text(encoding="utf-8"))
+        for name in (QUALITY["segments"], QUALITY["forearm"]):
+            check = _check(report, name)
+            assert not check["ok"] and "前腕R 有限の長さが無い" in check["detail"], check
+
+    def test_no_length_in_the_range_fails_the_spread(self, tmp_path):
+        """長さは有限でも範囲内が 1 個以下だと、ばらつきを出せない（None）。落ちずに不合格にする。"""
+        run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
+        kpts = next(p for p in run.glob("kpts3d_*.csv") if not p.name.startswith("kpts3d_raw_"))
+        table = pd.read_csv(kpts)
+        table[f"joint_{IDS.index(16)}_x"] = table[f"joint_{IDS.index(14)}_x"] + 0.8   # 右前腕がいつも 0.8 m
+        table.to_csv(kpts, index=False)
+        report = vr.check_run(run)
+        assert "前腕R 0%" in _check(report, QUALITY["segments"])["detail"]
+        check = _check(report, QUALITY["forearm"])
+        assert not check["ok"] and "前腕R 範囲内の長さが 1 個以下" in check["detail"]
+        assert "前腕R" in vr.format_report(report)
+
+    def test_a_run_without_pairs_fails_without_crashing(self, tmp_path):
+        """組が 1 つもできなかった回（kpts3d が見出しだけ）も、落ちずに不合格にする。"""
+        report = vr.check_run(make_hybrid_run(tmp_path, frames=0))
+        assert not _check(report, QUALITY["segments"])["ok"]
+        assert "有限の長さが無い" in _check(report, QUALITY["forearm"])["detail"]
+        vr.format_report(report)
+
+    def test_a_camera_without_any_point_fails_the_rate_and_the_frame(self, tmp_path):
+        """Mac が人を見つけない（別のカメラ番号を開いた）と、landmarks2d に Mac の行が 1 つも無い。残った Pixel だけで
+        「Mac・Pixel とも」の速さと「両カメラの画面内」を合格にしない。"""
+        run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
+        marks = next(run.glob("landmarks2d_*.csv"))
+        table = pd.read_csv(marks)
+        table[table.role != "cam0"].to_csv(marks, index=False)
+        report = vr.check_run(run)
+        rate = _check(report, "速さ: Mac・Pixel とも 24 fps 以上（30 fps の 8 割）")
+        assert not rate["ok"] and "Mac（cam0）の点が無い" in rate["detail"]
+        inside = _check(report, QUALITY["inside"])
+        assert not inside["ok"] and "Mac の点が無い" in inside["detail"]
+        assert report["fps"]["real_share"] == 0.0
 
     def test_hands_out_of_the_frame_are_named(self, tmp_path):
         run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)

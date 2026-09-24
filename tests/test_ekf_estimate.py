@@ -23,9 +23,9 @@ import copy
 import numpy as np
 import pytest
 
-from app.tuning.ekf_estimate import fit_capture, fit_series, initial_guess, main
+from app.tuning.ekf_estimate import fit_capture, fit_series, initial_guess, main, on_frame_grid
 from app.tuning.ekf_likelihood import BURN_IN, innovation_autocorrelation, innovation_loglik
-from app.tuning.raw_capture import RawCaptureWriter, read_raw_capture
+from app.tuning.raw_capture import RawCapture, RawCaptureWriter, read_raw_capture
 from extended_kalman_filter import EKFConfig, ExtendedKalman1D, constant_acceleration_model
 
 Q_TRUE = 0.122
@@ -105,6 +105,34 @@ class TestEstimator:
         z = _simulate(Q_TRUE, R_TRUE, dt, n)
         fit = fit_series(z, dt, span_decades=0.01, start=(Q_TRUE * 1e3, R_TRUE))
         assert fit.at_bound, "範囲の端で止まった推定を、張り付きとして報告していない"
+
+
+class TestDroppedFrames:
+    """処理が間に合わず取りこぼした行は、生 CSV の frame 番号の差に残る（USB は間引き幅の倍数で跳ぶ）。推定は行が
+    dt ごとに並ぶ前提なので、行を詰めたまま推定すると抜けの前後が 1 dt に縮み、q_acc が狂う（正弦の動きで 10% の
+    取りこぼしなら約 2 倍、ランダムウォークでは桁で外れる）。frame の差から抜けを NaN の行に戻してから推定する。"""
+
+    def test_gaps_in_the_frame_numbers_become_missing_rows(self):
+        grid = on_frame_grid(np.array([0, 8, 16, 40, 48]), np.arange(5.0))
+        np.testing.assert_array_equal(grid, [0.0, 1.0, 2.0, np.nan, np.nan, 3.0, 4.0])
+
+    def test_steady_frames_are_left_as_they_are(self):
+        values = np.arange(12.0).reshape(4, 3)
+        np.testing.assert_array_equal(on_frame_grid(np.array([3, 4, 5, 6]), values), values)
+
+    def test_a_capture_with_dropped_frames_gives_the_same_estimate(self):
+        dt, n = SERIES["間引きなし"]
+        z = _simulate(Q_TRUE, R_TRUE, dt, n)
+        keep = np.flatnonzero(np.random.default_rng(1).random(n) > 0.10)   # 1 割を取りこぼした
+        points = np.full((keep.size, 1, 3), np.nan)
+        points[:, 0, 0] = z[keep]
+        capture = RawCapture(landmark_ids=(11,), frame=keep, t=keep * dt, points=points,
+                             provenance={"dt": dt, "stage": "pre_ekf", "landmark_ids": [11]})
+        fit = fit_capture(capture)[(11, "x")]
+        full = fit_series(z, dt)
+        assert fit.q_acc == pytest.approx(full.q_acc, rel=0.2) and fit.r == pytest.approx(full.r, rel=0.2)
+        packed = fit_series(z[keep], dt)
+        assert abs(np.log10(packed.q_acc / full.q_acc)) > 0.3, "行を詰めても狂わないなら、この試験は何も確かめていない"
 
 
 class TestSameFilterAsRuntime:

@@ -130,3 +130,55 @@ class TestTuneEkfDestinations:
         from app.hybrid.paths import ekf_profile_root, hybrid_root
 
         assert ekf_profile_root() == hybrid_root() / "ekf_profiles"
+
+
+# ---------------------------------------------------------------------------
+# hybrid-raw の出力は実行時の置き場へ書かない
+# ---------------------------------------------------------------------------
+#
+# なぜこのテストがあるか: tools.verify_run hybrid-raw が記録から作り直した生 CSV（kpts3d_raw_<stamp>_retri*.csv）も
+# サイドカーの source が hybrid だったので、tune_ekf はそのプロファイルを実行時の hybrid/ekf_profiles/ に書いた。
+# --grid の出力は dt が 1/30 s で、記録器の kpts3d_raw_<stamp>.csv から作ったプロファイルを同じ名前で上書きしうる。
+# 実行時のプロファイルは記録器の生 CSV からだけ作り、hybrid-raw の出力（source が hybrid_retri）は比べる用として
+# 収録の隣に書く。
+
+
+def _retri_recording(tmp_path, provenance):
+    rng = np.random.default_rng(2)
+    t = np.arange(N_FRAMES) / 30
+    points = np.sin(2 * np.pi * 0.5 * t)[:, None, None] * 0.1 + rng.normal(0, 0.003, (N_FRAMES, len(IDS), 3))
+    csv_path = tmp_path / "session" / "kpts3d_raw_20260924_070000_000000_retri_grid.csv"
+    csv_path.parent.mkdir()
+    writer = RawCaptureWriter(csv_path, IDS, provenance=dict({"dt": 1 / 30, "src_fps": 30.0, "times": "grid"},
+                                                             **provenance))
+    for k in range(N_FRAMES):
+        writer.append(k, float(t[k]), points[k])
+    writer.close()
+    return csv_path
+
+
+class TestRetriangulatedCaptures:
+    @pytest.mark.parametrize("provenance", [
+        {"source": "hybrid_retri", "hybrid_session": "/x"},
+        {"source": "hybrid", "hybrid_session": "/x"},   # 直す前の hybrid-raw が書いたサイドカー
+    ])
+    def test_a_hybrid_raw_output_stays_next_to_the_capture(self, tmp_path, monkeypatch, capsys, provenance):
+        from app.runners import tune_ekf
+
+        root = tmp_path / "hybrid" / "ekf_profiles"
+        monkeypatch.setattr(tune_ekf, "ekf_profile_root", lambda: root)
+        csv_path = _retri_recording(tmp_path, provenance)
+        assert main([str(csv_path)]) == 0
+        assert not root.exists(), "hybrid-raw の出力のプロファイルを実行時の置き場に書いた"
+        assert (csv_path.parent / f"ekf_profile_{1 / 30:.5f}.json").is_file()
+        out = capsys.readouterr().out
+        assert "HYBRID_EKF_PROFILE" not in out
+        assert "kpts3d_raw_<stamp>.csv" in out, "実行時のプロファイルを何から作るかを案内していない"
+
+    def test_the_hybrid_raw_output_is_marked(self, tmp_path):
+        from app.tuning.raw_capture import read_raw_capture
+        from test_hybrid_verification import make_hybrid_run
+        from tools import verify_run as vr
+
+        path = vr.hybrid_raw_capture(make_hybrid_run(tmp_path), grid=True)
+        assert read_raw_capture(path).provenance["source"] == "hybrid_retri"

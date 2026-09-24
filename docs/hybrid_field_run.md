@@ -23,7 +23,8 @@
 - 右腕の 3D が飛ぶ原因は**置き方**。基線が短く、右腕では 2 本の視線がほぼ平行になり、2D のわずかな誤差で奥行きが大きく振れた。
   左右の取り違えではない（入れ替えても 685 組のうち 0 組しか直らなかった）。Pixel 側の補間でもない（Pixel の撮影時刻で三角測量し直しても同じ）
 - Mac の画面の下で手が切れていた（手首が画面外）
-- 混成の経路には EKF も外れ値の除き方も無いので、飛んだ 3D がそのままトルクになる
+- 当時の混成の経路には EKF も外れ値の除き方も無かったので、飛んだ 3D がそのままトルクになった（2026-09-24 から EKF と
+  腕の長さの安全策がある。下の「分かっていて直していないこと」）。置き方の失敗は、今も試し計測の `check` で先に見つける
 
 ## 2026-09-24 の Pixel の速さの測定（段階の行）
 
@@ -63,8 +64,9 @@
    届かないのは不具合ではなく、論文の閾値と 1RM の関係による（過去の実データのスコアも同じ桁）
 6. 終了コード 3 で止まったら: 先頭の窓の肩–肘の長さが人体の範囲外（置き方・写り方）。被写体が両方の画面に入り、最初の 2 秒静止しているかを確かめる
 7. 止めたら `python -m tools.verify_run check ~/Documents/WheelchairTorque/hybrid/measure --expect-stop` で、回ごとの W_pos・スコア・帯・
-   重力の出どころ・処理時間を見る。最初の本計測の `kpts3d_raw_<stamp>.csv` から解析ページ（または `python -m app.runners.tune_ekf`）で
-   EKF の較正プロファイルを作り、設定 `HYBRID_EKF_PROFILE` に `~/Documents/WheelchairTorque/hybrid/ekf_profiles` を入れる
+   重力の出どころ・処理時間を見る。最初の本計測の記録器の `kpts3d_raw_<stamp>.csv`（`_retri` の付かないもの）から解析ページ
+   （または `python -m app.runners.tune_ekf`）で EKF の較正プロファイルを作り、設定 `HYBRID_EKF_PROFILE` に
+   `~/Documents/WheelchairTorque/hybrid/ekf_profiles` を入れる（手順は §5 の 3）
 
 **被験者なしの練習（記録を流し直す）**: 計測画面の「実験者用の詳細設定」で入力を「記録の再生」にし、「記録」の行の「選ぶ…」で
 計測フォルダ（`meta.json` のあるもの。既定は `~/Documents/WheelchairTorque/hybrid/measure` から選び始める）を選んで開始すると、
@@ -185,14 +187,19 @@ Pixel の画面の段階の行の読み方:
    ```
    - **§3-2**: 「meta: 記録を正しく閉じた」「meta: 停止要求で止まった」が合格。停止ボタンから 2 秒以内に終わったか（`mobile/README.md` の目安）
    - **§6-2**: トルクの大きさ（手首・肘 10〜40 N·m 台の見込み）、Mac・Pixel の fps、組が抜けた時間。肩幅を巻尺の値と比べる（±2 cm）
-3. S6（§6-3）の材料を作る:
+3. S6（§6-3）: 実行時の EKF のプロファイルは、記録器の `kpts3d_raw_<stamp>.csv`（EKF の手前、1/30 s の格子）から作る:
    ```sh
-   python -m tools.verify_run hybrid-raw ~/Documents/WheelchairTorque/hybrid/measure
-   python -m tools.verify_run hybrid-raw ~/Documents/WheelchairTorque/hybrid/measure --hz 4
-   python -m app.tuning.ekf_estimate <計測フォルダ>/kpts3d_raw_<stamp>.csv
-   python -m app.runners.tune_ekf <計測フォルダ>/kpts3d_raw_<stamp>.csv
+   python -m app.tuning.ekf_estimate <計測フォルダ>/kpts3d_raw_<stamp>.csv   # 推定の表
+   python -m app.runners.tune_ekf <計測フォルダ>/kpts3d_raw_<stamp>.csv      # hybrid/ekf_profiles/ekf_profile_0.03333.json
    ```
-   推定の表で、端に張り付く系列が過半数、または |ρ1| > 0.3 なら、EKF の設計を見直す材料になる（設計メモ :396）
+   推定の表で、端に張り付く系列が過半数、または |ρ1| > 0.3 なら、EKF の設計を見直す材料になる（設計メモ :396）。
+   比べる用に、実際の撮影時刻で三角測量し直した 3D も推定できる（`docs/hybrid_verification.md` §2。プロファイルは実行時の
+   置き場に書かれない）:
+   ```sh
+   python -m tools.verify_run hybrid-raw ~/Documents/WheelchairTorque/hybrid/measure           # kpts3d_raw_<stamp>_retri.csv
+   python -m tools.verify_run hybrid-raw ~/Documents/WheelchairTorque/hybrid/measure --hz 4    # kpts3d_raw_<stamp>_retri_s3.csv（名前の s は画面に出る）
+   python -m app.tuning.ekf_estimate <計測フォルダ>/kpts3d_raw_<stamp>_retri.csv
+   ```
 4. 計測フォルダの `verify_report.json` と、`ekf_estimate` の出力を残す
 
 ## 6. 記録シート
@@ -216,7 +223,9 @@ Pixel の画面の段階の行の読み方:
 
 ## 分かっていて直していないこと
 
-- **サイクル検出（KNOWN_ISSUES §6-9）**: 左肩の奥行き方向を 1 フレームあたりの速さで見ているので、サイクルの回数と
-  サイクルごとの仕事は当てにならない。トルクと 3D の質で判断する
-- **外れ値の除き方が無い**: 置き方を直しても、飛んだ 3D はそのままトルクになる。飛ぶ組が残るなら、骨の長さで外れ値を除く処理を足すかを決める
+- **回の区切り**: 混成は `app.hybrid.rep_detector.RepDetector`（肩の中点の重力の上向きの高さ。基準は最初の 2 秒の静止）で区切る。
+  先頭で動いていると基準がずれる。持ち上げ 3 cm 未満の回は数えない。USB 経路のサイクル検出（左肩の y、KNOWN_ISSUES §6-9）は直していない
+- **飛んだ 3D はトルクの記録に残る**: EKF（頑健な門で 1〜2 フレームの飛びを抑え、観測から 15 cm 以上のずれが 3 フレーム続いた点は
+  作り直す）と腕の長さの安全策（先頭の窓の上腕長・前腕長から ±25% を超えた腕は仕事とゲージに積まない）はあるが、トルクは毎フレーム
+  記録する。置き方が悪く飛ぶ組が多いと、ゲージがほとんど動かない（偽の過負荷は出さない）。置き方を先に直す
 - **Pixel が 30 fps に届かない限り、組の Pixel 側の一部は補間の点**（`docs/hybrid_verification.md`）
