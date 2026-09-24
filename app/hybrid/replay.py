@@ -32,6 +32,9 @@ __all__ = ["merged_frames", "replay"]
 
 # 記録を 1 秒ごとに書き出す本番（on_tick は 50 ms ごと）に合わせた間隔
 _FLUSH_INTERVAL_S = 0.05
+# 実時間の再生で次の点を待つとき、一度に寝る長さの上限 [s]。2 台とも点の無い区間（人が画面の外）でも、
+# 停止の要求（GUI の停止ボタン、猶予 10 s）をこの間隔で見る
+_SLEEP_STEP_S = 0.1
 
 
 def merged_frames(frames: Mapping[str, Sequence[LandmarkFrame]], *, start_s: float = 0.0,
@@ -48,6 +51,18 @@ def merged_frames(frames: Mapping[str, Sequence[LandmarkFrame]], *, start_s: flo
     high = None if end_s is None else origin + round(end_s * 1e9)
     chosen = [f for f in everything if f.t_capture_ns >= low and (high is None or f.t_capture_ns < high)]
     return sorted(chosen, key=lambda f: (f.t_capture_ns, f.role != "cam0", f.seq))
+
+
+def _wait_until(target: float, *, clock: Callable[[], float], sleep: Callable[[float], None],
+                stop: Callable[[], bool]) -> bool:
+    """``clock`` が ``target`` になるまで ``_SLEEP_STEP_S`` 刻みで寝る。途中で停止を求められたら False。"""
+    while True:
+        if stop():
+            return False
+        wait = target - clock()
+        if wait <= 0:
+            return True
+        sleep(min(wait, _SLEEP_STEP_S))
 
 
 def _timing(samples_ms: list[float], pairs: int) -> dict:
@@ -119,9 +134,9 @@ def replay(session_dir: str | Path, *, root: str | Path, start_s: float = 0.0, e
             break
         if speed > 0:
             target = wall_start + (frame.t_capture_ns - t_first) / 1e9 / speed
-            wait = target - clock()
-            if wait > 0:
-                sleep(wait)
+            if not _wait_until(target, clock=clock, sleep=sleep, stop=stop):
+                measurement.stop_reason = "stop_request"
+                break
         try:
             deliver(frame)
         except Exception:  # MeasurementSession が failed と理由を立ててから投げ直す。ここで止める

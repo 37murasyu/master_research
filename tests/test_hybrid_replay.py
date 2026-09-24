@@ -97,6 +97,29 @@ class TestReplay:
         assert meta["status"] == "complete"
         assert meta["stop_reason"] == "stop_request"
 
+    def test_a_stop_request_in_a_gap_is_seen_within_a_tenth_of_a_second(self, tmp_path):
+        """記録に 2 台とも点の無い区間（人が画面の外）があっても、実時間の再生の停止の要求は 0.1 s 以内に効く。
+
+        以前は次の点の時刻まで 1 回で寝たので、区間の長さだけ停止が効かなかった。GUI の猶予（10 s）を超えると
+        kill され、再生の記録の meta が recording のまま残った。
+        """
+        session = make_body_run(tmp_path, seconds=3.0)
+        path = next(session.glob("landmarks2d_*.csv"))
+        table = pd.read_csv(path)
+        table[(table["t_ns"] < 0.5e9) | (table["t_ns"] >= 2.5e9)].to_csv(path, index=False)
+        now = [0.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += max(0.0, seconds)
+
+        out = rp.replay(session, root=tmp_path / "replay", speed=1.0, clock=lambda: now[0], sleep=sleep,
+                        should_stop=lambda: now[0] >= 1.0)
+        assert max(sleeps) <= 0.1 + 1e-9, "一度に長く寝た"
+        assert now[0] <= 1.1 + 1e-9, f"停止の要求（1.0 s）から戻るまでが長い（{now[0]:.2f} s）"
+        assert _outputs(out)[1]["stop_reason"] == "stop_request"
+
     def test_the_record_is_written_from_the_replay_thread(self, tmp_path):
         """Recorder は作ったスレッドからしか書けない。別スレッドで回しても開閉が同じスレッドで起きる。"""
         box = {}
