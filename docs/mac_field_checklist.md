@@ -78,13 +78,18 @@
 
 ## 5. EKF の較正（§6-3 の S6 → S9b）
 
-手順: `docs/hybrid_field_run.md` §0 の 7・§5 の 3、`docs/hybrid_verification.md`。
+手順: `docs/hybrid_field_run.md` §0 の 7・§5 の 3、`docs/hybrid_verification.md` §2。
 
-- [ ] S6: 4 の本計測（90 秒以上）の `kpts3d_raw_<stamp>.csv` から、解析ページ「EKF の較正プロファイルを作る」（または
-      `python -m app.runners.tune_ekf`）でプロファイルを作る。4 Hz 相当も比べるなら `verify_run hybrid-raw --hz 4`
+- [ ] S6: 4 の本計測（90 秒以上）の記録器の `kpts3d_raw_<stamp>.csv`（EKF の手前の 1/30 s の格子。`_retri` の付かないもの）から、
+      解析ページ「EKF の較正プロファイルを作る」（または `python -m app.runners.tune_ekf <計測フォルダ>/kpts3d_raw_<stamp>.csv`）で
+      プロファイルを作る。`~/Documents/WheelchairTorque/hybrid/ekf_profiles/ekf_profile_0.03333.json` に書かれる
+- [ ] 比べる用（任意）: `verify_run hybrid-raw`（実際の撮影時刻で三角測量し直した `kpts3d_raw_<stamp>_retri.csv`）と `--hz 4`
+      （4 Hz 相当の `_retri_s3.csv`。名前の s は画面に出る）を `python -m app.tuning.ekf_estimate` にかけ、格子の推定と比べる。
+      これらを `tune_ekf` にかけても、プロファイルは CSV の隣に書かれ、実行時の置き場には入らない
 - [ ] 中止条件に当たらないか: 探索範囲の端に張り付く系列が過半数、または |ρ1| > 0.3（被験者 7 の古い映像では当たった。
       新しい構成でも当たるなら設計を見直す）
-- [ ] S9b: 設定 `HYBRID_EKF_PROFILE` にプロファイルのフォルダを入れてもう 1 試技 → `verify_run check` で RMS 差と棄却率が期待の範囲
+- [ ] S9b: 設定 `HYBRID_EKF_PROFILE` にプロファイルのフォルダを入れてもう 1 試技 → `verify_run check` の「§6-3 EKF」で雑音の出どころが
+      `profile`、RMS 差と棄却率が期待の範囲
 - [ ] その後で決める: 同梱の既定値（今は q=0.122、r=2.59e-5）の差し替え、`EKF_MAX_GAP_S` の既定値（今は 0＝無制限。欠測の長さの分布で決める）
 
 ## 6. 任意（時間があれば）

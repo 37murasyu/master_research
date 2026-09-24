@@ -5,13 +5,14 @@
 実際の計測構成は Pixel 7a 1 台＋Mac 内蔵カメラ（``app.hybrid``、``app.runners.hybrid_measure``）で、USB カメラ 2 台の
 経路（``master_research_code.py``）とは出力の形が違う。Pixel の映像は JPEG で毎秒 3〜4 枚しか届かない
 （``app.hybrid.link`` の PREVIEW・CALIBRATION）ので、30 fps で残るのは 2D ランドマーク（``landmarks2d_*``）と
-三角測量した 3D（``kpts3d_*``、EKF なし）。検証はこの記録の上に作る。
+三角測量した 3D（``kpts3d_*``。ここで作る古い版の記録は EKF なし）。検証はこの記録の上に作る。
 
 - §3-2: 停止の要求で止めても記録を正しく閉じる（``meta.json`` の ``status`` が ``complete``）。何で止まったかも
   ``meta.json`` に残す（以前は残しておらず、停止ボタンで止まったのか失敗で止まったのか区別できなかった）
 - §6-2: トルクの大きさ、サイクルごとの仕事、Pixel・Mac・組の実際の速さ
-- §6-3: 混成の経路は EKF を使っていない。S6（雑音の推定）は、3D を生 CSV の形（``kpts3d_raw_*``）に直せば
-  ``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf`` がそのまま使える。4 Hz 間引きは記録を間引いて作る
+- §6-3: 今の記録器は EKF の手前の 3D を ``kpts3d_raw_<stamp>.csv`` に書き、実行時のプロファイルはそこから作る
+  （``tests/test_hybrid_check_extended.py``）。``hybrid-raw`` は記録から比べる用の生 CSV（``kpts3d_raw_<stamp>_retri*``、
+  source は ``hybrid_retri``）を作り、``app.tuning.ekf_estimate`` にそのままかけられる。4 Hz 間引きは記録を間引いて作る
 """
 
 from __future__ import annotations
