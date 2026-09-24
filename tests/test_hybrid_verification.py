@@ -143,7 +143,7 @@ class TestHybridRawCapture:
         assert len(capture.points) == N
         assert np.allclose(capture.points.reshape(N, -1), kpts)
         assert capture.provenance["dt"] == pytest.approx(DT_NS / 1e9, rel=1e-6)
-        assert capture.provenance["source"] == "hybrid"
+        assert capture.provenance["source"] == "hybrid_retri", "記録器の生 CSV（source が hybrid）と分ける"
 
     def test_a_stride_emulates_the_fixed_rate(self, tmp_path):
         """混成の経路には間引きの設定が無い。S6 の 2 設定目（4 Hz）は記録を 8 組おきに間引いて作る。"""

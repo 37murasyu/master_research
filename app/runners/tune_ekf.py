@@ -10,9 +10,12 @@ GUI の解析タスク（S11）もこのコマンドを呼ぶ。
 実行時の探索が **dt でファイルを選ぶ**ため（決定 6）。間引き設定ごとに録った
 プロファイルを同じフォルダに並べておける。``--out`` にフォルダを渡すと、その中に同じ名前で書く。
 
-混成（Mac＋Pixel）の収録（サイドカーの ``source`` が ``hybrid``）は、既定で ``hybrid/ekf_profiles/`` に書き、
-設定 ``HYBRID_EKF_PROFILE`` に入れる値を案内する。混成の計測の格子は 1/30 s で、実行時の探索は dt の相対差
-5% 以内しか選ばないので、それを外れた収録で作ったときは警告する。
+混成（Mac＋Pixel）の計測の記録器が書いた格子の生 CSV（``kpts3d_raw_<stamp>.csv``、サイドカーの ``source`` が
+``hybrid``）は、既定で ``hybrid/ekf_profiles/`` に書き、設定 ``HYBRID_EKF_PROFILE`` に入れる値を案内する。混成の計測の
+格子は 1/30 s で、実行時の探索は dt の相対差 5% 以内しか選ばないので、それを外れた収録で作ったときは警告する。
+``tools.verify_run hybrid-raw`` が記録から作り直した生 CSV（``kpts3d_raw_<stamp>_retri*.csv``、``source`` が
+``hybrid_retri``）は比べる用なので、実行時の置き場へは書かず収録の隣に書く（``--grid`` の出力は dt が 1/30 s で、
+記録器の生 CSV から作ったプロファイルを同じ名前で上書きしてしまう）。
 
 設計: ``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` の S7。
 """
@@ -29,7 +32,7 @@ from app.hybrid.paths import ekf_profile_root
 from app.net.sync_buffer import DEFAULT_GRID
 from app.tuning.ekf_estimate import fit_capture, format_report
 from app.tuning.ekf_profile import MIN_N_EFF, build_profile, write_profile
-from app.tuning.raw_capture import read_raw_capture
+from app.tuning.raw_capture import is_hybrid_recorder_capture, is_hybrid_retri_capture, read_raw_capture
 
 
 # 実行時の探索が同じ dt とみなす相対差（ekf_profile.resolve_profile）。混成の計測の格子の dt は DEFAULT_GRID.period_s
@@ -80,7 +83,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_report(fits, dt))
 
     profile = build_profile(capture, fits, min_n_eff=args.min_n_eff)
-    hybrid = capture.provenance.get("source") == "hybrid"
+    # 実行時の置き場へ書くのは記録器の格子の生 CSV だけ（hybrid-raw の出力は比べる用）
+    hybrid = is_hybrid_recorder_capture(capture.provenance)
     destination = resolve_destination(args.out, args.csv, dt, hybrid=hybrid)
     destination.parent.mkdir(parents=True, exist_ok=True)
     write_profile(destination, profile)
@@ -97,6 +101,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                   "kpts3d_raw_<stamp>.csv から作り直す）")
         print(f"[tune_ekf] 混成の計測で使うには、設定 HYBRID_EKF_PROFILE（GUI のカルマンフィルタの欄）に "
               f"{destination}（またはフォルダ {destination.parent}）を入れる")
+    elif is_hybrid_retri_capture(capture.provenance) and not args.out:
+        print(f"[tune_ekf] この収録は hybrid-raw が記録から作り直した 3D（比べる用）なので、混成の計測が読む "
+              f"{ekf_profile_root()} には書かない。混成の計測に使うプロファイルは、計測フォルダの記録器の生 CSV "
+              "kpts3d_raw_<stamp>.csv（_retri の付かないもの）から作る")
     return 0
 
 

@@ -50,7 +50,8 @@ from app.core.stop_request import STOP_FILE_ENV  # noqa: E402
 from app.hybrid.retriangulate import retriangulate  # noqa: E402
 from app.tuning.ekf_likelihood import innovation_loglik  # noqa: E402
 from app.tuning.ekf_profile import builtin_entry, read_profile  # noqa: E402
-from app.tuning.raw_capture import RawCaptureWriter, read_raw_capture, sidecar_path  # noqa: E402
+from app.tuning.raw_capture import (  # noqa: E402
+    HYBRID_RETRI_SOURCE, RawCaptureWriter, read_raw_capture, sidecar_path)
 from tools.parse_fps_stats import parse_file  # noqa: E402
 
 JOINTS = ("wrist_R", "elbow_R", "wrist_L", "elbow_L")
@@ -611,9 +612,11 @@ RETRI_SUFFIX = "_retri"
 
 def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: str | Path | None = None, *,
                        grid: bool = False, hz: float | None = None) -> Path:
-    """混成の 3D（EKF なし）を生 CSV（``kpts3d_raw_<stamp>_retri*``、``app.tuning.raw_capture`` の形）に直す。
+    """混成の 3D（EKF の手前）を生 CSV（``kpts3d_raw_<stamp>_retri*``、``app.tuning.raw_capture`` の形）に直す。
 
-    S6 の雑音の推定（``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf``）がそのまま使える。
+    S6 の雑音の推定（``app.tuning.ekf_estimate`` / ``app.runners.tune_ekf``）がそのまま使える。サイドカーの source は
+    ``hybrid_retri``（比べる用）。混成の計測（実行時）が読むプロファイルは、記録器が書いた ``kpts3d_raw_<stamp>.csv``
+    （source が ``hybrid``）から作る。tune_ekf は ``hybrid_retri`` のプロファイルを実行時の置き場へ書かず、収録の隣に書く
 
     - 既定は、遅い方のカメラ（実機では Pixel、10〜15 Hz）の実際の撮影時刻で記録の 2D から三角測量し直した 3D
       （``app.hybrid.retriangulate``）。計測中の 3D は 30 Hz の格子へ線形補間した点で、補間の区間が直線になり
@@ -674,7 +677,8 @@ def hybrid_raw_capture(session: str | Path, stride: int | None = None, out_dir: 
         "unit": "m", "frame": "runtime", "dt": float(np.median(steps)),
         "dt_source": f"混成ステレオの {where} の間隔の中央値（{stride} 組おき）",
         "src_fps": real_fps, "file_mode": False,
-        "source": "hybrid", "hybrid_session": str(folder), "times": times, "stride": stride,
+        # 記録器の生 CSV（source が hybrid、tune_ekf が実行時の置き場へ書く）と分ける
+        "source": HYBRID_RETRI_SOURCE, "hybrid_session": str(folder), "times": times, "stride": stride,
         "skipped_pairs": skipped, "t0_s": float(t[index[0]]),
         "interval_p05": float(np.percentile(steps, 5)), "interval_p95": float(np.percentile(steps, 95)),
         "RT_POSE_FIXED_HZ_ON": stride > 1, "EKF_ENABLE": False, "ekf_noise": None,
@@ -1143,7 +1147,8 @@ def main(argv=None) -> int:
         print(f"生 CSV: {path}（{meta['dt_source']}: dt {meta['dt']:.5f} s、間隔の 5〜95%: "
               f"{meta['interval_p05']:.4f}〜{meta['interval_p95']:.4f} s、組を作れなかった点 {meta['skipped_pairs']}）")
         print(f"次: python -m app.tuning.ekf_estimate {path}")
-        print(f"    python -m app.runners.tune_ekf {path}")
+        print(f"    python -m app.runners.tune_ekf {path}   # 比べる用。プロファイルはこの CSV の隣に書く")
+        print("    混成の計測に使うプロファイルは、計測フォルダの kpts3d_raw_<stamp>.csv（記録器の生 CSV）から tune_ekf で作る")
         return 0
     report = check_run(args.out_dir, log=args.log, timestamp=args.timestamp, expect_stop=args.expect_stop)
     print(format_report(report))
