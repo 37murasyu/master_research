@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
 from app.net import protocol as p
-from app.net.server import LandmarkServer, SessionHandler
+from app.net.server import MAX_FUTURE_NS, LandmarkServer, SessionHandler
 from app.net.sync_buffer import GridSpec, SyncBuffer
 
 
@@ -78,12 +79,102 @@ class TestSessionHandler:
         assert handler.handle("これはJSONではない") is None
         assert handler.errors == 1
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            json.dumps({"type": "landmarks", "role": "cam0", "seq": 0, "t_capture_ns": 1, "w": 1280, "h": 720,
+                        "lm": [[10**400, 0.5, 0, 1]] * p.LANDMARK_COUNT}),
+            '{"type":"landmarks","lm":' + "[" * 100_000 + "]" * 100_000 + "}",
+        ],
+        ids=["huge-int-coordinate", "deep-nesting"],
+    )
+    def test_hostile_message_is_counted_not_raised(self, raw):
+        """以前は OverflowError・RecursionError が外へ出て、受信サーバが接続ごと 1011 で切っていた。"""
+        handler = SessionHandler(SyncBuffer(), clock=FakeClock())
+        assert handler.handle(raw) is None
+        assert handler.errors == 1
+
     def test_keeps_working_after_a_malformed_message(self):
         buffer = SyncBuffer(grid=GridSpec(target_hz=10.0))
         handler = SessionHandler(buffer, clock=FakeClock())
         handler.handle("{壊れている")
         handler.handle(_landmarks_message("cam0", 0, 0))
         assert buffer.buffered_count("cam0") == 1
+
+
+S = 1_000_000_000  # 1 秒 = 10^9 ナノ秒
+
+
+class TestCaptureTimeCheck:
+    """撮影時刻が受信時の PC の時計から外れた点は、同期バッファへ入れずに捨てて数える。
+
+    未来の撮影時刻の点が 1 枚でも入ると、同期バッファはそれを最新として相手の点を捨て、格子もその時刻までの
+    穴を「補間できない」と飛ばすので、以後の組が全滅していた（60 s 先の 1 枚で、以後の 15 s が 0 組）。
+    保持時間より古い点は、相手の点がもう捨てられているので組にならない。
+    """
+
+    def _handler(self, now: int, **kwargs):
+        buffer = SyncBuffer()
+        handler = SessionHandler(buffer, clock=FakeClock(start=now, step=0), **kwargs)
+        return handler, buffer
+
+    def test_future_capture_time_is_dropped_and_counted(self):
+        handler, buffer = self._handler(100 * S)
+        handler.handle(_landmarks_message("cam1", 0, 160 * S))
+        assert buffer.buffered_count("cam1") == 0
+        assert handler.time_rejected == 1
+
+    def test_clock_sync_error_within_the_margin_is_kept(self):
+        """端末の時刻合わせの誤差（数十 ms）で PC の時計より少し先になった点は使う。"""
+        handler, buffer = self._handler(100 * S)
+        handler.handle(_landmarks_message("cam1", 0, 100 * S + MAX_FUTURE_NS))
+        assert buffer.buffered_count("cam1") == 1
+        assert handler.time_rejected == 0
+
+    def test_capture_time_older_than_the_window_is_dropped(self):
+        handler, buffer = self._handler(100 * S)
+        handler.handle(_landmarks_message("cam1", 0, 100 * S - buffer.window_ns - 1))
+        handler.handle(_landmarks_message("cam1", 1, 100 * S - buffer.window_ns))
+        assert buffer.buffered_count("cam1") == 1
+        assert handler.time_rejected == 1
+
+    def test_dropped_points_are_not_passed_on(self):
+        """生 2D の記録や表示（on_landmarks）にも渡さない。未来の点が並びを壊す。"""
+        seen: list = []
+        handler, _buffer = self._handler(100 * S, on_landmarks=seen.append)
+        handler.handle(_landmarks_message("cam1", 0, 160 * S))
+        handler.handle(_landmarks_message("cam1", 1, 100 * S - 150_000_000))
+        assert [frame.seq for frame in seen] == [1]
+
+    @pytest.mark.parametrize("offset_s", [3.0, 60.0])
+    def test_one_future_point_does_not_stop_the_pairs(self, offset_s):
+        """PC のカメラ（注入）は撮影直後に、Pixel は 150 ms 遅れで届く。5 s の時点で 1 枚だけ未来の点が来る。"""
+        clock = FakeClock(start=0, step=0)
+        pairs: list = []
+        server = LandmarkServer(buffer=SyncBuffer(), clock=clock, remote_roles=("cam1",), on_pairs=pairs.extend)
+        handler = SessionHandler(server.buffer, clock=clock, remote_roles=("cam1",))
+        t0, period = 1000 * S, 33_333_333
+        events = []
+        for i in range(20 * 30):
+            t = t0 + i * period
+            events.append((t + 5_000_000, _local_frame(t)))
+            events.append((t + 150_000_000, _landmarks_message("cam1", i, t + 7_000_000)))
+        bad_at = t0 + 5 * S + 150_000_000 + 1
+        events.append((bad_at, _landmarks_message("cam1", 99_999, t0 + 5 * S + round(offset_s * S))))
+        events.sort(key=lambda e: e[0])
+
+        before = 0
+        for arrival, item in events:
+            clock.now = arrival
+            if arrival <= bad_at:
+                before = len(pairs)
+            if isinstance(item, p.LandmarkFrame):
+                server.inject(item)
+            else:
+                handler.handle(item)
+
+        assert handler.time_rejected == 1
+        assert len(pairs) - before >= 15 * 30 - 5, "未来の点の後の組が失われている"
 
 
 class TestServerIntegration:
@@ -107,8 +198,9 @@ class TestServerIntegration:
                     await cam0.send(p.encode(p.Hello("cam0", "test", "s")))
                     await cam1.send(p.encode(p.Hello("cam1", "test", "s")))
 
+                    base = time.monotonic_ns()  # 撮影時刻は PC の時計（端末は時刻合わせ済み）
                     for i in range(6):
-                        t = i * 100_000_000  # 100ms 刻み
+                        t = base + i * 100_000_000  # 100ms 刻み
                         await cam0.send(_landmarks_message("cam0", i, t))
                         await cam1.send(_landmarks_message("cam1", i, t))
 
@@ -124,6 +216,60 @@ class TestServerIntegration:
         pairs = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
         assert pairs, "ペアが 1 つも出ていない"
         assert all(set(pair.frames) == {"cam0", "cam1"} for pair in pairs)
+
+    def test_a_hostile_message_keeps_the_connection(self):
+        """壊れた電文 1 通で接続を切らず、protocol_errors に数える（以前は 1011 で切れ、数えなかった）。"""
+
+        async def scenario():
+            server = LandmarkServer(host="127.0.0.1", port=0, buffer=SyncBuffer())
+            await server.start()
+            try:
+                import websockets
+
+                async with websockets.connect(f"ws://127.0.0.1:{server.port}") as ws:
+                    await ws.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
+                    await ws.send(json.dumps({
+                        "type": "landmarks", "role": "cam1", "seq": 0, "t_capture_ns": time.monotonic_ns(),
+                        "w": 1280, "h": 720, "lm": [[10**400, 0.5, 0, 1]] * p.LANDMARK_COUNT,
+                    }))
+                    await ws.send(p.encode(p.SyncRequest(t1=1)))
+                    reply = p.decode(await asyncio.wait_for(ws.recv(), timeout=5))
+                    return reply, server.stats
+            finally:
+                await server.stop()
+
+        reply, stats = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+        assert isinstance(reply, p.SyncResponse), "壊れた電文の後も同じ接続で時刻同期に応える"
+        assert stats["protocol_errors"] == 1
+        assert stats["clients"] == 1
+
+    def test_stats_count_points_dropped_by_capture_time(self):
+        """撮影時刻で捨てた点は統計（time_rejected）に出す。接続が切れた後も数え続ける。"""
+
+        async def scenario():
+            server = LandmarkServer(host="127.0.0.1", port=0, buffer=SyncBuffer())
+            await server.start()
+            try:
+                import websockets
+
+                async with websockets.connect(f"ws://127.0.0.1:{server.port}") as ws:
+                    await ws.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
+                    await ws.send(_landmarks_message("cam1", 0, time.monotonic_ns() + 60 * S))
+                    await ws.send(p.encode(p.SyncRequest(t1=1)))
+                    await asyncio.wait_for(ws.recv(), timeout=5)  # ここまでの電文は処理済み
+                    connected = server.stats
+                for _ in range(50):
+                    if server.stats["clients"] == 0:
+                        break
+                    await asyncio.sleep(0.02)
+                return connected, server.stats
+            finally:
+                await server.stop()
+
+        connected, finished = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+        assert connected["time_rejected"] == 1
+        assert connected["frames_received"] == 1
+        assert finished["clients"] == 0 and finished["time_rejected"] == 1
 
     def test_time_sync_round_trip_over_the_wire(self):
         async def scenario():
@@ -547,15 +693,16 @@ class TestInject:
 
                 async with websockets.connect(f"ws://127.0.0.1:{server.port}") as cam1:
                     await cam1.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
+                    base = time.monotonic_ns()
                     for i in range(6):
-                        await cam1.send(_landmarks_message("cam1", i, i * 100_000_000))
+                        await cam1.send(_landmarks_message("cam1", i, base + i * 100_000_000))
                     for _ in range(50):
                         if server.stats["frames_received"] == 6:
                             break
                         await asyncio.sleep(0.02)
                     # 端末からはもう何も来ない。注入だけでペアが出ること
                     for i in range(6):
-                        server.inject(_local_frame(i * 100_000_000))
+                        server.inject(_local_frame(base + i * 100_000_000))
                     return pairs, seen
             finally:
                 await server.stop()

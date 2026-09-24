@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -39,6 +40,7 @@ __all__ = [
     "CaptureRequest",
     "CalibrationFrame",
     "MAX_CALIBRATION_BYTES",
+    "MAX_FRAME_SIDE",
     "ClockOffset",
     "encode",
     "decode",
@@ -59,6 +61,14 @@ ROLES = ("cam0", "cam1")
 # 校正用フレーム 1 枚の上限。720p の JPEG は 200〜300KB 程度なので十分な余裕がある。
 # 無線の相手からの入力なので、際限なく受け取らない。
 MAX_CALIBRATION_BYTES = 8 * 1024 * 1024
+
+# 画像の 1 辺の画素数の上限。Pixel の最大の画像（約 9000 px）にも十分な余裕がある。
+MAX_FRAME_SIDE = 1 << 16
+
+# 整数の値域。端末（Kotlin）は整数をすべて Long（64 bit）で送る。JSON は桁数に上限なく整数を読むので、
+# これを超える値は壊れた電文として弾く（下流の numpy の int64 で溢れる）。
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 class ProtocolError(ValueError):
@@ -240,10 +250,24 @@ def encode(message: Message) -> str:
 
 
 def decode(raw: str | bytes) -> Message:
-    """受信文字列をメッセージに変換する。契約違反は ProtocolError。"""
+    """受信文字列をメッセージに変換する。契約違反は ProtocolError。
+
+    ネットワーク越しの入力なので、中で何が起きても ProtocolError 以外は外へ出さない。深い入れ子の
+    RecursionError（JSON の読み取りと、エラー文の repr の両方で起きる）や、巨大な整数の OverflowError が
+    外へ出ると、受信サーバは接続ごと切り（1011）、壊れた電文としても数えない。
+    """
+    try:
+        return _decode(raw)
+    except ProtocolError:
+        raise
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ProtocolError(f"電文を読めません（{type(exc).__name__}）") from exc
+
+
+def _decode(raw: str | bytes) -> Message:
     try:
         payload = json.loads(raw)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ProtocolError(f"JSON として読めません: {exc}") from exc
 
     if not isinstance(payload, dict):
@@ -253,12 +277,12 @@ def decode(raw: str | bytes) -> Message:
     if kind == "landmarks":
         return _decode_landmarks(payload)
     if kind == "sync_req":
-        return SyncRequest(t1=_require_int(payload, "t1"))
+        return SyncRequest(t1=_require_time(payload, "t1"))
     if kind == "sync_res":
         return SyncResponse(
-            t1=_require_int(payload, "t1"),
-            t2=_require_int(payload, "t2"),
-            t3=_require_int(payload, "t3"),
+            t1=_require_time(payload, "t1"),
+            t2=_require_time(payload, "t2"),
+            t3=_require_time(payload, "t3"),
         )
     if kind == "hello":
         device_id = payload.get("device_id")
@@ -271,7 +295,7 @@ def decode(raw: str | bytes) -> Message:
             device_id=device_id,
         )
     if kind == "capture_req":
-        at_ns = _optional_int(payload, "at_ns")
+        at_ns = _optional_int(payload, "at_ns", _require_time)
         max_width = _optional_int(payload, "max_width")
         if max_width is not None and max_width <= 0:
             raise ProtocolError(f"max_width は正の整数である必要があります: {max_width}")
@@ -288,10 +312,7 @@ def decode(raw: str | bytes) -> Message:
 
 
 def _decode_calibration_frame(payload: dict[str, Any]) -> CalibrationFrame:
-    width = _require_int(payload, "w")
-    height = _require_int(payload, "h")
-    if width <= 0 or height <= 0:
-        raise ProtocolError(f"フレームサイズが不正: w={width}, h={height}")
+    width, height = _require_frame_size(payload)
 
     encoded = _require_str(payload, "jpeg")
     # 無線の相手からの入力。大きさを先に見てから復号する。
@@ -315,7 +336,7 @@ def _decode_calibration_frame(payload: dict[str, Any]) -> CalibrationFrame:
     return CalibrationFrame(
         role=_require_role(payload),
         id=_require_int(payload, "id"),
-        t_capture_ns=_require_int(payload, "t_capture_ns"),
+        t_capture_ns=_require_time(payload, "t_capture_ns"),
         width=width,
         height=height,
         jpeg=image,
@@ -323,10 +344,7 @@ def _decode_calibration_frame(payload: dict[str, Any]) -> CalibrationFrame:
 
 
 def _decode_landmarks(payload: dict[str, Any]) -> LandmarkFrame:
-    width = _require_int(payload, "w")
-    height = _require_int(payload, "h")
-    if width <= 0 or height <= 0:
-        raise ProtocolError(f"フレームサイズが不正: w={width}, h={height}")
+    width, height = _require_frame_size(payload)
 
     raw_points = payload.get("lm")
     if not isinstance(raw_points, list):
@@ -341,14 +359,18 @@ def _decode_landmarks(payload: dict[str, Any]) -> LandmarkFrame:
         if not isinstance(point, (list, tuple)) or len(point) != 4:
             raise ProtocolError(f"lm[{i}] は (x, y, z, visibility) の4要素である必要があります")
         try:
-            points.append((float(point[0]), float(point[1]), float(point[2]), float(point[3])))
-        except (TypeError, ValueError) as exc:
+            values = (float(point[0]), float(point[1]), float(point[2]), float(point[3]))
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ProtocolError(f"lm[{i}] に数値でない値: {point!r}") from exc
+        # JSON の NaN・Infinity、1e400 のような溢れ。通すと三角測量と濾波が黙って NaN になる
+        if not all(math.isfinite(value) for value in values):
+            raise ProtocolError(f"lm[{i}] に有限でない値: {values!r}")
+        points.append(values)
 
     return LandmarkFrame(
         role=_require_role(payload),
         seq=_require_int(payload, "seq"),
-        t_capture_ns=_require_int(payload, "t_capture_ns"),
+        t_capture_ns=_require_time(payload, "t_capture_ns"),
         width=width,
         height=height,
         landmarks=points,
@@ -360,13 +382,31 @@ def _require_int(payload: dict[str, Any], key: str) -> int:
     # bool は int の派生なので明示的に弾く（True が 1 として通ると気づきにくい）
     if isinstance(value, bool) or not isinstance(value, int):
         raise ProtocolError(f"{key} は整数である必要があります: {value!r}")
+    if not _INT64_MIN <= value <= _INT64_MAX:
+        raise ProtocolError(f"{key} が 64 bit の整数の範囲を超えています")
     return value
 
 
-def _optional_int(payload: dict[str, Any], key: str) -> int | None:
+def _require_time(payload: dict[str, Any], key: str) -> int:
+    """時刻 [ns]。PC の時計（monotonic_ns）も端末の時計（elapsedRealtimeNanos）も起動から数えるので負にならない。"""
+    value = _require_int(payload, key)
+    if value < 0:
+        raise ProtocolError(f"{key} は 0 以上の時刻である必要があります: {value}")
+    return value
+
+
+def _require_frame_size(payload: dict[str, Any]) -> tuple[int, int]:
+    width = _require_int(payload, "w")
+    height = _require_int(payload, "h")
+    if not (0 < width <= MAX_FRAME_SIDE and 0 < height <= MAX_FRAME_SIDE):
+        raise ProtocolError(f"フレームサイズが不正: w={width}, h={height}")
+    return width, height
+
+
+def _optional_int(payload: dict[str, Any], key: str, require=_require_int) -> int | None:
     if payload.get(key) is None:
         return None
-    return _require_int(payload, key)
+    return require(payload, key)
 
 
 def _require_str(payload: dict[str, Any], key: str) -> str:

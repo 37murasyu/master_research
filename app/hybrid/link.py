@@ -28,7 +28,7 @@ from typing import Callable, Iterable
 
 from app.net import protocol as p
 from app.net.server import DEFAULT_PORT, LandmarkServer, check_injectable, local_ip
-from app.net.sync_buffer import DEFAULT_GRID, GridSpec, PairedSample, SyncBuffer
+from app.net.sync_buffer import DEFAULT_GRID, DEFAULT_WINDOW_SEC, GridSpec, PairedSample, SyncBuffer
 
 __all__ = [
     "CALIBRATION",
@@ -146,7 +146,7 @@ class LinkStatus:
     clients: int = 0
     frames_received: int = 0
     frames_injected: int = 0
-    # 直近 1 秒に届いた端末の点の数（撮影時刻で数える）。
+    # 直近 1 秒に届いた端末の点の数（受け取った時刻で数える。撮影時刻で数えると、届くまでの遅れのぶん低く出る）。
     remote_fps: float = 0.0
     pairs: int = 0
     dropped_gap: int = 0
@@ -155,6 +155,8 @@ class LinkStatus:
     max_skew_ms: float = 0.0
     protocol_errors: int = 0
     role_mismatches: int = 0
+    # 撮影時刻が受信時の PC の時計から外れていて捨てた端末の点の数（先すぎる・保持時間より古い）。
+    time_rejected: int = 0
     captures_received: int = 0
     capture_timeouts: int = 0
     callback_errors: int = 0
@@ -178,7 +180,7 @@ class PhoneLink:
         host: str = "0.0.0.0",
         port: int = DEFAULT_PORT,
         advertise_host: str | None = None,
-        window_sec: float = 2.0,
+        window_sec: float = DEFAULT_WINDOW_SEC,
         grid: GridSpec = DEFAULT_GRID,
         on_pairs: PairsCallback | None = None,
         on_landmarks: LandmarksCallback | None = None,
@@ -226,7 +228,12 @@ class PhoneLink:
 
         self._lock = threading.Lock()
         self._recent: collections.deque[p.LandmarkFrame] = collections.deque(maxlen=history)
+        # 端末の点を受け取った時刻（PC の時計）。直近 1 秒ぶんを remote_fps として数える
+        self._arrivals: collections.deque[int] = collections.deque()
         self._latest_capture: p.CalibrationFrame | None = None
+        # 画像を送った端末の名乗り（受け取った時点のもの）と、take_capture が最後に返した画像の送り手
+        self._latest_capture_device: p.Hello | None = None
+        self._capture_device: p.Hello | None = None
         self._capture_taken = True
         self._captures_received = 0
         self._callback_errors = 0
@@ -300,16 +307,29 @@ class PhoneLink:
         if mode != self._scheduler.mode:
             with self._lock:
                 self._latest_capture = None
+                self._latest_capture_device = None
                 self._capture_taken = True
         self._scheduler.set_mode(mode)
 
     def take_capture(self) -> p.CalibrationFrame | None:
-        """前回から新しく届いた画像があれば返す。無ければ None。"""
+        """前回から新しく届いた画像があれば返す。無ければ None。送った端末は ``capture_device``。"""
         with self._lock:
             if self._capture_taken:
                 return None
             self._capture_taken = True
+            self._capture_device = self._latest_capture_device
             return self._latest_capture
+
+    @property
+    def capture_device(self) -> p.Hello | None:
+        """``take_capture`` が最後に返した画像を送った端末の名乗り（画像を受け取った時点のもの）。
+
+        同じ QR を読んだ別の Pixel が席を奪うと、以後の画像はその端末から届く。``status().devices`` は
+        ループの刻みごとの写しなので、席が替わった直後の画像を前の端末のものと取り違えうる。校正は
+        画像ごとにこれを見て、別の端末の画像を混ぜない。
+        """
+        with self._lock:
+            return self._capture_device
 
     def nearest_remote(self, t_ns: int, tolerance_ns: int) -> p.LandmarkFrame | None:
         """撮影時刻が ``t_ns`` に最も近い端末の点。``tolerance_ns`` より離れていれば None。"""
@@ -380,13 +400,12 @@ class PhoneLink:
 
     def _refresh_status(self) -> None:
         stats = self._server.stats
+        now = time.monotonic_ns()
         with self._lock:
-            recent = [f.t_capture_ns for f in self._recent]
+            while self._arrivals and now - self._arrivals[0] >= 1_000_000_000:
+                self._arrivals.popleft()
+            remote_fps = float(len(self._arrivals))
             captures, errors = self._captures_received, self._callback_errors
-        remote_fps = 0.0
-        if recent:
-            newest = time.monotonic_ns()
-            remote_fps = float(sum(1 for t in recent if 0 <= newest - t < 1_000_000_000))
         status = LinkStatus(
             url=self.url,
             devices=dict(self._server.devices),
@@ -401,6 +420,7 @@ class PhoneLink:
             max_skew_ms=float(stats["max_role_skew_ms"]),
             protocol_errors=int(stats["protocol_errors"]),
             role_mismatches=int(stats["role_mismatches"]),
+            time_rejected=int(stats["time_rejected"]),
             captures_received=captures,
             capture_timeouts=self._scheduler.timeouts,
             callback_errors=errors,
@@ -419,8 +439,10 @@ class PhoneLink:
 
     def _handle_landmarks(self, frame: p.LandmarkFrame) -> None:
         if frame.role == self.remote_role:
+            received = time.monotonic_ns()
             with self._lock:
                 self._recent.append(frame)
+                self._arrivals.append(received)
         if self._user_on_landmarks is not None:
             self._guarded("on_landmarks", self._user_on_landmarks, frame)
 
@@ -428,9 +450,13 @@ class PhoneLink:
         self._scheduler.complete(frame.id)
         if not self._scheduler.accepts_capture(frame.id):
             return
+        # 画像を使えるのは名乗った接続のうち席を持つ 1 本だけ（require_hello と後勝ち）なので、今この役割を
+        # 持つ端末が送り手。受け取った時点で控える（後で見ると、その間に席が替わっているかもしれない）
+        sender = self._server.devices.get(self.remote_role)
         with self._lock:
             # 時間切れの後に遅れて届いた画像も、画像としては正しいので使う
             self._latest_capture = frame
+            self._latest_capture_device = sender
             self._capture_taken = False
             self._captures_received += 1
 

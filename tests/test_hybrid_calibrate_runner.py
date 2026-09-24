@@ -13,16 +13,28 @@ from app.runners import hybrid_calibrate as runner
 from test_hybrid_calibration import synthetic_views
 
 
-def _install(monkeypatch, tmp_path, *, collector_errors=0):
-    """カメラ・端末・収集器を偽物に差し替える。``collector_errors`` 回ぶん add_remote が失敗する。"""
+class _Closed(list):
+    """閉じたものの一覧。作った収集器（``collectors``）も持たせる。"""
+
+    collectors: list
+
+
+def _install(monkeypatch, tmp_path, *, collector_errors=0, swap_after=None, ready_after=0):
+    """カメラ・端末・収集器を偽物に差し替える。``collector_errors`` 回ぶん add_remote が失敗する。
+
+    ``swap_after`` 枚の画像の後は、別の Pixel（pixel-2）が席を奪って画像を送る。収集器は ``ready_after`` 枚の
+    Pixel の画像を受け取ると推定に進む（0 なら最初から）。作った収集器の一覧を返す（``Collector.made``）。
+    """
     from app.hybrid import calibration_io
 
     board = Board()
     a, b, *_ = synthetic_views(board)
     zero0 = np.zeros((720, 1280), np.uint8)
     zero1 = np.zeros((1080, 1920), np.uint8)
-    closed = []
+    closed = _Closed()
     failures = iter(range(collector_errors))
+    # Pixel の画像の枚数と、いま画像を送っている端末
+    phone = SimpleNamespace(captures=0, device_id="pixel-1")
 
     class Camera:
         size = (1280, 720)
@@ -52,12 +64,16 @@ def _install(monkeypatch, tmp_path, *, collector_errors=0):
         def take_capture(self):
             return None
 
+        @property
+        def capture_device(self):
+            return Hello("cam1", "Pixel", "s", phone.device_id)
+
         def set_capture_mode(self, mode):
             pass
 
         def status(self):
             return SimpleNamespace(
-                devices={"cam1": Hello("cam1", "Pixel", "s", "pixel-1")}
+                devices={"cam1": Hello("cam1", "Pixel", "s", phone.device_id)}
             )
 
     class Live:
@@ -72,14 +88,17 @@ def _install(monkeypatch, tmp_path, *, collector_errors=0):
             pass
 
         def step(self, **kwargs):
+            phone.captures += 1
+            if swap_after is not None and phone.captures > swap_after:
+                phone.device_id = "pixel-2"
             return CalibrationFrame("cam1", 1, 1, 1920, 1080, b"\xff\xd8\xff\xd9")
 
     class Collector:
-        ready = True
         mono = [a, b]
         sizes = [(1280, 720), (1920, 1080)]
         pairs = list(zip(a, b))
         pair_images = [(zero0, zero1)] * len(a)
+        made = []
 
         def __init__(self, *args):
             from collections import Counter
@@ -87,6 +106,13 @@ def _install(monkeypatch, tmp_path, *, collector_errors=0):
             self.cached = (False, False)
             self.reasons = Counter()
             self.last_motion_px = None
+            # 受け取った Pixel の画像を送った端末（混ざっていないかを見る）
+            self.remote_devices = []
+            Collector.made.append(self)
+
+        @property
+        def ready(self):
+            return len(self.remote_devices) >= ready_after
 
         def add_mac(self, *args, **kwargs):
             pass
@@ -94,6 +120,7 @@ def _install(monkeypatch, tmp_path, *, collector_errors=0):
         def add_remote(self, *args, **kwargs):
             if next(failures, None) is not None:
                 raise ValueError("収集中に Pixel の画像寸法が変わりました。やり直してください")
+            self.remote_devices.append(phone.device_id)
 
     monkeypatch.setattr(runner, "MacCamera", Camera)
     monkeypatch.setattr(runner, "PoseDetector", Detector)
@@ -110,6 +137,7 @@ def _install(monkeypatch, tmp_path, *, collector_errors=0):
     monkeypatch.setattr(cv, "destroyAllWindows", lambda: None)
     clock = itertools.count(0.0, 2.0)
     monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    closed.collectors = Collector.made
     return closed
 
 
@@ -130,6 +158,22 @@ def test_size_change_during_collection_restarts_instead_of_crashing(tmp_path, mo
     assert runner.main([]) == 0
     assert "画像寸法が変わりました" in capsys.readouterr().out
     assert load_calibration("latest", root=tmp_path).meta["stereo"]["rms"] < 0.01
+
+
+def test_a_different_pixel_mid_collection_restarts_without_mixing(tmp_path, monkeypatch, capsys):
+    """盤集めの途中で同じ QR の別の Pixel が席を奪ったら、集めた画像を捨てて最初からやり直す。
+
+    以前は気づかず、2 台の画像を 1 台ぶんとして内部パラメータと外部パラメータを求めていた。
+    """
+    closed = _install(monkeypatch, tmp_path, swap_after=2, ready_after=3)
+    assert runner.main(["--board-up", "off"]) == 0
+    out = capsys.readouterr().out
+    assert "Pixel が替わりました" in out and "pixel-1" in out and "pixel-2" in out
+    first, *rest = closed.collectors
+    assert first.remote_devices and set(first.remote_devices) == {"pixel-1"}, "替わった端末の画像を前の端末の盤に混ぜた"
+    assert rest and all(set(c.remote_devices) <= {"pixel-2"} for c in rest)
+    cameras = load_calibration("latest", root=tmp_path).meta["cameras"]
+    assert cameras[1]["device_id"] == "pixel-2"
 
 
 def test_failed_estimation_restarts_instead_of_crashing(tmp_path, monkeypatch, capsys):

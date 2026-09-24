@@ -25,7 +25,7 @@ from typing import Sequence
 
 from app.net.protocol import ROLES, LandmarkFrame, PixelCoordinates
 
-__all__ = ["DEFAULT_GRID", "GridSpec", "InterpolatedFrame", "PairedSample", "SyncBuffer"]
+__all__ = ["DEFAULT_GRID", "DEFAULT_WINDOW_SEC", "GridSpec", "InterpolatedFrame", "PairedSample", "SyncBuffer"]
 
 Landmarks = Sequence[tuple[float, float, float, float]]
 
@@ -76,6 +76,13 @@ class GridSpec:
 
 # 既定の格子（30 Hz、穴の上限 100 ms）
 DEFAULT_GRID = GridSpec()
+
+# 保持時間の既定 [s]。Pixel は Wi-Fi が詰まっている間の点を送信キューに溜め、回復した瞬間にまとめて送る。
+# その間も PC のカメラの点は届き続けるので、保持時間が詰まりより短いと、まとめて届いた点の相手が先に捨てられて
+# 組にならない（2 s のころは 3 s の詰まりで 33 組、8 s で 183 組を失っていた）。詰まりが Pixel の ping の間隔
+# （15 s、``mobile`` の ``SensorClient.pingInterval``）を超えると端末が接続を切るので、それより古い点は来ない。
+# 組は両方そろった時点で出るので、長くしても表示は遅れない。メモリは 30 Hz・2 台・20 s で約 8 MB。
+DEFAULT_WINDOW_SEC = 20.0
 
 
 def _time_of(frame: LandmarkFrame) -> int:
@@ -155,7 +162,9 @@ class SyncBuffer:
     roles:
         揃うべきロール。既定は ``("cam0", "cam1")``。
     window_sec:
-        保持する時間窓。長いほどジッタに強いが、その分だけ表示が遅れる。
+        保持する時間窓。既定は ``DEFAULT_WINDOW_SEC``（決め方はそちら）。組は全ロールがそろった時点で
+        出るので、長くしても表示は遅れない。短いと、Wi-Fi が詰まった後にまとめて届いた点の相手が先に
+        捨てられて組にならない。メモリは保持時間に比例する。
     grid:
         格子（``GridSpec``）。再標本化する周波数（``target_hz``）と、補間を許す最大の欠測幅
         （``max_gap_ms``）を持つ。これを超える穴は補間せず捨てる。長い穴を線形補間で埋めると、
@@ -167,7 +176,7 @@ class SyncBuffer:
         self,
         roles: Sequence[str] = ROLES,
         *,
-        window_sec: float = 2.0,
+        window_sec: float = DEFAULT_WINDOW_SEC,
         grid: GridSpec = DEFAULT_GRID,
     ):
         self.grid = grid
@@ -207,12 +216,16 @@ class SyncBuffer:
         frames.insert(index, frame)
 
     # -- 出力 --------------------------------------------------------------
-    def drain(self) -> list[PairedSample]:
-        """今の時点で組めるペアをすべて返す。"""
+    def drain(self, now_ns: int | None = None) -> list[PairedSample]:
+        """今の時点で組めるペアをすべて返す。
+
+        ``now_ns`` は受信時の PC の時計（受信サーバが渡す）。古い点を捨てる基準（``_evict``）を、点の最新の
+        時刻とこれの早い方にする。記録の再生のように PC の時計と関係の無い時刻を流すときは渡さない。
+        """
         if not self._ensure_grid_origin():
             # 片方しか来ていない間も古いものは捨てる。混成構成では PC のカメラが
             # 先に流れ始め、スマホが繋がるまで片側だけが溜まり続けるため。
-            self._evict()
+            self._evict(now_ns)
             return []
 
         pairs: list[PairedSample] = []
@@ -236,7 +249,7 @@ class SyncBuffer:
             self._next_grid_ns = t + self.grid.period_ns
             self._next_grid_index += 1
 
-        self._evict()
+        self._evict(now_ns)
         return pairs
 
     # -- 内部 --------------------------------------------------------------
@@ -340,13 +353,20 @@ class SyncBuffer:
             nearest.append(min(candidates, key=lambda x: abs(x - t)))
         self._stats.observe_skew((max(nearest) - min(nearest)) / 1_000_000)
 
-    def _evict(self) -> None:
-        """時間窓より古いフレームを捨てる。長時間の計測でメモリを食わないため。"""
+    def _evict(self, now_ns: int | None) -> None:
+        """時間窓より古いフレームを捨てる。長時間の計測でメモリを食わないため。
+
+        基準は点の最新の時刻と、受信時の PC の時計（``now_ns``）の早い方。点の時刻だけを基準にすると、
+        未来の時刻の点が 1 枚あるだけで基準が先へ引っ張られ、相手の点を捨て尽くして以後の組が全滅する
+        （``--cam0-offset-ms`` で PC のカメラの点を保持時間より先へずらしたときも同じ）。
+        """
         newest = max(
             (f[-1].t_capture_ns for f in self._frames.values() if f), default=None
         )
         if newest is None:
             return
+        if now_ns is not None:
+            newest = min(newest, now_ns)
         cutoff = newest - self.window_ns
 
         for frames in self._frames.values():

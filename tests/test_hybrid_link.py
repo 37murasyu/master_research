@@ -248,6 +248,30 @@ class TestPhoneLink:
         assert status.callback_errors > 0
         assert status.frames_received > 10, "例外の後も受信を続けていること"
 
+    def test_status_counts_points_dropped_by_capture_time(self):
+        """PC の時計より未来の撮影時刻の点は捨て、状態（time_rejected）に出す。"""
+        import websockets
+
+        link = PhoneLink(host="127.0.0.1", port=0)
+        link.start()
+
+        async def send_a_future_point() -> None:
+            async with websockets.connect(link.url) as ws:
+                await ws.send(p.encode(p.Hello("cam1", "Pixel 7a", link.session, "id")))
+                future = time.monotonic_ns() + 60_000_000_000
+                await ws.send(p.encode(p.LandmarkFrame(
+                    "cam1", 0, future, 1280, 720, synthetic_pose(0.0, "cam1"),
+                )))
+                await ws.send(p.encode(p.SyncRequest(t1=1)))
+                await asyncio.wait_for(ws.recv(), timeout=5)
+
+        try:
+            asyncio.run(send_a_future_point())
+            assert _wait_until(lambda: link.status().time_rejected == 1)
+            assert link.nearest_remote(time.monotonic_ns(), tolerance_ns=120_000_000_000) is None
+        finally:
+            link.stop()
+
     def test_occupied_port_fails_at_start(self):
         import socket
 
@@ -263,6 +287,33 @@ class TestPhoneLink:
             listener.close()
 
 
+def test_capture_device_names_the_phone_that_sent_each_image():
+    """校正の途中で同じ QR の別の Pixel が席を奪うと、以後の画像はその端末のもの。
+
+    状態（``status().devices``）はループの刻みごとの写しなので、席が替わった直後の画像を古い端末のものと
+    取り違えうる。画像を受け取った時点の送り手を、画像と一緒に渡す。
+    """
+    link = PhoneLink(host="127.0.0.1", port=0, capture_mode=CALIBRATION)
+    link.start()
+    try:
+        first = MockPhone(link.url, "cam1", session=link.session, device_id="pixel-A",
+                          capture_fn=synthetic_capture)
+        first_thread = _run_phone(first, duration=4.0)
+        assert _wait_until(lambda: link.take_capture() is not None), "最初の端末の画像が届かない"
+        assert link.capture_device.device_id == "pixel-A"
+
+        second = MockPhone(link.url, "cam1", session=link.session, device_id="pixel-B",
+                           capture_fn=synthetic_capture)
+        second_thread = _run_phone(second, duration=2.0)
+        assert _wait_until(
+            lambda: link.take_capture() is not None and link.capture_device.device_id == "pixel-B"
+        ), "席を奪った端末の画像を、その端末のものとして渡していない"
+        second_thread.join(timeout=10)
+        first_thread.join(timeout=10)  # 席を譲って切られるので、こちらの例外は見ない
+    finally:
+        link.stop()
+
+
 def test_mode_switch_does_not_use_delayed_preview_for_calibration():
     link = PhoneLink(capture_mode=PREVIEW)
     old = link._scheduler.next_request()
@@ -272,3 +323,41 @@ def test_mode_switch_does_not_use_delayed_preview_for_calibration():
     current = link._scheduler.next_request()
     link._handle_capture(p.CalibrationFrame('cam1', current.id, 2, 1280, 720, b'jpeg'))
     assert link.take_capture().id == current.id
+
+
+def test_link_keeps_the_buffer_default_window():
+    """PhoneLink の同期バッファの保持時間は、同期バッファの既定（Wi-Fi の詰まりの後にまとめて届く点を組にできる長さ）。
+
+    以前は PhoneLink が 2 s を直書きしており、3 s 以上の詰まりの後の点が組にならなかった。
+    """
+    from app.net.sync_buffer import SyncBuffer
+
+    link = PhoneLink(port=0)
+    assert link._server.buffer.window_ns == SyncBuffer().window_ns
+
+
+@pytest.mark.parametrize("latency_ms", [0, 150, 600])
+def test_remote_fps_counts_arrivals_not_capture_times(monkeypatch, latency_ms):
+    """プレビューの「Pixel N fps」は、受け取った時刻の直近 1 秒で数える。
+
+    以前は撮影時刻が「今から 1 秒以内」の点を数えていたので、30 fps でも届くまでの遅れのぶん低く出た
+    （150 ms の遅れで 26、600 ms で 12）。
+    """
+    from types import SimpleNamespace
+
+    import app.hybrid.link as link_module
+
+    clock = SimpleNamespace(now=0)
+    monkeypatch.setattr(link_module, "time", SimpleNamespace(monotonic_ns=lambda: clock.now, monotonic=time.monotonic))
+    link = PhoneLink(port=0)
+    start, period = 10_000_000_000, 33_333_333
+    for k in range(90):  # 30 fps で 3 秒ぶん、撮影から latency_ms 遅れて届く
+        t_capture = start + k * period
+        clock.now = t_capture + latency_ms * 1_000_000
+        link._handle_landmarks(p.LandmarkFrame("cam1", k, t_capture, 1280, 720, synthetic_pose(0.0, "cam1")))
+        link._refresh_status()
+    assert link.status().remote_fps == pytest.approx(30, abs=1)
+
+    clock.now += 1_500_000_000  # 端末が止まったら 0 に落ちる
+    link._refresh_status()
+    assert link.status().remote_fps == 0

@@ -90,6 +90,64 @@ class TestMalformedInput:
         assert "cam9" in str(exc.value) or "role" in str(exc.value)
 
 
+def _deep(depth: int) -> str:
+    return "[" * depth + "]" * depth
+
+
+def _with_point(point: str) -> str:
+    """最初のランドマークだけを JSON の生の文字列 ``point`` に差し替えた電文。"""
+    raw = json.dumps(_valid_landmarks_payload())
+    return raw.replace("[0.5, 0.5, 0.0, 0.9]", point, 1)
+
+
+class TestHostileInput:
+    """壊れた電文・悪意のある電文でも、``decode`` は ProtocolError だけを投げる。
+
+    受信サーバは ProtocolError だけを捕まえて数える。以前は巨大な整数の座標で OverflowError、深い入れ子で
+    RecursionError が外へ出て、接続ごと 1011 で切れ、protocol_errors にも数えなかった。NaN・Inf の座標や、
+    負・64 bit を超える時刻は素通りしていた（三角測量と同期バッファが黙って壊れる）。
+    """
+
+    @pytest.mark.parametrize(
+        "broken",
+        [
+            pytest.param(_with_point("[" + "9" * 400 + ", 0.5, 0, 1]"), id="huge-int-coordinate"),
+            pytest.param('{"type":"landmarks","lm":' + _deep(100_000) + "}", id="deep-nesting"),
+            pytest.param('{"type":' + _deep(990) + "}", id="deep-type"),
+            pytest.param(_with_point("[NaN, 0.5, 0, 1]"), id="nan-x"),
+            pytest.param(_with_point("[0.5, 0.5, 0, Infinity]"), id="inf-visibility"),
+            pytest.param(_with_point("[0.5, -Infinity, 0, 1]"), id="minus-inf-y"),
+            pytest.param(_with_point("[1e400, 0.5, 0, 1]"), id="float-overflow"),
+            pytest.param(_with_point('["nan", 0.5, 0, 1]'), id="nan-string"),
+            pytest.param(json.dumps(_valid_landmarks_payload(t_capture_ns=-5)), id="negative-time"),
+            pytest.param(json.dumps(_valid_landmarks_payload(t_capture_ns=2**63)), id="time-over-int64"),
+            pytest.param(json.dumps(_valid_landmarks_payload(t_capture_ns=2**80)), id="time-2**80"),
+            pytest.param(json.dumps(_valid_landmarks_payload(seq=10**4000)), id="huge-seq"),
+            pytest.param(json.dumps(_valid_landmarks_payload(w=10**9, h=10**9)), id="huge-frame"),
+            pytest.param(json.dumps({"type": "sync_req", "t1": -1}), id="negative-sync-t1"),
+            pytest.param(json.dumps({"type": "sync_req", "t1": 2**80}), id="huge-sync-t1"),
+            pytest.param(json.dumps({"type": "sync_res", "t1": 1, "t2": -2, "t3": 3}), id="negative-sync-t2"),
+            pytest.param(json.dumps({"type": "capture_req", "id": 1, "at_ns": -1}), id="negative-at-ns"),
+            pytest.param(
+                json.dumps({"type": "calib_frame", "role": "cam0", "id": 3, "t_capture_ns": -1,
+                            "w": 1280, "h": 720, "jpeg": "/9j/2Q=="}),
+                id="negative-calib-time",
+            ),
+        ],
+    )
+    def test_rejects_with_protocol_error_only(self, broken):
+        with pytest.raises(p.ProtocolError):
+            p.decode(broken)
+
+    def test_extreme_but_valid_values_are_accepted(self):
+        """64 bit に収まる最大の時刻と、画面の外の座標（MediaPipe は画面外の点も返す）は通す。"""
+        frame = p.decode(json.dumps(_valid_landmarks_payload(
+            t_capture_ns=2**63 - 1, lm=[[-0.3, 1.4, -2.0, 0.0]] * p.LANDMARK_COUNT,
+        )))
+        assert frame.t_capture_ns == 2**63 - 1
+        assert frame.landmarks[0] == (-0.3, 1.4, -2.0, 0.0)
+
+
 class TestTimeSync:
     def test_offset_is_zero_for_symmetric_delay(self):
         """往復の遅延が対称なら、時計ずれ 0 と算出されること。"""
