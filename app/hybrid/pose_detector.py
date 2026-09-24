@@ -109,9 +109,7 @@ class PoseDetector:
         self._detector = detector
         self._image = image_factory
         self._last_ms = -1
-        # ROI の追跡の状態（本体の _pose_roi0 と _pose_roi0_miss）。最初は前の点が無いので全画面
-        self._roi = None
-        self._roi_miss = 0
+        self._roi_tracker = pose_roi.RoiTracker(pose_keypoints)  # ROI の追跡（``options.roi`` のときだけ使う）
 
     def detect(self, bgr, t_ns):
         """1 枚の BGR 画像の 33 点 ``(x, y, z, visibility)``（全体の画像に対する正規化座標）。人がいなければ None。"""
@@ -140,32 +138,20 @@ class PoseDetector:
     def _detect_roi(self, bgr):
         """本体の _pose_process_with_roi と ROI の更新（master_research_code.py の推定の前後）と同じ手順。
 
-        見失った回数だけ ROI を広げ、``MAX_MISS`` 回を超えたら全画面に戻す。点が少なすぎて ROI を決められない
-        ときも全画面。IMAGE モードなので切り出す場所が画像ごとに変わっても追跡は崩れない。
+        どこを切り出すかは ``pose_roi.RoiTracker`` が決める（見失った回数だけ広げ、``MAX_MISS`` 回を超えたら全画面）。
+        IMAGE モードなので切り出す場所が画像ごとに変わっても追跡は崩れない。
         """
-        roi = self._roi if self._roi_miss <= pose_roi.MAX_MISS else None
-        for _ in range(self._roi_miss if roi is not None else 0):
-            roi = pose_roi.expand_roi(roi, bgr.shape, pose_roi.MISS_GROW_RATIO)
-            if roi is None:
-                break
-        crop = None
+        roi = self._roi_tracker.crop_for(bgr.shape)
+        image = bgr
         if roi is not None:
             x0, y0, x1, y1 = roi
-            crop = bgr[y0:y1, x0:x1]
-            if crop.size == 0:
-                crop = None
-        points = self._points(self._detector.detect(self._rgb(bgr if crop is None else crop)))
-        if points is not None and crop is not None:
+            image = bgr[y0:y1, x0:x1]
+            if image.size == 0:  # 前のフレームの ROI が今の画像の外（画像が小さくなったときなど）
+                roi, image = None, bgr
+        points = self._points(self._detector.detect(self._rgb(image)))
+        if points is not None and roi is not None:
             points = pose_roi.remap_to_fullframe(points, roi, bgr.shape)
-
-        next_roi = pose_roi.roi_from_keypoints(pose_roi.landmarks_to_pixels(points, bgr.shape, pose_keypoints),
-                                               bgr.shape)
-        if next_roi is None:
-            self._roi_miss += 1
-            if self._roi_miss > pose_roi.MAX_MISS:
-                self._roi = None
-        else:
-            self._roi, self._roi_miss = next_roi, 0
+        self._roi_tracker.observe(points, bgr.shape)
         return points
 
     def close(self):
