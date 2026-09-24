@@ -11,13 +11,14 @@ from contextlib import ExitStack
 import csv
 import os
 from pathlib import Path
+import subprocess
 import sys
 import cv2 as cv
 import config
 from app.core.stop_request import StopRequest
 from app.gauge.thresholds import PARTS, load_one_rm, subject_index
 from app.gauge.tracker import GaugeTicker, GaugeTracker
-from app.hybrid.calibration_io import load_calibration
+from app.hybrid.calibration_io import load_calibration, mac_identity
 from app.hybrid.session import stable_session
 from app.hybrid.link import PhoneLink, CaptureMode
 from app.hybrid.live import LiveSession
@@ -89,6 +90,34 @@ def _default_body_mass(fallback: float = 60.0) -> float:
         return fallback
 
 
+def check_mac_camera(calibration, index) -> str | None:
+    """今開く Mac のカメラ（番号 ``index``）が校正したカメラと同じかを確かめる。違えば止める理由を返す。
+
+    識別子は校正ランナーが meta の ``cameras[0].device_id`` に書いたのと同じ ``mac_identity``（``<機種>:camera<番号>``）。
+    Camo や iPhone の連係カメラで番号がずれたまま計測すると、別のカメラの画像に校正を当て、3D とトルクが丸ごと
+    狂ったまま記録が complete になる。識別子を取れない（sysctl が無い・失敗した）ときと、meta に識別子が無い
+    古い校正は確かめようがないので、警告だけ出して続ける。
+
+    見るのは機種と番号だけなので、同じ番号に別の装置が入れ替わったことまでは分からない（``mac_identity`` の注記）。
+    """
+    cameras = calibration.meta.get("cameras") or [{}]
+    expected = cameras[0].get("device_id")
+    if not expected:
+        print("[Mac カメラ] 校正の meta に Mac のカメラの識別子が無い（古い校正）ため、"
+              "校正したカメラと同じかを確かめられない。そのまま計測します", file=sys.stderr)
+        return None
+    try:
+        current = mac_identity(index)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[Mac カメラ] カメラの識別子を取得できない（{exc}）ため、"
+              "校正したカメラと同じかを確かめられない。そのまま計測します", file=sys.stderr)
+        return None
+    if current != expected:
+        return (f"校正した Mac のカメラ（{expected}）と、今開くカメラ（{current}）が違います。"
+                "校正したときのカメラ番号を --camera（設定 CAM0）で指定するか、校正し直してください")
+    return None
+
+
 def main(argv=None):
     # 常に実機（Mac のカメラと Pixel）。記録の再生は別の role（app.entry.REPLAY_ROLE）で、環境変数では切り替えない
     if hasattr(sys.stdout, "reconfigure"):
@@ -114,6 +143,11 @@ def main(argv=None):
     stop.install_signal_handlers()
     try:
         calibration = load_calibration(args.calibration)
+        # 開く前に確かめる。記録は Pixel の最初の点で始まるので、ここで止めれば計測フォルダは残らない
+        mismatch = check_mac_camera(calibration, args.camera)
+        if mismatch:
+            print(mismatch, file=sys.stderr)
+            return 2
         with ExitStack() as stack:
             try:
                 camera = MacCamera(args.camera, size=calibration.intrinsics[0].size)

@@ -13,16 +13,32 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from app.gauge import protocol
+from app.hybrid.calibration_io import update_meta
 from app.net.protocol import LandmarkFrame
 from app.runners import hybrid_measure
 from hybrid_pushup import PushUp, calibrated_pairs
 from test_hybrid_measure import calibration
 
 ONE_RM_TABLE = "subject_id,elbow_L_outer,elbow_R_outer,wrist_L,wrist_R\n0,20,22,8,9\n"
+
+
+def _mac_identity(index):
+    """校正ランナーと同じ形（``calibration_io.mac_identity``、``<機種>:camera<番号>``）の Mac のカメラの識別子。"""
+    return f"Mac14,2:camera{index}"
+
+
+def _set_mac_camera(cal, device_id):
+    """校正の meta の Mac のカメラの識別子（``cameras[0].device_id``）を書き換える。None なら鍵を消す（古い校正）。"""
+    cameras = [dict(camera) for camera in cal.meta["cameras"]]
+    cameras[0].pop("device_id", None)
+    if device_id is not None:
+        cameras[0]["device_id"] = device_id
+    update_meta(cal.directory, cameras=cameras)
 
 
 class FakeCamera:
@@ -105,6 +121,7 @@ def fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(hybrid_measure, "poll_window", lambda: -1)
     monkeypatch.setattr(hybrid_measure, "StopRequest", FakeStop)
     monkeypatch.setattr(hybrid_measure, "stable_session", lambda renew=False: "abcd1234")
+    monkeypatch.setattr(hybrid_measure, "mac_identity", _mac_identity)
     monkeypatch.setattr("app.hybrid.recorder.measurement_root", lambda: tmp_path / "measure")
     table = tmp_path / "one_rm.csv"
     table.write_text(ONE_RM_TABLE, encoding="utf-8")
@@ -114,7 +131,10 @@ def fakes(monkeypatch, tmp_path):
     monkeypatch.delenv("HYBRID_DYN_GATE", raising=False)
     monkeypatch.delenv("HYBRID_EKF_PROFILE", raising=False)
     monkeypatch.delenv("DEMO_MONO_GAUGE_ON", raising=False)
-    return calibration(tmp_path)
+    monkeypatch.delenv("CAM0", raising=False)
+    cal = calibration(tmp_path)
+    _set_mac_camera(cal, _mac_identity(0))  # 校正は既定の 0 番のカメラで取った
+    return cal
 
 
 def _gauge_lines(out: str) -> list[str]:
@@ -173,6 +193,64 @@ def test_the_demo_moves_the_gauge_without_torque(fakes, capsys, monkeypatch):
     assert max(f.parts["elbow_R"].now or 0.0 for f in frames) > 1.0
     folder = next(line.split("保存: ", 1)[1] for line in captured.out.splitlines() if line.startswith("保存: "))
     assert json.loads((Path(folder) / "meta.json").read_text(encoding="utf-8"))["demo"] is True
+
+
+def _recording_camera(monkeypatch):
+    """開いたカメラの番号を残す MacCamera の偽物。"""
+    opened = []
+
+    def camera(index, size=None):
+        opened.append(index)
+        return FakeCamera(index, size)
+
+    monkeypatch.setattr(hybrid_measure, "MacCamera", camera)
+    return opened
+
+
+def test_a_mac_camera_other_than_the_calibrated_one_stops(fakes, capsys, monkeypatch, tmp_path):
+    """校正は 1 番のカメラ、計測は 0 番なら、カメラを開かずに終了コード 2 で止め、両方の識別子を理由に出す。
+
+    以前は Pixel の端末 ID しか見なかった。Camo や iPhone の連係カメラで番号がずれたまま計測すると、別のカメラの
+    画像に校正を当て、3D とトルクが丸ごと狂ったまま complete の記録が残った。止めるのは記録を始める前（記録は
+    Pixel の最初の点で始まる）なので、計測フォルダは作らない。
+    """
+    _set_mac_camera(fakes, _mac_identity(1))
+    opened = _recording_camera(monkeypatch)
+    code = hybrid_measure.main(["--calibration", str(fakes.directory), "--camera", "0"])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert opened == [], "校正と違うカメラを開いた"
+    assert _mac_identity(1) in err and _mac_identity(0) in err
+    assert not (tmp_path / "measure").exists(), "止めたのに計測フォルダができた"
+
+
+def test_the_calibrated_mac_camera_is_measured(fakes, capsys, monkeypatch):
+    """校正と同じ番号（設定 CAM0 から読む番号）なら、そのまま計測する。"""
+    _set_mac_camera(fakes, _mac_identity(1))
+    monkeypatch.setenv("CAM0", "1")
+    opened = _recording_camera(monkeypatch)
+    assert hybrid_measure.main(["--calibration", str(fakes.directory)]) == 0
+    assert opened == [1]
+    assert "保存: " in capsys.readouterr().out
+
+
+def _unidentifiable(index):
+    raise subprocess.CalledProcessError(1, ["sysctl", "-n", "hw.model"])
+
+
+@pytest.mark.parametrize("case", ["old_calibration", "no_identity"])
+def test_an_unverifiable_mac_camera_only_warns(fakes, capsys, monkeypatch, case):
+    """meta に識別子が無い古い校正と、今のカメラの識別子を取れない（sysctl の失敗）ときは、警告だけで計測する。"""
+    if case == "old_calibration":
+        _set_mac_camera(fakes, None)
+    else:
+        monkeypatch.setattr(hybrid_measure, "mac_identity", _unidentifiable)
+    opened = _recording_camera(monkeypatch)
+    assert hybrid_measure.main(["--calibration", str(fakes.directory)]) == 0
+    captured = capsys.readouterr()
+    assert opened == [0]
+    assert "保存: " in captured.out
+    assert "確かめられない" in captured.err
 
 
 def test_hybrid_measure_ignores_hybrid_replay(monkeypatch):

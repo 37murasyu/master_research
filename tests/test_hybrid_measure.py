@@ -252,5 +252,7 @@ def test_camera_size_mismatch_returns_two(tmp_path, monkeypatch):
     def wrong(*args, **kwargs):
         raise ValueError("size mismatch")
 
+    # 校正したカメラ（識別子 "mac"）を開いた。止まるのは識別子の違いではなく寸法の違い
+    monkeypatch.setattr(hybrid_measure, "mac_identity", lambda index: "mac")
     monkeypatch.setattr(hybrid_measure, "MacCamera", wrong)
     assert hybrid_measure.main(["--calibration", str(cal.directory)]) == 2
