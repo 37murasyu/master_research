@@ -1,6 +1,7 @@
 """計測画面。設定を編集し、計測ワーカーを起動・停止し、その出力を見る。
 
-主ボタンは 1 つで、停止中は「計測を開始」、実行中は「停止」に入れ替わる（設計書 §5.2、R16-01）。
+主ボタンは 1 つで、停止中は「計測を開始」、実行中は「停止」に入れ替わる（設計書 §5.2、R16-01）。停止を求めて
+子が終わる（CSV を書き出す）のを待つ間は、押せない「停止中…」にする。
 入力は 3 つ（USB カメラ 2 台・Mac＋Pixel・記録の再生）。Mac＋Pixel（混成）と記録の再生のときは、開始と同時に
 被験者ゲージの窓（``app.gauge.window``）を開き、子の出力のゲージの行（``WorkerRunner.gauge_frame``）をそこへ流す。
 「J の数値」スイッチはゲージ窓を開く入力のときだけ出し、実行中も切り替えられる（ゲージ窓は同じプロセスにあるので、
@@ -411,18 +412,21 @@ class MeasurePage(RunnerPage):
         self._dev.set_badge(n)
 
     def _refresh_main_button(self) -> None:
-        """主ボタンを押せるか。実行中は常に押せる（停止）。止まっているときは開始できない理由があれば押せない。"""
+        """主ボタンを押せるか。実行中は押せる（停止）が、停止を求めて子が終わるのを待つ間は押せない。
+        止まっているときは開始できない理由があれば押せない。"""
         problem = None
         if self._header_phase != "running" and self._input.replay_folder:
             problem = replay_folder_problem(self._settings.get(_REPLAY_FOLDER))
-        self._main_button.setEnabled(problem is None)
+        self._main_button.setEnabled(problem is None and self._state != "stopping")
         self._start_blocked.setText(problem or "")
         self._start_blocked.setVisible(problem is not None)
 
     def _on_state(self, state: str) -> None:
         super()._on_state(state)
-        running = state in ("starting", "running")
-        self._main_button.setText("停止" if running else "計測を開始")
+        # 停止を待つ間（"stopping"）も子は動いている。押せない「停止中…」にし、その間のクリックで
+        # 計測をやり直さない（押した分は、止まった後の「計測を開始」には届かない）
+        running = state in self.BUSY_STATES
+        self._main_button.setText("停止中…" if state == "stopping" else "停止" if running else "計測を開始")
         self._locked_reason.setVisible(running)
         if running:
             self._output_link.setVisible(False)

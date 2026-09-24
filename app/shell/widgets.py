@@ -45,6 +45,7 @@ class StatusBadge(QtWidgets.QLabel):
         "stopped": ("#6b7280", "停止中"),
         "starting": ("#d97706", "起動中"),
         "running": ("#059669", "計測中"),
+        "stopping": ("#d97706", "停止処理中"),
         "error": ("#dc2626", "エラー"),
     }
 
@@ -161,13 +162,16 @@ class RunnerPage(QtWidgets.QWidget):
         TITLE / LOG_LABEL / SPLIT_SIZES
         build_side_panel()                左パネル（唯一の必須実装）
         header_widgets()                  ヘッダに置く追加ウィジェット
-        widgets_disabled_while_running()  実行中に触れなくするもの
-        widgets_enabled_while_running()   実行中だけ押せるもの（中止ボタンなど）
+        widgets_disabled_while_running()  実行中（停止を待つ間も）に触れなくするもの
+        widgets_enabled_while_running()   実行中だけ押せるもの（中止ボタンなど。停止を待つ間は押せない）
     """
 
     TITLE: str = ""
     LOG_LABEL: str = "ログ"
     SPLIT_SIZES: tuple[int, int] = (360, 640)
+
+    # 子がまだ動いている状態（停止を求めて終わるのを待つ "stopping" を含む）
+    BUSY_STATES = ("starting", "running", "stopping")
 
     def __init__(
         self,
@@ -177,6 +181,8 @@ class RunnerPage(QtWidgets.QWidget):
     ):
         super().__init__(parent)
         self._settings = settings
+        # 最後に届いた実行の状態（WorkerRunner.state_changed）
+        self._state = "stopped"
 
         self._runner = WorkerRunner(role, self)
         self._runner.output.connect(self.append_log)
@@ -244,16 +250,18 @@ class RunnerPage(QtWidgets.QWidget):
         self._log.append_text(text)
 
     def _on_state(self, state: str) -> None:
+        self._state = state
         self._badge.set_state(state)
-        running = state in ("starting", "running")
+        busy = state in self.BUSY_STATES
         for widget in self.widgets_disabled_while_running():
-            widget.setEnabled(not running)
+            widget.setEnabled(not busy)
+        # 停止を待つ間は中止も押せない（もう求めてある）
         for widget in self.widgets_enabled_while_running():
-            widget.setEnabled(running)
+            widget.setEnabled(busy and state != "stopping")
 
     def shutdown(self) -> None:
-        """ウィンドウを閉じるとき、子プロセスを残さない。"""
-        self._runner.stop()
+        """ウィンドウを閉じるとき、子プロセスを残さない（終わるまで待つ。猶予を過ぎたら強制終了）。"""
+        self._runner.stop_and_wait()
 
     @property
     def is_running(self) -> bool:

@@ -242,3 +242,115 @@ class TestChildOutputEncoding:
         finally:
             runner._process.kill()
             runner._process.waitForFinished(5000)
+
+
+# 停止ファイルが置かれたら、CSV の書き出しに見立てて WRITE_S 秒かけてから終わる子
+_CHILD_WRITES_AFTER_STOP = (
+    "import os, pathlib, time\n"
+    "stop = pathlib.Path(os.environ['APP_STOP_FILE'])\n"
+    "while not stop.exists():\n"
+    "    time.sleep(0.02)\n"
+    "time.sleep(float(os.environ.get('WRITE_S', '1')))\n"
+)
+# 停止の求めに応じない子
+_CHILD_IGNORES_STOP = "import time\ntime.sleep(60)\n"
+
+
+def _wait_until(qt_app, predicate, timeout_s: float) -> bool:
+    """イベントを回しながら ``predicate`` が真になるのを待つ（子の終了やタイマーはイベントで届く）。"""
+    import time
+
+    from app.core.qt import QtCore
+
+    deadline = time.monotonic() + timeout_s
+    while not predicate() and time.monotonic() < deadline:
+        qt_app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        time.sleep(0.01)
+    return predicate()
+
+
+class TestStopDoesNotBlock:
+    """停止は求めるだけで戻り、子が終わるのはイベントで知る（GUI を固めない）。
+
+    かつては ``waitForFinished(GRACE_MS)`` で GUI が最大 10 秒固まり、その間の 2 回目のクリックが
+    停止の後に「計測を開始」として届いて計測をやり直していた。
+    """
+
+    def _start(self, monkeypatch, code: str, role: str = "realtime"):
+        from app.runners.worker import WorkerRunner
+
+        monkeypatch.setattr(entry, "worker_command",
+                            lambda role, passthrough=None, module=None: [sys.executable, "-c", code])
+        runner = WorkerRunner(role)
+        runner.events = []
+        runner.state_changed.connect(lambda s: runner.events.append(("state", s)))
+        runner.finished.connect(lambda c: runner.events.append(("finished", c)))
+        runner.logs = []
+        runner.output.connect(runner.logs.append)
+        assert runner.start(Settings(), module="dummy")
+        return runner
+
+    def test_stop_returns_at_once_and_the_end_arrives_later(self, qt_app, monkeypatch):
+        import time
+
+        monkeypatch.setenv("WRITE_S", "1.5")
+        runner = self._start(monkeypatch, _CHILD_WRITES_AFTER_STOP)
+        try:
+            t0 = time.monotonic()
+            runner.stop()
+            assert time.monotonic() - t0 < 0.5, "停止が子の終了を待って GUI を固めている"
+            assert runner.is_running and runner.events[-1] == ("state", "stopping")
+
+            assert _wait_until(qt_app, lambda: not runner.is_running, 10)
+            assert runner.events[-2:] == [("state", "stopped"), ("finished", 0)]
+            assert not any("強制終了" in line for line in runner.logs), "猶予の内に終わったのに強制終了した"
+        finally:
+            runner.stop_and_wait()
+
+    def test_a_second_stop_while_stopping_does_nothing(self, qt_app, monkeypatch):
+        runner = self._start(monkeypatch, _CHILD_WRITES_AFTER_STOP)
+        try:
+            runner.stop()
+            runner.stop()
+            assert sum("終了を要求しました" in line for line in runner.logs) == 1
+            assert runner.events.count(("state", "stopping")) == 1
+        finally:
+            runner.stop_and_wait()
+
+    def test_a_child_that_does_not_stop_is_killed_after_the_grace_period(self, qt_app, monkeypatch):
+        runner = self._start(monkeypatch, _CHILD_IGNORES_STOP)
+        runner.GRACE_MS = 300
+        try:
+            runner.stop()
+            assert _wait_until(qt_app, lambda: not runner.is_running, 5), "猶予を過ぎても強制終了しない"
+            assert any("強制終了" in line for line in runner.logs)
+            assert ("state", "stopped") in runner.events
+        finally:
+            runner.stop_and_wait()
+
+    @pytest.mark.parametrize("already_stopping", [False, True], ids=["動いている", "停止を求めた後"])
+    def test_stop_and_wait_leaves_no_child(self, qt_app, monkeypatch, already_stopping):
+        """窓を閉じるとき（closeEvent・shutdown）は、今までどおり子が終わるまで待ち、子を残さない。"""
+        monkeypatch.setenv("WRITE_S", "0.3")
+        runner = self._start(monkeypatch, _CHILD_WRITES_AFTER_STOP)
+        if already_stopping:
+            runner.stop()
+        runner.stop_and_wait()
+        assert not runner.is_running
+        assert runner.events[-1] == ("finished", 0), "書き出しを待たずに強制終了した"
+
+    def test_stop_and_wait_kills_a_child_that_does_not_stop(self, qt_app, monkeypatch):
+        runner = self._start(monkeypatch, _CHILD_IGNORES_STOP)
+        runner.GRACE_MS = 300
+        runner.stop_and_wait()
+        assert not runner.is_running
+        assert any("強制終了" in line for line in runner.logs)
+
+    def test_roles_without_a_stop_file_are_terminated(self, qt_app, monkeypatch):
+        """停止ファイルを見ない役割（キャリブレーション・解析）には terminate を送る（これも待たずに戻る）。"""
+        runner = self._start(monkeypatch, _CHILD_IGNORES_STOP, role="script")
+        try:
+            runner.stop()
+            assert _wait_until(qt_app, lambda: not runner.is_running, 5)
+        finally:
+            runner.stop_and_wait()

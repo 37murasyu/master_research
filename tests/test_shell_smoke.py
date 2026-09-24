@@ -269,3 +269,53 @@ class TestStopDirectory:
         runner = WorkerRunner("realtime")
         assert runner.start(Settings()) is False
         assert not list(tmp_path.glob("wt_stop_*")), "起動に失敗したのに停止用のディレクトリが残った"
+
+
+class TestStopping:
+    """停止を求めてから子が終わるまで（state "stopping"）の画面。"""
+
+    @pytest.mark.parametrize("page_name", ["calibrate", "analyze"])
+    def test_start_and_abort_buttons_are_disabled_while_stopping(self, qt_app, page_name):
+        from app.shell.page_analyze import AnalyzePage
+        from app.shell.page_calibrate import CalibratePage
+
+        page = {"calibrate": CalibratePage, "analyze": AnalyzePage}[page_name](Settings())
+        try:
+            start = page._start_button if page_name == "calibrate" else page._run_button
+            page._runner.state_changed.emit("running")
+            assert page._stop_button.isEnabled() and not start.isEnabled()
+            page._runner.state_changed.emit("stopping")
+            assert not page._stop_button.isEnabled(), "停止を待つ間に中止をもう一度押せる"
+            assert not start.isEnabled(), "停止を待つ間に開始を押せる"
+            assert page._badge.text() == "停止処理中"
+            page._runner.state_changed.emit("stopped")
+            assert start.isEnabled() and not page._stop_button.isEnabled()
+        finally:
+            page.shutdown()
+
+    def test_closing_the_window_while_stopping_leaves_no_child(self, qt_app, monkeypatch):
+        """停止を求めた後（子がまだ書き出し中）に窓を閉じても、子が終わるまで待って残さない。"""
+        import sys
+
+        from app import entry
+        from app.core.qt import QtWidgets
+        from app.shell.main_window import MainWindow
+
+        child = ("import os, pathlib, time\n"
+                 "stop = pathlib.Path(os.environ['APP_STOP_FILE'])\n"
+                 "while not stop.exists():\n"
+                 "    time.sleep(0.02)\n"
+                 "time.sleep(0.5)\n")
+        monkeypatch.setattr(entry, "worker_command",
+                            lambda role, passthrough=None, module=None: [sys.executable, "-c", child])
+        monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *args, **kwargs: QtWidgets.QMessageBox.Yes)
+        monkeypatch.setattr(MainWindow, "_save_settings", lambda self: None)
+
+        window = MainWindow(Settings())
+        measure = window._pages[0]
+        assert measure._runner.start(Settings())
+        measure._runner.stop()
+        assert measure.is_running, "子が書き出し中のはず"
+
+        window.close()
+        assert not measure.is_running, "窓を閉じた後に子が残った"
