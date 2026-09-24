@@ -162,3 +162,119 @@ class TestPersistence:
         )
         s = st.Settings.load(path)
         assert "REMOVED_LONG_AGO" not in s.as_env()
+
+
+class TestLoadingBrokenFiles:
+    """手で書き換えた・壊れた設定ファイルでも、GUI は既定値で立ち上がり、開始もできること。
+
+    かつては UTF-8 でない・一番外が配列・"65kg"・数や真偽の JSON 値で、起動時か開始時に例外で止まっていた。
+    読めないものは項目ごとに捨てて既定値に戻す。
+    """
+
+    def _load(self, tmp_path, content) -> st.Settings:
+        path = tmp_path / "settings.json"
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
+        return st.Settings.load(path)
+
+    @pytest.mark.parametrize("content", [
+        '{"values": {"SUBJECT_ID": "被験者3"}}'.encode("cp932"),  # UTF-8 でない
+        b"\xff\xfe\x00",
+        b"[]",
+        b'"values"',
+        b"3",
+        b'{"values": ["SUBJECT_ID"]}',
+        b'{"values": "SUBJECT_ID"}',
+        b'{"values": null}',
+        b"[" * 100_000,  # 深すぎる入れ子
+    ], ids=["cp932", "壊れたバイト列", "配列", "文字列", "数", "values が配列", "values が文字列",
+            "values が null", "深い入れ子"])
+    def test_unreadable_files_give_the_defaults(self, tmp_path, content):
+        s = self._load(tmp_path, content)
+        assert s.overrides == {}
+
+    @pytest.mark.parametrize("name, value", [
+        ("BODY_MASS_KG", "65kg"),
+        ("BODY_MASS_KG", "nan"),
+        ("BODY_MASS_KG", True),
+        ("BODY_MASS_KG", [70]),
+        ("MP_THREADS", "auto"),
+        ("MP_THREADS", 2.5),
+        ("SKIP_FRAMES", "1.5"),
+        ("HEADLESS", "たぶん"),
+        ("HEADLESS", {"on": True}),
+        ("SUBJECT_ID", None),
+        ("SUBJECT_ID", False),
+    ])
+    def test_an_unreadable_value_falls_back_to_the_default_only_for_that_item(self, tmp_path, name, value):
+        s = self._load(tmp_path, {"values": {name: value, "CAM0": "1"}})
+        assert name not in s.overrides
+        assert s.get(name) == st.Settings().get(name)
+        assert s.get("CAM0") == "1", "読める項目まで捨てている"
+
+    def test_numbers_and_booleans_in_the_file_are_read_as_their_values(self, tmp_path):
+        s = self._load(tmp_path, {"values": {
+            "HEADLESS": True, "SUBJECT_ID": 7, "BODY_MASS_KG": 70, "SKIP_FRAMES": 2, "EKF_Q_ACC": "2e-3",
+        }})
+        assert s.get("HEADLESS") is True
+        assert s.get("SUBJECT_ID") == "7"
+        assert s.get("BODY_MASS_KG") == 70.0
+        assert s.get("SKIP_FRAMES") == 2
+        assert s.get("EKF_Q_ACC") == pytest.approx(2e-3)
+        env = s.as_env()
+        assert all(isinstance(value, str) for value in env.values()), "子への環境変数に文字列でない値がある"
+        assert (env["HEADLESS"], env["SUBJECT_ID"], env["SKIP_FRAMES"]) == ("1", "7", "2")
+        assert float(env["BODY_MASS_KG"]) == 70.0
+
+    @pytest.mark.parametrize("raw", ["1", "0", "true", "True", "TRUE", "false", "FALSE", "yes", "no", "on", "Off",
+                                     " 1 ", ""])
+    def test_booleans_are_read_the_same_way_as_the_child(self, tmp_path, raw):
+        """GUI と子（config.env_flag）で真偽の読み方をそろえる。"TRUE" で GUI は偽・子は真と食い違っていた。"""
+        from config import env_flag
+
+        for name in ("HEADLESS", "DEMO_MONO_GAUGE_ON", "GAUGE_SHOW_JOULES"):
+            default = st.Settings().get(name)
+            s = self._load(tmp_path, {"values": {name: raw}})
+            child = env_flag(name, default, env=s.as_env())
+            assert s.get(name) is child, (name, raw)
+            assert s.get(name) is env_flag(name, default, env={name: raw}), (name, raw)
+
+
+class TestAtomicSave:
+    def test_a_failed_save_keeps_the_previous_file(self, tmp_path, monkeypatch):
+        """書き込みの途中で止まっても、前回の設定ファイルは壊れない（一時ファイルに書いてから置き換える）。"""
+        import os
+
+        path = tmp_path / "settings.json"
+        before = st.Settings()
+        before.set("SUBJECT_ID", "3")
+        before.save(path)
+        saved = path.read_bytes()
+
+        def fail(*_args, **_kwargs):
+            raise OSError("ディスクがいっぱい")
+
+        monkeypatch.setattr(os, "replace", fail)
+        after = st.Settings()
+        after.set("SUBJECT_ID", "4")
+        with pytest.raises(OSError):
+            after.save(path)
+
+        assert path.read_bytes() == saved
+        assert [p.name for p in tmp_path.iterdir()] == ["settings.json"], "一時ファイルが残った"
+
+    def test_save_replaces_the_file_from_the_same_folder(self, tmp_path, monkeypatch):
+        import os
+
+        replaced = []
+        real_replace = os.replace
+        monkeypatch.setattr(os, "replace", lambda src, dst: replaced.append((src, dst)) or real_replace(src, dst))
+        path = tmp_path / "sub" / "settings.json"
+        st.Settings().save(path)
+
+        assert len(replaced) == 1
+        src, dst = map(os.fspath, replaced[0])
+        assert os.path.dirname(src) == os.path.dirname(dst) == str(path.parent)
+        assert st.Settings.load(path).overrides == {}

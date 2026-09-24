@@ -79,6 +79,30 @@ class TestMainWindow:
         assert target.is_file(), "終了時に設定が保存されていない"
         assert Settings.load(target).get("DEMO_MONO_GAUGE_ON") is True
 
+    @pytest.mark.parametrize("content", [
+        '{"values": {"SUBJECT_ID": "被験者3"}}'.encode("cp932"),
+        b"[]",
+        '{"values": {"BODY_MASS_KG": "65kg", "MP_THREADS": "auto", "HEADLESS": "TRUE", "SUBJECT_ID": 7}}'.encode(),
+    ], ids=["cp932", "配列", "読めない値"])
+    def test_window_opens_and_can_start_with_a_broken_settings_file(self, qt_app, tmp_path, monkeypatch, content):
+        """手で書き換えた設定ファイルで、GUI が起動できない・開始で落ちる、にならないこと。"""
+        from app import entry
+        from app.core.qt import QtCore
+        from app.shell import main_window as mw
+
+        target = tmp_path / "settings.json"
+        target.write_bytes(content)
+        monkeypatch.setattr(mw.Settings, "default_path", classmethod(lambda cls: target))
+
+        window = mw.MainWindow()
+        try:
+            assert window._settings.get("BODY_MASS_KG") == 65.0
+            environment = QtCore.QProcessEnvironment()
+            for key, value in entry.worker_environment(window._settings).items():
+                environment.insert(key, value)  # 文字列でない値があると TypeError（開始で落ちていた）
+        finally:
+            window.close()
+
 
 class TestSettingsForm:
     def test_shows_only_ui_visible_settings(self, qt_app):
