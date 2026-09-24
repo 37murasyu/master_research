@@ -277,6 +277,28 @@ def test_an_unverifiable_mac_camera_only_warns(fakes, capsys, monkeypatch, case)
     assert "確かめられない" in captured.err
 
 
+@pytest.mark.parametrize("argv", [["--body-mass", "nan"], ["--body-mass", "inf"], ["--preview-hz", "nan"]])
+def test_a_non_finite_argument_is_refused_at_the_entrance(fakes, capsys, tmp_path, argv):
+    """体重・表示 Hz の NaN・inf は入口で断る（終了コード 2）。
+
+    以前は ``nan <= 0`` が偽なので検査を通り、記録の開始（meta.json は NaN を書けない）で落ちて、Pixel の点ごとに
+    meta の無い空の計測フォルダを作った。
+    """
+    with pytest.raises(SystemExit) as exc:
+        hybrid_measure.main(["--calibration", str(fakes.directory), *argv])
+    assert exc.value.code == 2
+    assert "体重" in capsys.readouterr().err
+    assert not (tmp_path / "measure").exists()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_a_non_finite_body_mass_setting_uses_the_default(monkeypatch, capsys, value):
+    """設定 BODY_MASS_KG の NaN・inf は、数でない値と同じく既定の体重にする（起動の段階で落とさない）。"""
+    monkeypatch.setenv("BODY_MASS_KG", value)
+    assert hybrid_measure._default_body_mass() == 60.0
+    assert "BODY_MASS_KG" in capsys.readouterr().err
+
+
 def test_hybrid_measure_ignores_hybrid_replay(monkeypatch):
     """``hybrid_measure`` は常に実機の計測。``HYBRID_REPLAY`` があっても再生へ回さない。
 

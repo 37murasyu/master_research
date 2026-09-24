@@ -9,6 +9,7 @@
 import argparse
 from contextlib import ExitStack
 import csv
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -79,15 +80,18 @@ def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementCon
 
 
 def _default_body_mass(fallback: float = 60.0) -> float:
-    """設定 BODY_MASS_KG を読む。数でなければ既定値（起動の段階で落とさない）。"""
+    """設定 BODY_MASS_KG を読む。数でなければ（NaN・inf も）既定値（起動の段階で落とさない）。"""
     raw = os.environ.get("BODY_MASS_KG")
     if not raw:
         return fallback
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
         print(f"BODY_MASS_KG={raw!r} は数ではないため {fallback} kg を使います", file=sys.stderr)
         return fallback
+    return value
 
 
 def check_mac_camera(calibration, index) -> str | None:
@@ -137,8 +141,10 @@ def main(argv=None):
         args.camera = default_camera_index()
     if args.body_mass is None:
         args.body_mass = _default_body_mass()
-    if args.body_mass <= 0 or args.preview_hz < 0:
-        parser.error("体重は正の値、表示 Hz は0以上にしてください")
+    # NaN は比べるとどれも偽なので、有限かを先に見る（通すと記録の開始で meta.json を書けずに落ちる）
+    if not (math.isfinite(args.body_mass) and args.body_mass > 0
+            and math.isfinite(args.preview_hz) and args.preview_hz >= 0):
+        parser.error("体重は正の値、表示 Hz は0以上の値（どちらも NaN・inf は不可）にしてください")
     stop = StopRequest.from_environment()
     stop.install_signal_handlers()
     try:

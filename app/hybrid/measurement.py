@@ -133,6 +133,10 @@ class MeasurementSession:
         raise exc
 
     def on_landmarks(self, frame):
+        if self.failed.is_set():
+            # 止めると決めた後に届いた点は捨てる。記録の開始で落ちた後に Pixel の点ごとに始め直すと、
+            # meta の無い空の計測フォルダが点の数だけ残る
+            return
         if frame.role == "cam1":
             self._last_remote = self._clock()
         # 記録は Pixel の点が初めて届いたときに始める。Mac の点は起動直後から流れるが、
