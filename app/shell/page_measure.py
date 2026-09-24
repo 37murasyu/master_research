@@ -14,12 +14,18 @@
 設定フォーム）。画面に説明文は置かない。出力先は、終わった後の「出力フォルダ」リンクで開く。
 計算を壊す設定（``app_default`` で既定を無効にした 4 つ）が有効なら、その件数を開示の見出しに出す
 （R20-03）。ログは、まだ何も流れていないうちは「未実行」と出す（R19-01）。
+
+入力ごとに何を出し入れするか（ゲージ窓・J のスイッチ・接続・校正の行・出力フォルダ）は ``MEASURE_INPUTS`` の
+1 か所に書き、画面のコードは role の文字列を比べない。入力を足すときは表に 1 行足す。
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Callable
 
 from app.core.qt import QtCore, QtGui, QtWidgets
 from app.core.settings import SCHEMA, Settings, measurement_output_dir
@@ -29,11 +35,43 @@ from app.hybrid import paths as hybrid_paths
 from app.shell.controls import Disclosure, StatusText, ToggleSwitch
 from app.shell.widgets import RunnerPage, SettingsForm
 
-__all__ = ["MeasurePage"]
+__all__ = ["MeasurePage", "MeasureInput", "MEASURE_INPUTS", "measure_input"]
 
-_HYBRID_ROLE = "hybrid_measure"
-# 入力のラジオの id と role の対応（id は並びの順）
-_INPUT_ROLES = ("realtime", _HYBRID_ROLE)
+
+@dataclass(frozen=True)
+class MeasureInput:
+    """計測画面の入力 1 つぶんの事実。画面は role の文字列を比べず、すべてこれを引く。
+
+    ``gauge``: 子がゲージの行を出すので、開始と同時にゲージ窓を開き、J のスイッチを出し、見出しに回数を出す。
+    ``pixel_link``: 見出しに Pixel の接続を出す。``calibration_row``: 使う校正の日時と「変更」リンクの行を出す。
+    ``output_root``: 終わった後の「出力フォルダ」リンクが開く場所（呼ぶたびに求める。試験で差し替えられるように）。
+    """
+
+    role: str
+    label: str
+    output_root: Callable[[], Path]
+    gauge: bool = False
+    pixel_link: bool = False
+    calibration_row: bool = False
+
+
+# 入力のラジオはこの並び（ラジオの id は添字）
+MEASURE_INPUTS = (
+    MeasureInput("realtime", "USB カメラ 2 台", output_root=lambda: measurement_output_dir()),
+    MeasureInput(
+        "hybrid_measure", "Mac＋Pixel", output_root=lambda: hybrid_paths.measurement_root(),
+        gauge=True, pixel_link=True, calibration_row=True,
+    ),
+)
+
+
+def measure_input(role: str) -> MeasureInput:
+    """role の入力の記述。表に無い role は ValueError（画面が知らない子を起動しない）。"""
+    for spec in MEASURE_INPUTS:
+        if spec.role == role:
+            return spec
+    raise ValueError(f"計測画面の入力に無い role: {role}")
+
 # 専用の欄を置くので、入れ子の設定フォームには並べない項目
 _DEDICATED_SETTINGS = frozenset({"SUBJECT_ID", "BODY_MASS_KG"})
 # 混成の校正のフォルダ名の書式（校正を保存する側が datetime.now() から付ける名前）
@@ -100,9 +138,9 @@ class MeasurePage(RunnerPage):
         # RunnerPage.__init__ が _on_state を呼ぶので、そこで触るものは先に作っておく。
         # ゲージ窓は親を持たない独立の窓（第 2 モニタに全画面で出すため）。閉じるのは shutdown。
         self._gauge_window = GaugeWindow(show_joules=bool(settings.get("GAUGE_SHOW_JOULES")))
-        # 今（または最後）の実行の role。入力の選択は実行の後で変わりうるので、終了時の振る舞いは
+        # 今（または最後）の実行の入力。入力の選択は実行の後で変わりうるので、終了時の振る舞いは
         # 選択ではなくこちらで決める。
-        self._run_role: str | None = None
+        self._run_input: MeasureInput | None = None
         # 見出しの局面（"stopped" / "running" / "success" / "error"）と、今の実行で最後に届いたフレーム。
         self._header_phase = "stopped"
         self._last_frame: GaugeFrame | None = None
@@ -164,15 +202,15 @@ class MeasurePage(RunnerPage):
         self._locked_reason = QtWidgets.QLabel("計測中は変更できません")
         self._locked_reason.setVisible(False)
 
-        # 入力（R2-01）。n=2 なのでコンボボックスではなくラジオ
-        self._input_usb = QtWidgets.QRadioButton("USB カメラ 2 台")
-        self._input_hybrid = QtWidgets.QRadioButton("Mac＋Pixel")
+        # 入力（R2-01）。数が少ないのでコンボボックスではなくラジオ。並びと名前は MEASURE_INPUTS
         self._input_group = QtWidgets.QButtonGroup(self)
-        for button_id, button in enumerate((self._input_usb, self._input_hybrid)):
+        self._input_radios = [QtWidgets.QRadioButton(spec.label) for spec in MEASURE_INPUTS]
+        for button_id, button in enumerate(self._input_radios):
             self._input_group.addButton(button, button_id)
-        self._input_group.button(_INPUT_ROLES.index(self._runner.role)).setChecked(True)
+        self._input_usb, self._input_hybrid = self._input_radios[:2]
+        self._input_group.button(MEASURE_INPUTS.index(self._input)).setChecked(True)
         self._input_group.idToggled.connect(self._on_input_toggled)
-        inputs = _hrow(self._input_usb, self._input_hybrid)
+        inputs = _hrow(*self._input_radios)
 
         self._subject_edit = QtWidgets.QLineEdit(str(self._settings.get("SUBJECT_ID") or ""))
         self._subject_edit.textChanged.connect(lambda text: self._settings.set("SUBJECT_ID", text))
@@ -218,6 +256,11 @@ class MeasurePage(RunnerPage):
         super().showEvent(event)
         self._calibration_time.setText(calibration_time_text())
 
+    @property
+    def _input(self) -> MeasureInput:
+        """今選んでいる入力。"""
+        return measure_input(self._runner.role)
+
     # -- 開始・停止 --------------------------------------------------------
     def _on_main_button(self) -> None:
         if self.is_running:
@@ -226,21 +269,21 @@ class MeasurePage(RunnerPage):
             self._start()
 
     def _start(self) -> None:
-        role = self._runner.role
+        spec = self._input
         self._last_frame = None
         if not self._runner.start(self._settings):
             return  # 起動に失敗したときは窓を開かない
-        self._run_role = role
-        # start の中で出た "running" の時点では _run_role が前回のままなので、ここで出し直す
+        self._run_input = spec
+        # start の中で出た "running" の時点では _run_input が前回のままなので、ここで出し直す
         self._refresh_header()
-        if role == _HYBRID_ROLE:
+        if spec.gauge:
             self._gauge_window.begin(
                 show_joules=bool(self._settings.get("GAUGE_SHOW_JOULES")),
                 avoid_screen=self.window().screen(),
             )
 
     def _on_finished(self, exit_code: int) -> None:
-        if self._run_role == _HYBRID_ROLE:
+        if self._run_input is not None and self._run_input.gauge:
             self._gauge_window.finish(exit_code)
         self._header_phase = "success" if exit_code == 0 else "error"
         self._refresh_header()
@@ -258,18 +301,18 @@ class MeasurePage(RunnerPage):
     def _on_input_toggled(self, button_id: int, checked: bool) -> None:
         if not checked:
             return  # 外れた側の通知。入った側の通知で切り替える
-        self._runner.role = _INPUT_ROLES[button_id]
+        self._runner.role = MEASURE_INPUTS[button_id].role
         self._sync_input_widgets()
 
     def _sync_input_widgets(self) -> None:
-        """入力が Mac＋Pixel のときだけ出すもの（J のスイッチ・校正の行。R15-01）。"""
-        hybrid = self._runner.role == _HYBRID_ROLE
-        self._joules_switch.setVisible(hybrid)
-        self._rows.setRowVisible(self._calibration_row, hybrid)
+        """入力によって出し入れするもの（J のスイッチ・校正の行。R15-01）。"""
+        spec = self._input
+        self._joules_switch.setVisible(spec.gauge)
+        self._rows.setRowVisible(self._calibration_row, spec.calibration_row)
 
     def _open_output_folder(self, _href: str) -> None:
-        folder = (hybrid_paths.measurement_root()
-                  if self._run_role == _HYBRID_ROLE else measurement_output_dir())
+        spec = self._run_input or self._input
+        folder = spec.output_root()
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
 
     # -- 表示更新 ----------------------------------------------------------
@@ -291,12 +334,13 @@ class MeasurePage(RunnerPage):
         self._refresh_header()
 
     def _refresh_header(self) -> None:
-        hybrid_running = self._header_phase == "running" and self._run_role == _HYBRID_ROLE
-        connected = (hybrid_running and self._last_frame is not None
+        spec = self._run_input if self._header_phase == "running" else None
+        connected = (spec is not None and spec.gauge and self._last_frame is not None
                      and self._last_frame.link == "connected")
         # 回数は、ゲージの見出しと同じく「完了した回数＋1」。つながる前は出さない
         rep = self._last_frame.rep + 1 if connected else None
         self._run_status.set_status(self._header_phase, rep=rep)
-        self._link_status.setVisible(hybrid_running)
-        if hybrid_running:
+        show_link = spec is not None and spec.pixel_link
+        self._link_status.setVisible(show_link)
+        if show_link:
             self._link_status.set_link(connected)

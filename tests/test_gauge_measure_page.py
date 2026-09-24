@@ -363,6 +363,26 @@ class TestAdvancedSettings:
         assert page._input_usb.isChecked() and page._runner.role == USB
         assert not page.findChildren(QtWidgets.QComboBox), "入力のコンボボックスが残っている（n=2 は R2-03）"
 
+    def test_inputs_come_from_one_table(self, page):
+        """入力ごとの事実（role・名前・ゲージ・接続・校正の行・出力フォルダ）は ``MEASURE_INPUTS`` の 1 か所だけに書く。
+
+        ラジオの並びも表示の切り替えもこの表を引く。画面のコードに role の文字列の比較が散っていると、
+        入力を 1 つ足すたびに全部を探して直すことになり、1 か所の直し漏れで振る舞いが食い違う。
+        """
+        from pathlib import Path
+
+        from app.core.qt import QtWidgets
+        import app.shell.page_measure as module
+
+        inputs = module.MEASURE_INPUTS
+        radios = page.findChildren(QtWidgets.QRadioButton)
+        assert [r.text() for r in radios] == [i.label for i in inputs]
+        for spec in inputs:
+            assert module.measure_input(spec.role) is spec
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert '"hybrid_measure"' in source and source.count('"hybrid_measure"') == 1, "role の文字列が表の外にもある"
+        assert "_HYBRID_ROLE" not in source
+
     def test_radio_switches_role(self, page):
         page._input_hybrid.click()
         assert page._runner.role == HYBRID
