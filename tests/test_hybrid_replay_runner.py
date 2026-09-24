@@ -43,6 +43,14 @@ def test_missing_session_is_reported(tmp_path, capsys):
     assert "計測フォルダではありません" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("mass", ["nan", "inf", "-60", "0"])
+def test_body_mass_must_be_a_positive_finite_number(tmp_path, mass):
+    """計測（hybrid_measure）と同じ入口の検査。NaN を通すと記録の開始で meta.json を書けずに落ちる。"""
+    with pytest.raises(SystemExit) as raised:
+        runner.main([str(tmp_path), "--body-mass", mass])
+    assert raised.value.code == 2
+
+
 def test_what_to_replay_comes_only_from_the_arguments(tmp_path, monkeypatch):
     """何を流すかは引数だけで決まる。親のシェルに残った ``HYBRID_REPLAY*`` は効かない（GUI は引数で渡す）。"""
     monkeypatch.setenv("HYBRID_REPLAY", str(tmp_path))

@@ -14,6 +14,7 @@ GUI からは独立の role ``hybrid_replay``（``app.entry.REPLAY_ROLE``）で�
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import threading
 import time
@@ -43,7 +44,11 @@ def main(argv=None) -> int:
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    # 計測（hybrid_measure）と同じ入口の検査。NaN は比べるとどれも偽なので有限かを先に見る
+    if args.body_mass is not None and not (math.isfinite(args.body_mass) and args.body_mass > 0):
+        parser.error("体重は正の値（NaN・inf は不可）にしてください")
     session = Path(args.session).expanduser()
     if not is_measurement_dir(session):
         print(f"計測フォルダではありません: {session}", file=sys.stderr)
