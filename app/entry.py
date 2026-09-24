@@ -39,7 +39,13 @@ __all__ = [
     "ROLES",
     "WORKER_MODULES",
     "SCRIPT_ROLE",
+    "REPLAY_ROLE",
 ]
+
+# 記録した混成の計測を流し直す役割（カメラも Pixel も使わない）。実機の計測（hybrid_measure）とは別の role にして、
+# 何を流すか（計測フォルダ・範囲・速さ）は引数で渡す（app.shell.page_measure.replay_arguments）。環境変数では
+# 切り替えないので、親のシェルに何が残っていても実機の計測が再生になることはない。計測画面もこの名前を引く。
+REPLAY_ROLE = "hybrid_replay"
 
 # 役割ごとに __main__ として実行する既存モジュール。
 #
@@ -52,16 +58,8 @@ WORKER_MODULES = {
     "calibrate": "calib",
     "hybrid_calibrate": "app.runners.hybrid_calibrate",
     "hybrid_measure": "app.runners.hybrid_measure",
-    # 記録した混成の計測を流し直す（カメラも Pixel も使わない）。hybrid_measure とは別の role にして、
-    # 環境変数の有無で実機と再生が入れ替わらないようにする（REPLAY_ENV_PREFIX）
-    "hybrid_replay": "app.runners.hybrid_replay",
+    REPLAY_ROLE: "app.runners.hybrid_replay",
 }
-
-# 再生の子（role hybrid_replay）だけが読む環境変数の頭（app.hybrid.replay.REPLAY_ENV と、その _FROM・_TO・_SPEED）。
-# ほかの子へは渡さない。親のシェルに残った export HYBRID_REPLAY=... で本番の計測が黙って再生になるのを防ぐ。
-# app.hybrid.replay は numpy などを読むので、ここでは名前だけを持つ（tests/test_hybrid_gui.py）。
-REPLAY_ROLE = "hybrid_replay"
-REPLAY_ENV_PREFIX = "HYBRID_REPLAY"
 
 # オフライン解析用の汎用役割。実行するモジュール名は --module で指定する。
 # 解析スクリプトは matplotlib で描画するものが多く、これも GUI 操作なので
@@ -159,14 +157,9 @@ def worker_environment(
     残った古い値を引き継がないよう、渡さないときは消す。
 
     計測の CSV は、GUI が「出力先」と表示している場所に書かせる（``OUTPUT_DIR``、config.save_dir が読む）。
-
-    ``HYBRID_REPLAY`` で始まる変数は親の環境から引き継がない。再生の子（``REPLAY_ROLE``）へは設定の値
-    （計測画面で選んだフォルダ）だけを渡し、ほかの子へは設定の値も渡さない。
     """
-    env = {name: value for name, value in os.environ.items() if not name.startswith(REPLAY_ENV_PREFIX)}
+    env = dict(os.environ)
     env.update(settings.as_env())
-    if role != REPLAY_ROLE:
-        env = {name: value for name, value in env.items() if not name.startswith(REPLAY_ENV_PREFIX)}
     env["APP_ROLE"] = role
     env[OUTPUT_DIR_ENV] = str(measurement_output_dir())
     env.pop(STOP_FILE_ENV, None)

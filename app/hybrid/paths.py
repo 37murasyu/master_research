@@ -31,6 +31,15 @@ def replay_root() -> Path:
     return hybrid_root() / "replay"
 
 
+def is_measurement_dir(path: str | Path) -> bool:
+    """流し直せる計測フォルダ（``meta.json`` のあるもの）か。
+
+    計測画面（開始を許すか）と再生の子（``app.runners.hybrid_replay``）の両方がこれで決める。別々に書くと、
+    画面は開始させたのに子が「計測フォルダではありません」で止まる食い違いが起こりうる。
+    """
+    return (Path(path) / "meta.json").is_file()
+
+
 def session_file() -> Path:
     """Pixel が覚えておく接続先の session（``app.hybrid.session``）。利用者は見ない設定側に置く。"""
     return user_config_dir(APP_NAME) / "hybrid_session.txt"

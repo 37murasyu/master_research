@@ -52,7 +52,7 @@ def test_one_rm_table_path_is_not_forced_on_the_worker():
     assert "ONE_RM_CSV" not in Settings().as_env()
 
 
-# 記録の再生（role hybrid_replay）だけが読む項目。名前 → (型, 既定値, 画面に出すか)
+# 記録の再生（role hybrid_replay）で何を流すか。子へは引数で渡る。名前 → (型, 既定値, 画面に出すか)
 REPLAY_SETTINGS = {
     "HYBRID_REPLAY": ("str", "", False),  # 計測画面の専用の欄で選ぶ
     "HYBRID_REPLAY_FROM": ("float", "0", True),
@@ -63,7 +63,7 @@ REPLAY_SETTINGS = {
 
 @pytest.mark.parametrize("name", sorted(REPLAY_SETTINGS))
 def test_replay_settings_have_defaults(name):
-    """既定値つきで全件渡るので、再生の子には親のシェルに残った値が効かない（``entry.worker_environment``）。"""
+    """既定値があるので、画面で触らなくても子の引数（``page_measure.replay_arguments``）を組み立てられる。"""
     kind, default, shown = REPLAY_SETTINGS[name]
     assert name in SCHEMA
     assert SCHEMA[name].type == kind

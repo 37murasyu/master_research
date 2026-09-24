@@ -4,8 +4,9 @@
 入力は 3 つ（USB カメラ 2 台・Mac＋Pixel・記録の再生）。Mac＋Pixel（混成）と記録の再生のときは、開始と同時に
 被験者ゲージの窓（``app.gauge.window``）を開き、子の出力のゲージの行（``WorkerRunner.gauge_frame``）をそこへ流す。
 「J の数値」スイッチはゲージ窓を開く入力のときだけ出し、実行中も切り替えられる（ゲージ窓は同じプロセスにあるので、
-その場で効く）。記録の再生は実機の計測とは別の role（``hybrid_replay``）で、再生する計測フォルダを選ぶまで
-主ボタンを押せない（押せない理由を主ボタンの左に出す）。
+その場で効く）。記録の再生は実機の計測とは別の role（``app.entry.REPLAY_ROLE``）で、再生する計測フォルダを選ぶまで
+主ボタンを押せない（押せない理由を主ボタンの左に出す）。何を流すか（計測フォルダ・範囲・速さ）は設定から組み立てた
+引数で子へ渡す（``replay_arguments``）。
 
 見出しの状態は、骨格の色付きバッジ（緑を含む）を隠し、点と文字の組（``StatusText``）で出す。
 1 つめは実行の状態（ゲージの行を出す入力なら回数も）、2 つめは混成の実行中だけの Pixel 接続（再生は Pixel を
@@ -31,6 +32,7 @@ from typing import Callable
 
 from app.core.qt import QtCore, QtGui, QtWidgets
 from app.core.settings import SCHEMA, Settings, measurement_output_dir
+from app.entry import REPLAY_ROLE
 from app.gauge import fonts as gauge_fonts
 from app.gauge.protocol import GaugeFrame
 from app.gauge.window import GaugeWindow
@@ -46,17 +48,17 @@ class MeasureInput:
     """計測画面の入力 1 つぶんの事実。画面は role の文字列を比べず、すべてこれを引く。
 
     ``gauge``: 子がゲージの行を出すので、開始と同時にゲージ窓を開き、J のスイッチを出し、見出しに回数を出す。
-    ``pixel_link``: 見出しに Pixel の接続を出す。``calibration_row``: 使う校正の日時と「変更」リンクの行を出す。
+    ``pixel``: 実機の Pixel を使う。見出しに Pixel の接続を出し、使う校正（混成の校正）の日時と「変更」リンクの行を出す。
     ``output_root``: 終わった後の「出力フォルダ」リンクが開く場所（呼ぶたびに求める。試験で差し替えられるように）。
     ``replay_folder``: 再生する計測フォルダ（設定 ``HYBRID_REPLAY``）の行を出し、選ぶまで開始させない。
+    開始のときは ``replay_arguments`` を子の引数にする。
     """
 
     role: str
     label: str
     output_root: Callable[[], Path]
     gauge: bool = False
-    pixel_link: bool = False
-    calibration_row: bool = False
+    pixel: bool = False
     replay_folder: bool = False
 
 
@@ -65,11 +67,11 @@ MEASURE_INPUTS = (
     MeasureInput("realtime", "USB カメラ 2 台", output_root=lambda: measurement_output_dir()),
     MeasureInput(
         "hybrid_measure", "Mac＋Pixel", output_root=lambda: hybrid_paths.measurement_root(),
-        gauge=True, pixel_link=True, calibration_row=True,
+        gauge=True, pixel=True,
     ),
     # 記録した計測を流し直す（カメラも Pixel も使わない）。記録は本番の計測と混ざらないよう replay_root に書く
     MeasureInput(
-        "hybrid_replay", "記録の再生", output_root=lambda: hybrid_paths.replay_root(),
+        REPLAY_ROLE, "記録の再生", output_root=lambda: hybrid_paths.replay_root(),
         gauge=True, replay_folder=True,
     ),
 )
@@ -82,8 +84,10 @@ def measure_input(role: str) -> MeasureInput:
             return spec
     raise ValueError(f"計測画面の入力に無い role: {role}")
 
+# 再生する計測フォルダの設定。専用の欄（入力「記録の再生」のときの「記録」の行）で選ぶ
+_REPLAY_FOLDER = "HYBRID_REPLAY"
 # 専用の欄を置くので、入れ子の設定フォームには並べない項目
-_DEDICATED_SETTINGS = frozenset({"SUBJECT_ID", "BODY_MASS_KG", "HYBRID_REPLAY"})
+_DEDICATED_SETTINGS = frozenset({"SUBJECT_ID", "BODY_MASS_KG", _REPLAY_FOLDER})
 # 混成の校正のフォルダ名の書式（校正を保存する側が datetime.now() から付ける名前）
 _CALIBRATION_DIR_FORMAT = "%Y%m%d_%H%M%S_%f"
 
@@ -105,16 +109,34 @@ def calibration_time_text() -> str:
 def replay_folder_problem(text: str) -> str | None:
     """再生する計測フォルダ（設定 ``HYBRID_REPLAY``）で開始できない理由。開始できるなら None。
 
-    子（``app.runners.hybrid_replay``）と同じく ``meta.json`` のあるフォルダを計測フォルダとみなす。
+    計測フォルダかどうかは子（``app.runners.hybrid_replay``）と同じ ``hybrid_paths.is_measurement_dir`` で決める。
     """
-    if not text.strip():
+    if not text:
         return "再生する計測フォルダを選んでください"
-    folder = Path(text.strip()).expanduser()
+    folder = Path(text).expanduser()
     if not folder.is_dir():
         return "計測フォルダがありません"
-    if not (folder / "meta.json").is_file():
+    if not hybrid_paths.is_measurement_dir(folder):
         return "計測フォルダではありません"
     return None
+
+
+def replay_arguments(settings: Settings) -> list[str]:
+    """再生の子（``app.runners.hybrid_replay``）の引数。端末から流すときと同じ形にする。
+
+    何を流すかは引数だけで子へ渡す（子は環境変数から読まない）。計測フォルダは絶対パスにする。子は凍結時に
+    作業場所へ移るので、相対パスのままだと画面で確かめたフォルダと子が開くフォルダがずれる。
+    ``HYBRID_REPLAY_TO`` が空なら ``--to`` を付けない（終わりまで）。数でなければ子が理由を出して止まる。
+    """
+    arguments = [
+        str(Path(settings.get(_REPLAY_FOLDER)).expanduser().absolute()),
+        "--from", str(settings.get("HYBRID_REPLAY_FROM")),
+        "--speed", str(settings.get("HYBRID_REPLAY_SPEED")),
+    ]
+    end = settings.get("HYBRID_REPLAY_TO").strip()
+    if end:
+        arguments += ["--to", end]
+    return arguments
 
 
 def _link_label(text: str, slot) -> QtWidgets.QLabel:
@@ -237,7 +259,6 @@ class MeasurePage(RunnerPage):
         self._input_radios = [QtWidgets.QRadioButton(spec.label) for spec in MEASURE_INPUTS]
         for button_id, button in enumerate(self._input_radios):
             self._input_group.addButton(button, button_id)
-        self._input_usb, self._input_hybrid, self._input_replay = self._input_radios
         self._input_group.button(MEASURE_INPUTS.index(self._input)).setChecked(True)
         self._input_group.idToggled.connect(self._on_input_toggled)
         # 3 つを横に並べると左の欄の既定の幅（360）を超えて切れるので、縦に並べる
@@ -266,7 +287,7 @@ class MeasurePage(RunnerPage):
         self._calibration_row = _hrow(self._calibration_time, self._calibration_link)
 
         # 再生する計測フォルダ。再生のときだけ出す。空・無いフォルダのうちは主ボタンを押せない
-        self._replay_edit = QtWidgets.QLineEdit(str(self._settings.get("HYBRID_REPLAY") or ""))
+        self._replay_edit = QtWidgets.QLineEdit(str(self._settings.get(_REPLAY_FOLDER) or ""))
         self._replay_edit.textChanged.connect(self._on_replay_folder_edited)
         self._replay_choose = QtWidgets.QPushButton("選ぶ…")
         self._replay_choose.clicked.connect(self._choose_replay_folder)
@@ -321,7 +342,8 @@ class MeasurePage(RunnerPage):
     def _start(self) -> None:
         spec = self._input
         self._last_frame = None
-        if not self._runner.start(self._settings):
+        arguments = replay_arguments(self._settings) if spec.replay_folder else None
+        if not self._runner.start(self._settings, arguments):
             return  # 起動に失敗したときは窓を開かない
         self._run_input = spec
         # start の中で出た "running" の時点では _run_input が前回のままなので、ここで出し直す
@@ -360,26 +382,22 @@ class MeasurePage(RunnerPage):
         """入力によって出し入れするもの（J のスイッチ・校正の行・再生の計測フォルダの行。R15-01）。"""
         spec = self._input
         self._joules_switch.setVisible(spec.gauge)
-        self._rows.setRowVisible(self._calibration_row, spec.calibration_row)
+        self._rows.setRowVisible(self._calibration_row, spec.pixel)
         self._rows.setRowVisible(self._replay_row, spec.replay_folder)
         self._refresh_main_button()
 
     def _on_replay_folder_edited(self, text: str) -> None:
-        self._settings.set("HYBRID_REPLAY", text.strip())
+        # 前後の空白はここで落とす。ほかは設定の値（落とした後）を読む
+        self._settings.set(_REPLAY_FOLDER, text.strip())
         self._refresh_main_button()
 
     def _choose_replay_folder(self) -> None:
-        current = Path(self._replay_edit.text().strip()).expanduser()
-        start = current if self._replay_edit.text().strip() and current.is_dir() else hybrid_paths.measurement_root()
+        folder = self._settings.get(_REPLAY_FOLDER)
+        current = Path(folder).expanduser()
+        start = current if folder and current.is_dir() else hybrid_paths.measurement_root()
         chosen = QtWidgets.QFileDialog.getExistingDirectory(self, "再生する計測フォルダ", str(start))
         if chosen:  # 取り消しは空の文字
             self._replay_edit.setText(chosen)
-
-    def _start_problem(self) -> str | None:
-        """今の入力で開始できない理由。開始できるなら None。"""
-        if self._input.replay_folder:
-            return replay_folder_problem(self._replay_edit.text())
-        return None
 
     def _open_output_folder(self, _href: str) -> None:
         spec = self._run_input or self._input
@@ -395,7 +413,9 @@ class MeasurePage(RunnerPage):
 
     def _refresh_main_button(self) -> None:
         """主ボタンを押せるか。実行中は常に押せる（停止）。止まっているときは開始できない理由があれば押せない。"""
-        problem = None if self._header_phase == "running" else self._start_problem()
+        problem = None
+        if self._header_phase != "running" and self._input.replay_folder:
+            problem = replay_folder_problem(self._settings.get(_REPLAY_FOLDER))
         self._main_button.setEnabled(problem is None)
         self._start_blocked.setText(problem or "")
         self._start_blocked.setVisible(problem is not None)
@@ -419,7 +439,7 @@ class MeasurePage(RunnerPage):
         # 回数は、ゲージの見出しと同じく「完了した回数＋1」。つながる前は出さない
         rep = self._last_frame.rep + 1 if connected else None
         self._run_status.set_status(self._header_phase, rep=rep)
-        show_link = spec is not None and spec.pixel_link
+        show_link = spec is not None and spec.pixel
         self._link_status.setVisible(show_link)
         if show_link:
             self._link_status.set_link(connected)

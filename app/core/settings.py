@@ -260,9 +260,9 @@ CURATED: dict[str, dict[str, Any]] = {
         "group": "被験者",
         "description": "体重 [kg]。",
     },
-    # --- 記録の再生（role hybrid_replay）だけが読む項目 ---------------------
-    # 既定値つきで全件渡すので、再生の子には親のシェルに残った値が効かない。ほかの子へは
-    # app.entry.worker_environment が渡さない（HYBRID_REPLAY で始まる名前をまとめて落とす）。
+    # --- 記録の再生（role hybrid_replay）で何を流すか -----------------------
+    # 次回も同じフォルダ・範囲・速さで流せるよう設定に覚えておく。子へは環境変数ではなく引数で渡す
+    # （計測画面が app.shell.page_measure.replay_arguments で組み立てる。子は環境変数から読まない）。
     # フォルダは計測画面の専用の欄（入力「記録の再生」）で選ぶので、設定フォームには出さない。
     "HYBRID_REPLAY": {
         "type": "str",
