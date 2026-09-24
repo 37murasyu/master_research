@@ -8,8 +8,9 @@ EKF の較正（``tune_ekf``）にかける生 3D も、回ごとのスコア（
 
 - ``kpts3d_raw_<stamp>.csv``: EKF の手前の 3D（``RawCaptureWriter`` の形）。1/30 s の格子で、抜けた格子は NaN の行
   （行を詰めると dt 一定の前提が崩れて ``tune_ekf`` の推定が狂う）
-- ``cycle_work_<stamp>.csv``: 既存の ``work_j``（符号付き W±）の後ろに W+・W−・W_1RM・スコア
-- ``frames_<stamp>.csv``: 既存の列の後ろに格子の番号・dt・関所・高さ・回
+- ``cycle_work_<stamp>.csv``: 既存の ``work_j``（符号付き W±）の後ろに W+・W−・W_1RM・スコア・status（確定した回は
+  closed、止めたときに開いたままだった回は末尾に unfinished）
+- ``frames_<stamp>.csv``: 既存の列の後ろに格子の番号・dt・関所・高さ・回・腕の長さの安全策・回の区切りの基準の高さ
 - ``meta.json``: 被験者・1RM・体重・前腕長・帯・重力・EKF の出どころ・関所
 """
 
@@ -63,7 +64,8 @@ class TestCycleWork:
     def test_the_columns_are_appended(self, tmp_path):
         session, _ = _session(tmp_path)
         table = pd.read_csv(_file(session, "cycle_work"))
-        assert list(table.columns) == ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score"]
+        assert list(table.columns) == ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score",
+                                       "status"]
         elbow = table[table.joint == "elbow_R"].iloc[0]
         assert elbow.work_j == pytest.approx(elbow.work_pos_j + elbow.work_neg_j)
         assert elbow.work_pos_j == pytest.approx(22.0, rel=0.25)
@@ -74,12 +76,66 @@ class TestCycleWork:
         assert np.isnan(shoulder.w1rm_j) and np.isnan(shoulder.score), "帯が無ければ空"
 
 
+class TestUnfinishedRep:
+    """止めたときに開いたままだった回を cycle_work に「未完」（status=unfinished）で残す（2026-09-24 のレビュー）。
+
+    かつては確定した回しか書かず、最後の押し上げの途中で止めるとその回の仕事が記録のどこにも残らなかった。基準が
+    ずれて回が閉じなくなったときも（W+ 231.7 J の開いた回）、記録からは何が起きたか分からなかった。
+    """
+
+    def _stopped_mid_rep(self, tmp_path):
+        """押し上げ 2 回のうち、2 回目の上げの頂点で止めた計測フォルダ。"""
+        cal = calibration(tmp_path)
+        session = MeasurementSession(
+            cal, root=tmp_path / "measure",
+            config=MeasurementConfig(body_mass_kg=65.0, one_rm=ONE_RM, subject_id="00"))
+        session.on_landmarks(LandmarkFrame("cam1", 0, 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
+        motion = PushUp(reps=2)
+        top = motion.rest_s + motion.period_s + motion.rise_s + 0.2
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            session.on_pairs(calibrated_pairs(motion)[: int(top * 30)])
+        session.stop_reason = "stop_request"
+        session.close()
+        return session
+
+    def test_the_open_rep_is_kept_as_unfinished_rows(self, tmp_path):
+        session = self._stopped_mid_rep(tmp_path)
+        table = pd.read_csv(_file(session, "cycle_work"))
+        assert list(table.status.unique()) == ["closed", "unfinished"]
+        closed, open_ = table[table.status == "closed"], table[table.status == "unfinished"]
+        assert sorted(closed.joint) == sorted(open_.joint) and len(open_) == 6, "部位ごとに 1 行"
+        elbow = open_[open_.joint == "elbow_R"].iloc[0]
+        assert elbow.work_pos_j == pytest.approx(22.0, rel=0.3), "上げの仕事は積んである"
+        assert elbow.work_j == pytest.approx(elbow.work_pos_j + elbow.work_neg_j)
+        assert elbow.score == pytest.approx(elbow.work_pos_j / elbow.w1rm_j)
+        frames = pd.read_csv(_file(session, "frames"))
+        assert elbow.frame == frames.frame.iloc[-1] and elbow.t_ns == frames.t_ns.iloc[-1]
+        assert frames.cycle_detected.sum() == 1, "未完の回は確定した回に数えない"
+        meta = json.loads((session.directory / "meta.json").read_text(encoding="utf-8"))
+        assert meta["reps"] == 1
+        unfinished = meta["unfinished_rep"]
+        assert unfinished["parts"]["elbow_R"]["work_pos_j"] == pytest.approx(elbow.work_pos_j)
+        assert unfinished["max_lift_m"] == pytest.approx(0.13, abs=0.01)
+
+    def test_nothing_is_added_when_every_rep_closed(self, tmp_path):
+        session, _ = _session(tmp_path)
+        table = pd.read_csv(_file(session, "cycle_work"))
+        assert (table.status == "closed").all()
+        meta = json.loads((session.directory / "meta.json").read_text(encoding="utf-8"))
+        assert meta["unfinished_rep"] is None
+
+
 class TestFrames:
     def test_the_columns_are_appended(self, tmp_path):
         session, _ = _session(tmp_path, drop={50, 51, 52, 53})
         table = pd.read_csv(_file(session, "frames"))
         assert list(table.columns) == ["frame", "t_ns", "t_s", "cycle_detected", "grid_index", "dt_s", "dyn_active",
-                                       "height_m", "rep", "arm_ok_L", "arm_ok_R"]
+                                       "height_m", "rep", "arm_ok_L", "arm_ok_R", "baseline_m"]
+        meta = json.loads((session.directory / "meta.json").read_text(encoding="utf-8"))
+        assert table.baseline_m.dropna().iloc[0] == pytest.approx(meta["baseline_height_m"])
+        assert meta["rep_baseline"]["initial_m"] == pytest.approx(meta["baseline_height_m"])
+        assert meta["rep_baseline"]["final_m"] == pytest.approx(table.baseline_m.iloc[-1])
         assert 50 not in set(table.grid_index) and 54 in set(table.grid_index)
         assert table.loc[table.grid_index == 54, "dt_s"].item() == pytest.approx(5 / 30, rel=1e-6)
         assert table.dyn_active.sum() > 20 and table.rep.iloc[-1] == 1

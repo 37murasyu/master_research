@@ -13,6 +13,8 @@ W_pos が 1 回 72〜160 J になって W_0.85 = 56.9 J を超え、過負荷と
 - 閉じる: 開いてから 0.3 s 以上経ち、基準 + 1 cm 以内に 3 フレーム続いたとき。30 s を超えても閉じる
 - 開いている間の最大の持ち上げが 3 cm 未満なら、回ではなかったとして捨てる（DISCARDED）
 - 高さが NaN のフレームは状態を変えない
+- 基準は座面の高さを追う（閉じていて静止した直近 2 s の中央値。5 mm 以内のずれは追わない）。基準より高く着座して
+  静止したら閉じる（``TestBaselineFollowsTheSeat``）
 """
 
 from __future__ import annotations
@@ -183,3 +185,91 @@ class TestRobustness:
         c = RepConfig()
         assert (c.open_rise_m, c.open_speed_mps, c.close_band_m, c.close_frames) == (0.02, 0.10, 0.01, 3)
         assert (c.min_lift_m, c.min_open_s, c.max_open_s, c.lookback_frames) == (0.03, 0.3, 30.0, 5)
+
+
+def _landing_higher(n: int, lift: float, step: float, *, rest_s: float = 0.6) -> np.ndarray:
+    """押し上げ n 回。毎回、座面に ``step`` だけ高く着座する（座り直し。2026-09-24 のレビューの t1b）。"""
+    parts, seat = [_rest(2.0)], 0.0
+    for _ in range(n):
+        top = seat + lift
+        parts += [seat + _ramp(lift, 1.0), np.full(int(0.4 / DT), top)]
+        seat += step
+        parts += [seat + _ramp(top - seat, 1.0, up=False), np.full(int(round(rest_s / DT)), seat)]
+    parts.append(np.full(int(1.0 / DT), seat))
+    return np.concatenate(parts)
+
+
+class TestBaselineFollowsTheSeat:
+    """基準の高さは先頭の窓の中央値で固定していた（2026-09-24 のレビュー）。
+
+    座り直して肩の中点が 1.5 cm 高くなると「基準 + 1 cm 以内に 3 フレーム」が満たされず回が閉じない
+    （合成の 8 回で閉じたのは 1 回、開いた回の W+ 231.7 J で過負荷の誤表示、30 s まで閉じない）。先頭の窓で
+    体を持ち上げていると基準が高く、以後の押し上げがすべて DISCARDED になる。
+
+    関所が閉じていて速さがほぼ 0 の間の直近の高さの中央値で基準を追う（ずれが 5 mm を超えたときだけ）。
+    閉じる判定と最小の持ち上げは回を開く直前の基準に対して行い、基準より高く着座して静止したら閉じる。
+    """
+
+    @pytest.mark.parametrize("speed", ["diff", None])
+    def test_landing_15mm_higher_every_time_still_closes_every_rep(self, speed):
+        det, events, _ = _run(_landing_higher(5, 0.13, 0.015), speed=speed, noise=0.001)
+        assert _count(events, RepEvent.CLOSED) == 5
+        assert _count(events, RepEvent.DISCARDED) == 0
+        assert not det.is_open
+        assert det.baseline_m == pytest.approx(BASE + 5 * 0.015, abs=0.003), "基準が座面に追いついていない"
+
+    def test_each_rep_closes_before_the_next_one_starts(self):
+        """着座して静止したら閉じる。次の押し上げを同じ回に入れない（回ごとの仕事が 2 回分にならない）。"""
+        rise = _landing_higher(3, 0.13, 0.015)
+        _, events, height = _run(rise)
+        opened = [i for i, e in enumerate(events) if e is RepEvent.OPENED]
+        closed = [i for i, e in enumerate(events) if e is RepEvent.CLOSED]
+        assert len(opened) == len(closed) == 3
+        assert all(c < o for c, o in zip(closed, opened[1:]))
+
+    def test_a_high_start_follows_down_to_the_seat(self):
+        """先頭の窓で体を持ち上げていた（基準が 13 cm 高い）。座って静止すれば基準が座面に下り、押し上げを数える。"""
+        det = RepDetector(BASE + 0.13)
+        rise = _pushups(3, 0.13)
+        heights = BASE + rise
+        events = []
+        prev = heights[0]
+        for h in heights:
+            events.append(det.update(h, (h - prev) / DT, DT))
+            prev = h
+        assert _count(events, RepEvent.CLOSED) == 3
+        assert _count(events, RepEvent.DISCARDED) == 0
+        assert det.baseline_m == pytest.approx(BASE, abs=0.002)
+
+    def test_sitting_with_noise_keeps_the_baseline(self):
+        """雑音（σ 3 mm）だけなら基準は動かない（ずれが 5 mm 以内は追わない）。回の区切りは今までどおり。"""
+        det, events, _ = _run(_rest(60.0), noise=0.003)
+        assert det.baseline_m == BASE
+        det, events, _ = _run(_pushups(3, 0.13), noise=0.001)
+        assert det.baseline_m == BASE
+        assert _count(events, RepEvent.CLOSED) == 3
+
+    def test_the_baseline_is_frozen_while_open(self):
+        """開いている間は基準を動かさない（閉じる判定と最小の持ち上げは開く直前の基準に対して）。"""
+        det = RepDetector(BASE)
+        assert det.update(BASE + 0.05, 0.0, DT) is RepEvent.OPENED
+        for _ in range(90):
+            det.update(BASE + 0.05, 0.0, DT)
+        assert det.is_open and det.baseline_m == BASE
+
+    def test_a_still_hold_at_the_top_does_not_close(self):
+        """持ち上げたまま静止（除圧の保持）しても閉じない。閉じるのは座面の近く（開く高さ未満）に戻ってから。"""
+        rise = np.concatenate([_rest(1.0), _ramp(0.10, 0.8), np.full(int(10.0 / DT), 0.10),
+                               _ramp(0.10, 0.8, up=False), _rest(1.0)])
+        _, events, height = _run(rise)
+        closed = events.index(RepEvent.CLOSED)
+        assert height[closed] - BASE < 0.02
+        assert _count(events, RepEvent.CLOSED) == 1
+
+    def test_a_small_bob_that_lands_higher_is_discarded(self):
+        """1.5 cm の速い揺れで 1.5 cm 高く座り直した。回に数えず（DISCARDED）、30 s 開いたままにしない。"""
+        rise = np.concatenate([_rest(1.0), _ramp(0.015, 0.12), _rest(3.0) + 0.015])
+        _, events, _ = _run(rise)
+        assert _count(events, RepEvent.OPENED) == 1
+        assert _count(events, RepEvent.DISCARDED) == 1
+        assert events.index(RepEvent.DISCARDED) * DT < 2.0

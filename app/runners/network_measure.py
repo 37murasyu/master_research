@@ -29,7 +29,8 @@
 混成だけのもの（2026-09-24、USB 経路は触らない）:
     - 回の区切りと力学の関所は ``app.hybrid.rep_detector.RepDetector``（肩の中点の重力の上向きへの射影＝高さ）。
       USB と同じ ``PushCycleDetector``（左肩の y の往復）は、実行時の座標の y が奥行きなので、手を固定して体幹が
-      上下するだけの押し上げで 1 回も閉じなかった
+      上下するだけの押し上げで 1 回も閉じなかった。基準の高さは先頭の窓の中央値から始めて座面の高さを追う
+    - 止めたときに開いたままの回は ``summary`` の ``unfinished_rep`` に残し、記録器が cycle_work に「未完」で書く
     - トルクと仕事率は関所によらず毎フレーム計算して記録し、仕事とゲージには関所が開いている間だけ積む
       （座っている間の雑音の仕事を積まない。``MeasurementConfig.dyn_gate``）
     - 仕事はフレームごとの dt で積む（``app.hybrid.rep_work``）
@@ -237,6 +238,8 @@ class FrameResult:
     dyn_active: bool = False
     # 高さ = 肩の中点・上向き u [m]（窓が閉じる前・肩が無いフレームは NaN）
     height_m: float = float("nan")
+    # このフレームの後の回の区切りの基準の高さ [m]（座面の高さを追う。窓が閉じる前は NaN）
+    baseline_m: float = float("nan")
     # このフレームが属する回の番号（0 始まり＝それまでに確定した回の数）
     rep: int = 0
     # 腕の長さの安全策（L・R）。偽ならその腕の仕事率を回とゲージに積まなかった
@@ -531,13 +534,40 @@ class NetworkMeasurement:
             "dyn_gate": self.config.dyn_gate,
             "demo": self._demo is not None,
             "baseline_height_m": self.baseline_height_m,
+            "rep_baseline": self._rep_baseline(),
             "reps": self.cycle_count,
+            "unfinished_rep": self.unfinished_rep(),
             "discarded_reps": self.discarded_reps,
             "dynamics_restarts": self.dynamics_restarts,
             "arm_length_guard": {"tolerance": self.config.arm_length_tolerance,
                                  "rejected_frames": dict(self.arm_guard_rejected)},
             "timing": self.timing(),
         }
+
+    def _rep_baseline(self) -> dict | None:
+        """回の区切りの基準の高さ（先頭の窓の値・最後の値・置き換えた回数）。窓が閉じる前は None。"""
+        detector = self.rep_detector
+        if detector is None:
+            return None
+        return {"initial_m": detector.initial_baseline_m, "final_m": detector.baseline_m,
+                "updates": detector.baseline_updates}
+
+    def unfinished_rep(self) -> dict | None:
+        """止めた時点で開いたままの回（関所が開いていて、まだ確定していない）。無ければ None。
+
+        meta.json の ``unfinished_rep`` に残し、記録器（``app.hybrid.recorder.Recorder.close``）が cycle_work の末尾に
+        「未完」（status=unfinished）の行を書く。frame・t_ns は最後に処理したフレーム。回の数（``reps``）には数えない。
+        """
+        detector = self.rep_detector
+        if detector is None or not detector.is_open or self.frame_index == 0:
+            return None
+        parts = {}
+        for key, work in self.rep_work.work().items():
+            band = self.bands.get(key)
+            parts[key] = {"work_j": work.net, "work_pos_j": work.pos, "work_neg_j": work.neg,
+                          "w1rm_j": None if band is None else band.w1rm}
+        return {"frame": self.frame_index - 1, "t_ns": self._prev_t_ns, "open_s": detector.open_s,
+                "max_lift_m": detector.max_lift_m, "parts": parts}
 
     def ekf_provenance(self) -> dict:
         """EKF の出どころ（meta.json・サイドカー用）。"""
@@ -784,6 +814,7 @@ class NetworkMeasurement:
         if detector is not None:
             speed = self._height(velocity) if velocity is not None else None
             event = detector.update(result.height_m, speed, dt)
+            result.baseline_m = detector.baseline_m
         if event is RepEvent.OPENED and gate:
             self.rep_work.release()
         is_open = (not gate) or (detector is not None and detector.is_open) \

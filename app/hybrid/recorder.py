@@ -19,14 +19,23 @@ if TYPE_CHECKING:
     from app.runners.network_measure import FrameResult
 
 
-def _cycle_columns(result, key):
+# cycle_work の status: 確定した回と、止めたときに開いたままだった回（未完）
+CLOSED = "closed"
+UNFINISHED = "unfinished"
+
+
+def _work_columns(pos, neg, w1rm):
     """cycle_work の W+・W−・W_1RM・スコア。無いものは空欄。"""
-    w1rm = result.cycle_w1rm.get(key)
+    score = pos / w1rm if w1rm else ""
+    return [pos, neg, "" if w1rm is None else w1rm, score]
+
+
+def _cycle_columns(result, key):
+    """確定した回の W+・W−・W_1RM・スコア。無いものは空欄。"""
     work = result.cycle_parts.get(key)
     if work is None:
         return ["", "", "", ""]
-    score = work.pos / w1rm if w1rm else ""
-    return [work.pos, work.neg, "" if w1rm is None else w1rm, score]
+    return _work_columns(work.pos, work.neg, result.cycle_w1rm.get(key))
 
 
 class Recorder:
@@ -94,9 +103,10 @@ class Recorder:
                 for axis in "xyz"
             ],
         )
-        # 既存の列の後ろに: 同期バッファの格子の番号・前の組からの dt・関所・高さ・回の番号・腕の長さの安全策
+        # 既存の列の後ろに: 同期バッファの格子の番号・前の組からの dt・関所・高さ・回の番号・腕の長さの安全策・
+        # 回の区切りの基準の高さ（座面の高さを追う。height_m − baseline_m が持ち上げ）
         self.times = writer("frames", ["frame", "t_ns", "t_s", "cycle_detected", "grid_index", "dt_s",
-                                       "dyn_active", "height_m", "rep", "arm_ok_L", "arm_ok_R"])
+                                       "dyn_active", "height_m", "rep", "arm_ok_L", "arm_ok_R", "baseline_m"])
         self.raw = writer(
             "landmarks2d",
             [
@@ -113,8 +123,10 @@ class Recorder:
             ],
         )
         self.torques = writer("local_torque", ["frame", "t_ns", "joint", "x", "y", "z"])
-        # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）
-        self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score"])
+        # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）。
+        # status は closed（確定した回）か unfinished（止めたときに開いたままだった回。close で末尾に書く）
+        self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score",
+                                          "status"])
         # ゲージに出した値（今の回の W+ [J]）。毎フレーム 1 行。帯と定義は閉じるときに .json へ
         self._gauge_parts = PART_NAMES
         self._gauge_path = self.directory / f"gauge_energy_{stamp}.csv"
@@ -234,6 +246,7 @@ class Recorder:
                 result.rep,
                 int(arm_ok.get("L", True)),
                 int(arm_ok.get("R", True)),
+                result.baseline_m,
             ]
         )
         self.torques.writerows(
@@ -241,7 +254,7 @@ class Recorder:
             for key, value in result.local_torques.items()
         )
         self.work.writerows(
-            [self.frames, result.t_ns, key, value, *_cycle_columns(result, key)]
+            [self.frames, result.t_ns, key, value, *_cycle_columns(result, key), CLOSED]
             for key, value in result.cycle_work_j.items()
         )
         gauge = result.gauge_now
@@ -271,10 +284,25 @@ class Recorder:
                 self.raw3d.flush()
             self._flushed = self.clock()
 
+    def _write_unfinished(self, rep):
+        """止めたときに開いたままだった回（``NetworkMeasurement.unfinished_rep``）を cycle_work の末尾に「未完」で書く。"""
+        if not rep:
+            return
+        self.work.writerows(
+            [rep["frame"], rep["t_ns"], key, part["work_j"],
+             *_work_columns(part["work_pos_j"], part["work_neg_j"], part.get("w1rm_j")), UNFINISHED]
+            for key, part in rep["parts"].items()
+        )
+
     def close(self, **metadata):
+        """記録を閉じる。``metadata`` は meta.json に足す（``NetworkMeasurement.summary`` など）。
+
+        ``metadata`` の ``unfinished_rep``（止めたときに開いたままだった回）は、閉じる前に cycle_work の末尾に書く。
+        """
         if self.closed:
             return
         self._check()
+        self._write_unfinished(metadata.get("unfinished_rep"))
         self.flush(force=True)
         for stream in self._streams:
             stream.close()
