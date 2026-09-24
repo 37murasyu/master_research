@@ -52,12 +52,19 @@ class GaugeWindow(QtWidgets.QWidget):
     立てない。
     """
 
-    def __init__(self, *, show_joules: bool = True, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        show_joules: bool = True,
+        font_preset: str | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        """``font_preset`` は書体の組（設定 GAUGE_FONT_PRESET の値。None・空・知らない名前は既定の組）。"""
         super().__init__(parent, QtCore.Qt.Window)
         self.setWindowTitle(WINDOW_TITLE)
         self.setAttribute(QtCore.Qt.WA_QuitOnClose, False)
 
-        self._gauge = GaugeWidget(show_joules=show_joules)
+        self._gauge = GaugeWidget(show_joules=show_joules, font_preset=font_preset)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -80,15 +87,25 @@ class GaugeWindow(QtWidgets.QWidget):
     def finish(self, exit_code: int) -> None:
         self._gauge.finish(exit_code)
 
-    def begin(self, *, show_joules: bool, avoid_screen: QtGui.QScreen | None = None) -> None:
+    def begin(
+        self,
+        *,
+        show_joules: bool,
+        font_preset: str | None = None,
+        avoid_screen: QtGui.QScreen | None = None,
+    ) -> None:
         """次の計測の前に呼ぶ。まっさらな状態に戻し、J の表示を反映して画面に出す。
 
         ``GaugeWidget.reset()`` は J 表示の有無を変えないので、ここで
         ``reset`` の直後に ``set_show_joules`` を呼び、呼び出し側が指定した
         値で上書きする（widget タスクの docstring に書いた前提どおり）。
+        ``font_preset``（設定 GAUGE_FONT_PRESET の値）を渡せば書体の組もここで
+        変える。``None`` なら今の組のまま。
         """
         self._gauge.reset()
         self._gauge.set_show_joules(show_joules)
+        if font_preset is not None:
+            self._gauge.set_font_preset(font_preset)
         self.present(avoid_screen)
 
     def present(self, avoid_screen: QtGui.QScreen | None = None) -> None:

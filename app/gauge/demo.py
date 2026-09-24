@@ -230,9 +230,9 @@ def _cmd_snapshot(directory: str, size: str, fonts: str | None = None) -> int:
     for preset in presets:
         out_dir = Path(directory) / preset if fonts == "all" else Path(directory)
         out_dir.mkdir(parents=True, exist_ok=True)
-        gauge_fonts.set_preset(preset)
+        font_set = gauge_fonts.font_set(preset)
         for name, state in SCENARIOS.items():
-            image = render_image(state, w, h)
+            image = render_image(state, w, h, font_set)
             image.save(str(out_dir / f"{name}.png"))
 
     return 0
@@ -342,12 +342,12 @@ def _live_frames() -> list[GaugeFrame]:
     return frames
 
 
-def _cmd_live() -> int:
+def _cmd_live(font_preset: str | None = None) -> int:
     from app.core.qt import QtCore, QtWidgets
     from app.gauge.window import GaugeWindow
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    window = GaugeWindow(show_joules=True)
+    window = GaugeWindow(show_joules=True, font_preset=font_preset)
     window.begin(show_joules=True)
 
     frames = _live_frames()
@@ -404,11 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_emit(count=args.count, interval=args.interval, exit_code=args.exit_code)
     if args.snapshot:
         return _cmd_snapshot(args.snapshot, args.size, args.fonts)
-    if args.fonts:
-        from app.gauge import fonts as gauge_fonts
-
-        gauge_fonts.set_preset(args.fonts)
-    return _cmd_live()
+    return _cmd_live(args.fonts)
 
 
 if __name__ == "__main__":
