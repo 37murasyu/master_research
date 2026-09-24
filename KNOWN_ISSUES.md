@@ -48,6 +48,8 @@ EKF の自己チューニングは `docs/superpowers/specs/2026-09-08-ekf-self-t
 
 ### 実機で行う
 
+**Mac での実機検証の全体のチェックリストは `docs/mac_field_checklist.md`**（下の 3 つと、画面・置き方・EKF 較正・任意の確認を 1 か所に）。
+
 手順は、USB カメラ 2 台なら `docs/usb_stereo_verification.md`、実際の構成の Mac＋Pixel 7a（混成ステレオ）なら
 `docs/hybrid_verification.md`（道具）と `docs/hybrid_field_run.md`（当日の手順・記録シート。先に置き方を直す。§6-10）。どちらも `tools/verify_run.py check` で確かめる（混成の計測フォルダは自動で見分ける）。
 USB は受け取った被験者 7 の動画の再生で、混成は模擬 Pixel で試走した（下の各節）。実機でしか確かめられないのは次の 3 つ。
