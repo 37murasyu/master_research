@@ -287,6 +287,33 @@ class TestPhoneLink:
             listener.close()
 
 
+def test_capture_device_names_the_phone_that_sent_each_image():
+    """校正の途中で同じ QR の別の Pixel が席を奪うと、以後の画像はその端末のもの。
+
+    状態（``status().devices``）はループの刻みごとの写しなので、席が替わった直後の画像を古い端末のものと
+    取り違えうる。画像を受け取った時点の送り手を、画像と一緒に渡す。
+    """
+    link = PhoneLink(host="127.0.0.1", port=0, capture_mode=CALIBRATION)
+    link.start()
+    try:
+        first = MockPhone(link.url, "cam1", session=link.session, device_id="pixel-A",
+                          capture_fn=synthetic_capture)
+        first_thread = _run_phone(first, duration=4.0)
+        assert _wait_until(lambda: link.take_capture() is not None), "最初の端末の画像が届かない"
+        assert link.capture_device.device_id == "pixel-A"
+
+        second = MockPhone(link.url, "cam1", session=link.session, device_id="pixel-B",
+                           capture_fn=synthetic_capture)
+        second_thread = _run_phone(second, duration=2.0)
+        assert _wait_until(
+            lambda: link.take_capture() is not None and link.capture_device.device_id == "pixel-B"
+        ), "席を奪った端末の画像を、その端末のものとして渡していない"
+        second_thread.join(timeout=10)
+        first_thread.join(timeout=10)  # 席を譲って切られるので、こちらの例外は見ない
+    finally:
+        link.stop()
+
+
 def test_mode_switch_does_not_use_delayed_preview_for_calibration():
     link = PhoneLink(capture_mode=PREVIEW)
     old = link._scheduler.next_request()

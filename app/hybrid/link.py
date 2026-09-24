@@ -229,6 +229,9 @@ class PhoneLink:
         self._lock = threading.Lock()
         self._recent: collections.deque[p.LandmarkFrame] = collections.deque(maxlen=history)
         self._latest_capture: p.CalibrationFrame | None = None
+        # 画像を送った端末の名乗り（受け取った時点のもの）と、take_capture が最後に返した画像の送り手
+        self._latest_capture_device: p.Hello | None = None
+        self._capture_device: p.Hello | None = None
         self._capture_taken = True
         self._captures_received = 0
         self._callback_errors = 0
@@ -302,16 +305,29 @@ class PhoneLink:
         if mode != self._scheduler.mode:
             with self._lock:
                 self._latest_capture = None
+                self._latest_capture_device = None
                 self._capture_taken = True
         self._scheduler.set_mode(mode)
 
     def take_capture(self) -> p.CalibrationFrame | None:
-        """前回から新しく届いた画像があれば返す。無ければ None。"""
+        """前回から新しく届いた画像があれば返す。無ければ None。送った端末は ``capture_device``。"""
         with self._lock:
             if self._capture_taken:
                 return None
             self._capture_taken = True
+            self._capture_device = self._latest_capture_device
             return self._latest_capture
+
+    @property
+    def capture_device(self) -> p.Hello | None:
+        """``take_capture`` が最後に返した画像を送った端末の名乗り（画像を受け取った時点のもの）。
+
+        同じ QR を読んだ別の Pixel が席を奪うと、以後の画像はその端末から届く。``status().devices`` は
+        ループの刻みごとの写しなので、席が替わった直後の画像を前の端末のものと取り違えうる。校正は
+        画像ごとにこれを見て、別の端末の画像を混ぜない。
+        """
+        with self._lock:
+            return self._capture_device
 
     def nearest_remote(self, t_ns: int, tolerance_ns: int) -> p.LandmarkFrame | None:
         """撮影時刻が ``t_ns`` に最も近い端末の点。``tolerance_ns`` より離れていれば None。"""
@@ -431,9 +447,13 @@ class PhoneLink:
         self._scheduler.complete(frame.id)
         if not self._scheduler.accepts_capture(frame.id):
             return
+        # 画像を使えるのは名乗った接続のうち席を持つ 1 本だけ（require_hello と後勝ち）なので、今この役割を
+        # 持つ端末が送り手。受け取った時点で控える（後で見ると、その間に席が替わっているかもしれない）
+        sender = self._server.devices.get(self.remote_role)
         with self._lock:
             # 時間切れの後に遅れて届いた画像も、画像としては正しいので使う
             self._latest_capture = frame
+            self._latest_capture_device = sender
             self._capture_taken = False
             self._captures_received += 1
 

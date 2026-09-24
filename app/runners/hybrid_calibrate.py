@@ -236,9 +236,19 @@ def main(argv=None):
                             session.local_image,
                             corners=session.local_corners,
                         )
-                        if capture is not None:
+                        # この画像を送った Pixel（受け取った時点の名乗り）
+                        hello = link.capture_device if capture is not None else None
+                        if capture is not None and cameras and (
+                            hello is None or hello.device_id != cameras[1]["device_id"]
+                        ):
+                            # 同じ QR を読んだ別の Pixel が席を奪った。混ぜると 2 台の画像を 1 台ぶんとして解く
+                            restart(
+                                f"盤集めの途中で Pixel が替わりました（{cameras[1]['device_id']} → "
+                                f"{hello.device_id if hello else '不明'}）。別の端末の画像を混ぜないよう、"
+                                "集めた盤を捨てて最初からやり直します（Space で盤集めを再開）"
+                            )
+                        elif capture is not None:
                             if not cameras:
-                                hello = link.status().devices.get("cam1")
                                 if hello is None or not hello.device_id:
                                     print(
                                         "端末 ID を取得できません。新しい release 版で QR を読み直してください"
