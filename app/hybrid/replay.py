@@ -7,7 +7,8 @@
     accept_frame → SyncBuffer.push → on_landmarks → SyncBuffer.drain → on_pairs
 
 Recorder は作ったスレッドからしか書けないので、``replay`` を呼んだスレッドが記録を開いて閉じる。
-GUI から使うときは環境変数 ``HYBRID_REPLAY`` に計測フォルダを入れて計測を開始する（``app.runners.hybrid_replay``）。
+入口は ``app.runners.hybrid_replay``（GUI からは独立の role ``hybrid_replay`` で起動し、計測フォルダは設定
+``HYBRID_REPLAY`` で渡す。この環境変数は再生の子にしか渡らない。``app.entry.worker_environment``）。
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from app.runners.network_measure import MeasurementConfig
 
 __all__ = ["REPLAY_ENV", "merged_frames", "replay"]
 
-# GUI の計測（子プロセス hybrid_measure）を再生に切り替える環境変数。値は計測フォルダ
+# 再生する計測フォルダ（再生の子 hybrid_replay だけに渡る。app.entry.REPLAY_ENV_PREFIX）
 REPLAY_ENV = "HYBRID_REPLAY"
 # 記録を 1 秒ごとに書き出す本番（on_tick は 50 ms ごと）に合わせた間隔
 _FLUSH_INTERVAL_S = 0.05
