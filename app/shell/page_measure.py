@@ -238,7 +238,12 @@ class MeasurePage(RunnerPage):
         self._input_usb, self._input_hybrid, self._input_replay = self._input_radios
         self._input_group.button(MEASURE_INPUTS.index(self._input)).setChecked(True)
         self._input_group.idToggled.connect(self._on_input_toggled)
-        inputs = _hrow(*self._input_radios)
+        # 3 つを横に並べると左の欄の既定の幅（360）を超えて切れるので、縦に並べる
+        inputs = QtWidgets.QWidget()
+        inputs_layout = QtWidgets.QVBoxLayout(inputs)
+        inputs_layout.setContentsMargins(0, 0, 0, 0)
+        for button in self._input_radios:
+            inputs_layout.addWidget(button)
 
         self._subject_edit = QtWidgets.QLineEdit(str(self._settings.get("SUBJECT_ID") or ""))
         self._subject_edit.textChanged.connect(lambda text: self._settings.set("SUBJECT_ID", text))

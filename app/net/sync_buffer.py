@@ -20,7 +20,7 @@ dt、``app.hybrid.ekf`` の EKF の dt、``app.hybrid.rep_work`` の積む dt �
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 from app.net.protocol import ROLES, LandmarkFrame, PixelCoordinates
