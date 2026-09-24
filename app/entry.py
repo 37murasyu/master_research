@@ -34,6 +34,7 @@ __all__ = [
     "resolve_module",
     "worker_command",
     "worker_environment",
+    "CHILD_OUTPUT_ENV",
     "run_worker",
     "workspace_dir",
     "ROLES",
@@ -117,6 +118,13 @@ def resolve_module(role: str, module: str | None = None) -> str:
     return resolved
 
 
+# 子の標準出力の書き方（tools/verify_run.py の再生と同じ 3 つ）。親の環境の値より優先する。
+# - 文字コード: Windows のパイプの既定（cp932）だと、本体の "✅" の print で子が UnicodeEncodeError で落ちる。
+#   PYTHONUTF8 は open() の既定も UTF-8 にする（PYTHONIOENCODING は標準入出力だけ）
+# - ためない: Python はパイプへの出力をためるので、flush しない print は子が終わるまでログに出なかった
+CHILD_OUTPUT_ENV = {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+
+
 def uses_stop_file(role: str) -> bool:
     return role in {"realtime", "hybrid_calibrate", "hybrid_measure", REPLAY_ROLE}
 
@@ -160,9 +168,13 @@ def worker_environment(
     残った古い値を引き継がないよう、渡さないときは消す。
 
     計測の CSV は、GUI が「出力先」と表示している場所に書かせる（``OUTPUT_DIR``、config.save_dir が読む）。
+
+    子の標準出力は UTF-8 で、ためずに書かせる（``CHILD_OUTPUT_ENV``）。親（``WorkerRunner``）は UTF-8 で読み、
+    ログを逐次出す。
     """
     env = {name: value for name, value in os.environ.items() if name not in SCHEMA}
     env.update(settings.as_env())
+    env.update(CHILD_OUTPUT_ENV)
     env["APP_ROLE"] = role
     env[OUTPUT_DIR_ENV] = str(measurement_output_dir())
     env.pop(STOP_FILE_ENV, None)

@@ -94,6 +94,14 @@ class TestWorkerEnvironment:
         monkeypatch.setenv(name, "シェルに残った値")
         assert name not in entry.worker_environment(Settings())
 
+    def test_the_child_writes_unbuffered_utf8(self, monkeypatch):
+        """親は子の出力を UTF-8 で読み、ログを逐次出す（tools/verify_run.py の再生と同じ 3 つ）。"""
+        monkeypatch.setenv("PYTHONIOENCODING", "cp932")
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+        env = entry.worker_environment(Settings())
+        assert (env["PYTHONUNBUFFERED"], env["PYTHONIOENCODING"], env["PYTHONUTF8"]) == ("1", "utf-8", "1")
+
     def test_settings_without_a_default_are_passed_when_set_in_the_app(self, monkeypatch):
         monkeypatch.setenv("SUBJECT_ID", "99")
         settings = Settings()

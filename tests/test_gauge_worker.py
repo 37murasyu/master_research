@@ -195,3 +195,50 @@ class TestRealChildFrames:
         joined_output = "".join(outputs)
         assert "@@GAUGE" not in joined_output
         assert "ordinary line" in joined_output
+
+
+class TestChildOutputEncoding:
+    """子の標準出力は UTF-8 で、書いたそばから届く（親は UTF-8 で読み、ログを逐次出す）。
+
+    Windows のパイプの既定（cp932）だと、本体の "✅" の print で子が UnicodeEncodeError で落ちる。
+    Python はパイプへの出力をためるので、flush しない print は子が終わるまでログに出なかった。
+    ここでは親の環境に cp932 を残して前者を、flush しない print で後者を再現する。
+    """
+
+    def _run(self, monkeypatch, code: str):
+        from app.runners.worker import WorkerRunner
+
+        monkeypatch.setattr(entry, "worker_command",
+                            lambda role, passthrough=None, module=None: [sys.executable, "-c", code])
+        runner = WorkerRunner("script")
+        outputs: list[str] = []
+        runner.output.connect(outputs.append)
+        assert runner.start(Settings(), module="dummy")
+        return runner, outputs
+
+    def test_the_child_writes_utf8_even_if_the_parent_says_otherwise(self, qt_app, monkeypatch):
+        monkeypatch.setenv("PYTHONIOENCODING", "cp932")
+        runner, outputs = self._run(monkeypatch, "print('✅ Mediapipe・モデル準備 完了')")
+        codes: list[int] = []
+        runner.finished.connect(codes.append)
+        assert runner._process.waitForFinished(10_000)
+
+        assert codes == [0], "".join(outputs)
+        assert "✅ Mediapipe・モデル準備 完了" in "".join(outputs)
+
+    def test_lines_arrive_while_the_child_is_still_running(self, qt_app, monkeypatch):
+        import time
+
+        monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+        # 目印は子が組み立てる（「[起動]」のログにコマンドの文字がそのまま出るので、それと区別する）
+        runner, outputs = self._run(monkeypatch, "import time\nprint('step', 1 + 1)\ntime.sleep(30)\n")
+        try:
+            deadline = time.monotonic() + 10
+            while "step 2" not in "".join(outputs) and time.monotonic() < deadline:
+                runner._process.waitForReadyRead(100)
+                runner._drain_output()
+            assert "step 2" in "".join(outputs), "子が終わるまでログが届かない（出力がためられている）"
+            assert runner.is_running
+        finally:
+            runner._process.kill()
+            runner._process.waitForFinished(5000)
