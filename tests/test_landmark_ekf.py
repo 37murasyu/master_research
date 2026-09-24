@@ -294,3 +294,105 @@ class TestSetNoise:
         a = np.stack([swapped.step(f, 1 / 30)[0] for f in meas])
         b = np.stack([fresh.step(f, 1 / 30)[0] for f in meas])
         np.testing.assert_array_equal(a, b)
+
+
+# 公開の作り直しの口（reset_series）を足す前の土台のコミット。step の数値はここから 1 ビットも変えない
+BASE_COMMIT = "70107b565311b35f8dd68abbb20615f8dd661ce6"
+
+
+def _base_module(tmp_path, monkeypatch):
+    """土台のコミットの ``extended_kalman_filter.py`` を別の名前で読み込む。git や履歴が無ければ飛ばす。"""
+    import importlib.util
+    import subprocess
+    import sys
+
+    try:
+        source = subprocess.run(["git", "show", f"{BASE_COMMIT}:extended_kalman_filter.py"], cwd=REPO_ROOT,
+                                capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("土台のコミットを git から読めない（浅い clone など）")
+    path = tmp_path / "extended_kalman_filter_base.py"
+    path.write_bytes(source)
+    spec = importlib.util.spec_from_file_location("extended_kalman_filter_base", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)   # dataclass が読み込み中のモジュールを引く
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestResetSeries:
+    """点の状態を観測で初期化し直す公開の口（``reset_series``）。
+
+    混成の発散の見張り（``app.hybrid.ekf.GridEkf``）が、ずれたままの点を作り直すのに使う。以前は ``GridEkf`` が
+    ベクトル化版の私的な状態（``_X``・``_P``・``_init``・``_gap``）を直接書き、初回観測の初期化を写していた。
+    初期化の式は ``step`` の初回観測と共有する（``ExtendedKalman1D._start``・``LandmarkEKF._start_rows``）。
+    ``LandmarkEKF`` は USB 経路（``master_research_code.py``）と共有なので、切り出しで ``step`` の値を変えない。
+    """
+
+    @pytest.mark.parametrize("vectorized", [True, False], ids=["vectorized", "sequential"])
+    @pytest.mark.parametrize("robust_gate, max_gap_s", [(False, 0.0), (True, 0.5)], ids=["捨てる門", "頑健な門と欠測の上限"])
+    def test_step_is_bit_identical_to_the_base_commit(self, tmp_path, monkeypatch, vectorized, robust_gate,
+                                                      max_gap_s):
+        base = _base_module(tmp_path, monkeypatch)
+        meas = _measurements(300)
+        rng = np.random.default_rng(9)
+        n = N_POINTS * 3
+        series = dict(q_acc=rng.uniform(0.01, 0.5, n), r=rng.uniform(1e-5, 1e-3, n),
+                      gate_std=rng.choice([0.0, 2.5, 3.0], n))
+        # 土台の側には土台の型を渡す（isinstance で SeriesNoise を見分けるので）
+        pairs = [(EKFConfig(), base.EKFConfig()), (SeriesNoise(**series), base.SeriesNoise(**series))]
+        for cfg, base_cfg in pairs:
+            for dt in DTS.values():
+                kwargs = dict(fs=30.0, vectorized=vectorized, robust_gate=robust_gate, max_gap_s=max_gap_s)
+                now = LandmarkEKF(N_POINTS, cfg=cfg, **kwargs)
+                before = base.LandmarkEKF(N_POINTS, cfg=base_cfg, **kwargs)
+                for frame in meas:
+                    for a, b in zip(now.step(frame, dt), before.step(frame, dt)):
+                        assert a.tobytes() == b.tobytes(), "step の値が土台のコミットから変わった"
+
+    @pytest.mark.parametrize("vectorized", [True, False], ids=["vectorized", "sequential"])
+    @pytest.mark.parametrize("robust_gate, max_gap_s", [(False, 0.0), (True, 0.5)], ids=["捨てる門", "頑健な門と欠測の上限"])
+    def test_a_reset_is_the_same_as_starting_to_observe_the_point(self, vectorized, robust_gate, max_gap_s):
+        """作り直した点は、その点を初めて観測したフィルタと、その後ずっと同じ値を返す。ほかの点は触らない。"""
+        meas = _measurements(300)
+        at = 150
+        mask = np.zeros(N_POINTS, dtype=bool)
+        mask[[1, 3, 7]] = True   # 3 は長い穴（100〜160）の途中で、欠測の長さも 0 に戻ることを見る
+        meas[at, 7, 2] = np.nan  # 観測の無い軸は未初期化に戻り、次の観測で初期化する
+        unseen = meas.copy()
+        unseen[:at, mask] = np.nan
+
+        def make():
+            return LandmarkEKF(N_POINTS, fs=30.0, cfg=EKFConfig(q_acc=0.122, r=2.59e-5, gate_std=3.0),
+                               vectorized=vectorized, robust_gate=robust_gate, max_gap_s=max_gap_s)
+
+        reset, fresh = make(), make()
+        for k in range(at):
+            reset.step(meas[k], 1 / 30)
+            fresh.step(unseen[k], 1 / 30)
+        reset.step(meas[at], 1 / 30)
+        reset.reset_series(mask, meas[at])
+        first = fresh.step(meas[at], 1 / 30)
+        assert np.isnan(first[0][7, 2]) and np.isfinite(first[0][7, :2]).all()
+        for k in range(at + 1, len(meas)):
+            for a, b in zip(reset.step(meas[k], 1 / 30), fresh.step(meas[k], 1 / 30)):
+                np.testing.assert_array_equal(a, b)
+
+    @pytest.mark.parametrize("vectorized", [True, False], ids=["vectorized", "sequential"])
+    def test_the_state_is_the_observation_at_rest(self, vectorized):
+        ekf = LandmarkEKF(2, fs=30.0, cfg=EKFConfig(), vectorized=vectorized)
+        for k in range(10):
+            ekf.step(np.full((2, 3), 0.01 * k), 1 / 30)
+        z = np.array([[1.0, 2.0, 3.0], [9.0, 9.0, 9.0]])
+        ekf.reset_series(np.array([True, False]), z)
+        pos, vel, acc = ekf.step(np.full((2, 3), np.nan), 1e-9)   # ほぼ 0 の dt で予測だけ
+        np.testing.assert_allclose(pos[0], z[0])
+        np.testing.assert_allclose(vel[0], 0.0, atol=1e-6)
+        assert np.all(pos[1] < 0.2), "mask の外の点まで作り直した"
+
+    def test_wrong_shapes_are_rejected(self):
+        ekf = LandmarkEKF(2, fs=30.0, cfg=EKFConfig())
+        with pytest.raises(ValueError, match="mask shape"):
+            ekf.reset_series(np.ones(3, dtype=bool), np.zeros((2, 3)))
+        with pytest.raises(ValueError, match="z shape"):
+            ekf.reset_series(np.ones(2, dtype=bool), np.zeros(6))

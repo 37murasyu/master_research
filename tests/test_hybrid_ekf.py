@@ -238,3 +238,50 @@ class TestDivergence:
             worst = max(worst, float(np.max(np.linalg.norm(result.points_3d - expected, axis=1))))
         assert worst < 0.5, f"{worst:.2f} m ずれた（見張りが無いと約 4 m）"
         assert measurement.ekf.resets > 0
+
+
+def _reinit_before(ekf: GridEkf, points: np.ndarray, raw: np.ndarray) -> None:
+    """公開の口（``LandmarkEKF.reset_series``）を使う前の ``GridEkf._reinit`` の写し。比べるためだけに残す。"""
+    inner = ekf._ekf
+    rows = np.repeat(points, 3)
+    z = raw.reshape(-1)
+    inner._X[rows] = 0.0
+    inner._X[rows, 0] = z[rows]
+    inner._P[rows] = np.eye(3)
+    inner._init[rows] = np.isfinite(z[rows])
+    inner._gap[rows] = 0.0
+
+
+class TestReinitThroughThePublicMethod:
+    """発散の見張りの作り直しは ``LandmarkEKF.reset_series`` だけを使い、私的な状態を直接書いていた前と同じ値を返す。"""
+
+    @staticmethod
+    def _run(reinit=None, seed: int = 1):
+        rng = np.random.default_rng(seed)
+        ekf = GridEkf(EkfSettings(), IDS)
+        if reinit is not None:
+            ekf._reinit = lambda points, raw: reinit(ekf, points, raw)
+        n = len(IDS)
+        base = rng.normal(0, 0.3, (n, 3))
+        out = []
+        for k in range(300):
+            # 1.3 Hz・15 cm の揺れ（同梱値では追い切れず見張りが働く）に、2 m の飛び・欠測・抜け・長い抜けを混ぜる
+            x = base + 0.15 * np.sin(2 * np.pi * 1.3 * k / 30) * np.array([1.0, 0.5, 2.0]) \
+                + rng.normal(0, 0.003, (n, 3))
+            if k % 50 == 25:
+                x[3] += 2.0
+            if rng.random() < 0.05:
+                x[rng.integers(n)] = np.nan
+            if rng.random() < 0.05:
+                x[rng.integers(n), rng.integers(3)] = np.nan
+            missing = 20 if k == 200 else (2 if k % 70 == 69 else 0)
+            out.append(np.stack(ekf.step(x, missing=missing)))
+        return np.stack(out), ekf
+
+    @pytest.mark.parametrize("seed", [1, 2])
+    def test_the_same_values_as_writing_the_private_state(self, seed):
+        now, ekf = self._run(seed=seed)
+        before, ekf_before = self._run(_reinit_before, seed=seed)
+        assert ekf.resets > 0 and ekf.rebuilds == 1, "合成の観測列が見張りの作り直しを通っていない"
+        assert (ekf.resets, ekf.predicted) == (ekf_before.resets, ekf_before.predicted)
+        np.testing.assert_array_equal(now, before)
