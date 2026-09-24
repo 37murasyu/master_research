@@ -24,11 +24,13 @@ from typing import Iterable, Mapping
 import numpy as np
 
 from app.hybrid.rep_detector import RepConfig
+from app.net.sync_buffer import DEFAULT_GRID
 
 __all__ = ["MAX_STEP_S", "LOOKAHEAD_FRAMES", "MAX_SERIES", "WorkSample", "PartWork", "RepAccumulator"]
 
-# これより長い dt のフレームは積まない [s]。同期バッファが補間で埋める穴の上限（max_gap_ms=100）と同じ
-MAX_STEP_S = 0.1
+# これより長い dt のフレームは積まない [s]。既定の格子の、同期バッファが補間で埋める穴の上限（100 ms）。
+# 計測（NetworkMeasurement）は同期バッファと同じ GridSpec の max_gap_s を渡す
+MAX_STEP_S = DEFAULT_GRID.max_gap_s
 # 関所が開く前の輪の長さ（フレーム）。回の区切りの先読みの幅（RepConfig.lookback_frames）が正本
 LOOKAHEAD_FRAMES = RepConfig().lookback_frames
 # θ・τ_y の列の上限（30 Hz で 60 秒）

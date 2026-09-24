@@ -21,15 +21,15 @@ import pandas as pd
 from app.hybrid.calibration_io import load_session_calibration
 from app.hybrid.ekf import EkfSettings
 from app.net.protocol import LandmarkFrame
-from app.net.sync_buffer import InterpolatedFrame, PairedSample
+from app.net.sync_buffer import DEFAULT_GRID, InterpolatedFrame, PairedSample
 from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 from config import pose_keypoints
 
 __all__ = ["MAX_GAP_NS", "Retriangulated", "read_landmarks", "pairs_at_real_times", "retriangulate"]
 
 ROLES = ("cam0", "cam1")
-# 同期バッファ（SyncBuffer の max_gap_ms）と同じ。これを超える穴は補間で埋めない
-MAX_GAP_NS = 100_000_000
+# 同期バッファの既定の格子の穴の上限（GridSpec.max_gap_ns、100 ms）。これを超える穴は補間で埋めない
+MAX_GAP_NS = DEFAULT_GRID.max_gap_ns
 
 
 @dataclass(frozen=True)

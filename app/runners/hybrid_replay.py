@@ -23,12 +23,13 @@ from app.core.stop_request import StopRequest
 from app.gauge.tracker import GaugeTicker, GaugeTracker
 from app.hybrid.paths import replay_root
 from app.hybrid.replay import REPLAY_ENV, replay
+from app.net.sync_buffer import DEFAULT_GRID
 from config import env_float
 
 __all__ = ["main"]
 
 # メインループの周期（本番の Mac のカメラの 1 周回＝約 30 Hz に合わせる）
-_TICK_S = 1.0 / 30.0
+_TICK_S = DEFAULT_GRID.period_s
 
 
 def _env_float(name: str, default: float | None) -> float | None:

@@ -26,13 +26,14 @@ from pathlib import Path
 from typing import Sequence
 
 from app.hybrid.paths import ekf_profile_root
+from app.net.sync_buffer import DEFAULT_GRID
 from app.tuning.ekf_estimate import fit_capture, format_report
 from app.tuning.ekf_profile import MIN_N_EFF, build_profile, write_profile
 from app.tuning.raw_capture import read_raw_capture
 
 
-# 混成の計測の格子の dt [s] と、実行時の探索が同じ dt とみなす相対差（ekf_profile.resolve_profile）
-HYBRID_GRID_DT = 1.0 / 30.0
+# 混成の計測の（既定の）格子の dt [s] と、実行時の探索が同じ dt とみなす相対差（ekf_profile.resolve_profile）
+HYBRID_GRID_DT = DEFAULT_GRID.period_s
 DT_TOLERANCE = 0.05
 
 
