@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -62,6 +63,8 @@ class FakeLink:
     def __init__(self, **kwargs):
         self.callbacks = kwargs
         self.url = "ws://fake"
+        self.remote_role = "cam1"
+        self.connected = True
         FakeLink.instances.append(self)
 
     def start(self):
@@ -70,11 +73,18 @@ class FakeLink:
     def stop(self):
         self.callbacks["on_stop"]()
 
+    def status(self):
+        return SimpleNamespace(devices={"cam1": "pixel-1"} if self.connected else {})
+
 
 class FakeLive:
-    """1 周ごとに押し上げの組を 3 組ずつ流す（Pixel 側の受信を模す）。流し終えたら停止を要求する。"""
+    """1 周ごとに Pixel の点を 1 つと押し上げの組を 3 組ずつ流す（Pixel 側の受信を模す）。流し終えたら停止を要求する。
+
+    ``disconnect`` なら、最後の組を流したところで Pixel の接続を切る。
+    """
 
     pairs: list = []
+    disconnect = False
 
     def __init__(self, camera, detector, link, **kwargs):
         self.link = link
@@ -83,13 +93,14 @@ class FakeLive:
 
     def step(self, **kwargs):
         cb = self.link.callbacks
-        if self.steps == 2:
-            cb["on_landmarks"](LandmarkFrame("cam1", 0, 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
         if self.steps >= 2:
+            cb["on_landmarks"](LandmarkFrame("cam1", self.steps, self.steps, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
             chunk = FakeLive.pairs[self.index:self.index + 3]
             self.index += 3
             if chunk:
                 cb["on_pairs"](chunk)
+            if FakeLive.disconnect and self.index >= len(FakeLive.pairs):
+                self.link.connected = False
             cb["on_tick"]()
         self.steps += 1
         FakeStop.done = self.index >= len(FakeLive.pairs)
@@ -114,6 +125,7 @@ def fakes(monkeypatch, tmp_path):
     FakeLink.instances.clear()
     FakeStop.done = False
     FakeLive.pairs = calibrated_pairs(PushUp(reps=2))
+    FakeLive.disconnect = False
     monkeypatch.setattr(hybrid_measure, "MacCamera", FakeCamera)
     monkeypatch.setattr(hybrid_measure, "PoseDetector", FakeDetector)
     monkeypatch.setattr(hybrid_measure, "PhoneLink", FakeLink)
@@ -159,6 +171,18 @@ def test_every_loop_writes_one_gauge_line(fakes, capsys):
     assert elbow.prev is not None and elbow.prev > 5.0
     assert max(f.parts["elbow_R"].now or 0.0 for f in frames) > 5.0, "押し上げの途中で now が増える"
     assert set(frames[-1].parts) == set(protocol.PART_NAMES)
+
+
+def test_the_gauge_line_says_waiting_after_the_pixel_disconnects(fakes, capsys):
+    """Pixel の接続が切れたら、次の定期処理（on_tick）でゲージの行の link が waiting に戻る（GUI の接続表示）。
+
+    以前は記録を始めたときに 1 回 connected にするだけで、切れても connected のままだった。
+    """
+    FakeLive.disconnect = True
+    assert hybrid_measure.main(["--calibration", str(fakes.directory)]) == 0
+    frames = [protocol.decode(line) for line in _gauge_lines(capsys.readouterr().out)]
+    assert any(frame.link == "connected" for frame in frames)
+    assert frames[-1].link == "waiting"
 
 
 def test_the_settings_reach_the_measurement(fakes, capsys, monkeypatch):

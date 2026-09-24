@@ -185,6 +185,8 @@ def main(argv=None):
                 on_tick=measurement.flush,
                 on_stop=measurement.close,
             )
+            # ゲージの接続表示（measurement.flush）は、Pixel が名乗った接続が残っているかも見る
+            measurement.remote_connected = lambda: link.remote_role in link.status().devices
             stack.callback(cv.destroyAllWindows)
             link.start()
             stack.callback(link.stop)

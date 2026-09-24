@@ -125,6 +125,42 @@ def test_no_measurement_folder_until_the_phone_streams(tmp_path):
     assert session.directory is not None and session.directory.exists()
 
 
+def test_the_gauge_link_follows_the_pixel(tmp_path):
+    """ゲージ（と GUI）の接続表示は、Pixel の点が 1 s 途絶えるか接続が切れたら waiting に戻り、再開で connected に戻る。
+
+    以前は記録を始めたときに 1 回 connected にするだけで、Pixel が切れても connected のままだった。
+    更新は受信スレッドの定期処理（on_tick＝flush）で行う。
+    """
+    from app.gauge.tracker import GaugeTracker
+
+    now = [100.0]
+    connected = [True]
+    tracker = GaugeTracker()
+    session = MeasurementSession(calibration(tmp_path), root=tmp_path / "measure", tracker=tracker,
+                                 clock=lambda: now[0])
+    session.remote_connected = lambda: connected[0]
+
+    def pixel(seq):
+        session.on_landmarks(LandmarkFrame("cam1", seq, seq + 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
+
+    def link():
+        session.flush()
+        return tracker.snapshot().link
+
+    assert link() == "waiting", "点が来る前"
+    pixel(0)
+    assert link() == "connected"
+    now[0] += 0.9
+    assert link() == "connected", "1 s 以内の途切れ"
+    now[0] += 0.2
+    assert link() == "waiting", "最後の点から 1 s を超えた"
+    pixel(1)
+    assert link() == "connected", "点が戻った"
+    connected[0] = False
+    assert link() == "waiting", "接続が切れた"
+    session.close()
+
+
 def test_identity_and_dimension_rejection(tmp_path):
     session = MeasurementSession(calibration(tmp_path), root=tmp_path / "measure")
     assert session.check_hello(Hello("cam1", "Pixel", "s", "wrong")) is not None
