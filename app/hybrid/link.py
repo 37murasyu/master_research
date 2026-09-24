@@ -146,7 +146,7 @@ class LinkStatus:
     clients: int = 0
     frames_received: int = 0
     frames_injected: int = 0
-    # 直近 1 秒に届いた端末の点の数（撮影時刻で数える）。
+    # 直近 1 秒に届いた端末の点の数（受け取った時刻で数える。撮影時刻で数えると、届くまでの遅れのぶん低く出る）。
     remote_fps: float = 0.0
     pairs: int = 0
     dropped_gap: int = 0
@@ -228,6 +228,8 @@ class PhoneLink:
 
         self._lock = threading.Lock()
         self._recent: collections.deque[p.LandmarkFrame] = collections.deque(maxlen=history)
+        # 端末の点を受け取った時刻（PC の時計）。直近 1 秒ぶんを remote_fps として数える
+        self._arrivals: collections.deque[int] = collections.deque()
         self._latest_capture: p.CalibrationFrame | None = None
         # 画像を送った端末の名乗り（受け取った時点のもの）と、take_capture が最後に返した画像の送り手
         self._latest_capture_device: p.Hello | None = None
@@ -398,13 +400,12 @@ class PhoneLink:
 
     def _refresh_status(self) -> None:
         stats = self._server.stats
+        now = time.monotonic_ns()
         with self._lock:
-            recent = [f.t_capture_ns for f in self._recent]
+            while self._arrivals and now - self._arrivals[0] >= 1_000_000_000:
+                self._arrivals.popleft()
+            remote_fps = float(len(self._arrivals))
             captures, errors = self._captures_received, self._callback_errors
-        remote_fps = 0.0
-        if recent:
-            newest = time.monotonic_ns()
-            remote_fps = float(sum(1 for t in recent if 0 <= newest - t < 1_000_000_000))
         status = LinkStatus(
             url=self.url,
             devices=dict(self._server.devices),
@@ -438,8 +439,10 @@ class PhoneLink:
 
     def _handle_landmarks(self, frame: p.LandmarkFrame) -> None:
         if frame.role == self.remote_role:
+            received = time.monotonic_ns()
             with self._lock:
                 self._recent.append(frame)
+                self._arrivals.append(received)
         if self._user_on_landmarks is not None:
             self._guarded("on_landmarks", self._user_on_landmarks, frame)
 

@@ -334,3 +334,30 @@ def test_link_keeps_the_buffer_default_window():
 
     link = PhoneLink(port=0)
     assert link._server.buffer.window_ns == SyncBuffer().window_ns
+
+
+@pytest.mark.parametrize("latency_ms", [0, 150, 600])
+def test_remote_fps_counts_arrivals_not_capture_times(monkeypatch, latency_ms):
+    """プレビューの「Pixel N fps」は、受け取った時刻の直近 1 秒で数える。
+
+    以前は撮影時刻が「今から 1 秒以内」の点を数えていたので、30 fps でも届くまでの遅れのぶん低く出た
+    （150 ms の遅れで 26、600 ms で 12）。
+    """
+    from types import SimpleNamespace
+
+    import app.hybrid.link as link_module
+
+    clock = SimpleNamespace(now=0)
+    monkeypatch.setattr(link_module, "time", SimpleNamespace(monotonic_ns=lambda: clock.now, monotonic=time.monotonic))
+    link = PhoneLink(port=0)
+    start, period = 10_000_000_000, 33_333_333
+    for k in range(90):  # 30 fps で 3 秒ぶん、撮影から latency_ms 遅れて届く
+        t_capture = start + k * period
+        clock.now = t_capture + latency_ms * 1_000_000
+        link._handle_landmarks(p.LandmarkFrame("cam1", k, t_capture, 1280, 720, synthetic_pose(0.0, "cam1")))
+        link._refresh_status()
+    assert link.status().remote_fps == pytest.approx(30, abs=1)
+
+    clock.now += 1_500_000_000  # 端末が止まったら 0 に落ちる
+    link._refresh_status()
+    assert link.status().remote_fps == 0
