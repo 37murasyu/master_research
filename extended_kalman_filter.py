@@ -381,21 +381,15 @@ class LandmarkEKF:
     def _start_rows(self, rows: np.ndarray, z: np.ndarray) -> None:
         """ベクトル化版の系列 ``rows``（(N,) の真偽）を観測 ``z``（(N,)）で初期化する。
 
-        ``ExtendedKalman1D._start`` と同じ値（位置 = z、速度・加速度 0、P = I、欠測の長さ 0）。
-        初めて観測したとき（``_step_vectorized`` の 1)）と ``reset_series`` で共有する。``z`` は有限であること。
+        ``ExtendedKalman1D._start`` と同じ値（位置 = z、速度・加速度 0、P = I、欠測の長さ 0）。``z`` が有限でない
+        系列は未初期化に戻す（次の観測で初期化する。未初期化の間は位置を使わない）。初めて観測したとき
+        （``_step_vectorized`` の 1)。``z`` はどれも有限）と ``reset_series`` で共有する。
         """
         X = self._X
         X[rows] = 0.0
         X[rows, 0] = z[rows]
         self._P[rows] = self._I3
-        self._init[rows] = True
-        self._gap[rows] = 0.0
-
-    def _forget_rows(self, rows: np.ndarray) -> None:
-        """ベクトル化版の系列 ``rows`` を作った直後の未初期化の状態に戻す（次の観測で初期化する）。"""
-        self._X[rows] = 0.0
-        self._P[rows] = self._I3
-        self._init[rows] = False
+        self._init[rows] = np.isfinite(z[rows])
         self._gap[rows] = 0.0
 
     def reset_series(self, mask: np.ndarray, z: np.ndarray) -> None:
@@ -414,11 +408,7 @@ class LandmarkEKF:
         if z.shape != (self.n_points, 3):
             raise ValueError(f"z shape must be {(self.n_points, 3)}, got {z.shape}")
         if self.vectorized:
-            flat = z.reshape(-1)
-            rows = np.repeat(mask, 3)
-            valid = np.isfinite(flat)
-            self._start_rows(rows & valid, flat)
-            self._forget_rows(rows & ~valid)
+            self._start_rows(np.repeat(mask, 3), z.reshape(-1))
             return
         for i in np.flatnonzero(mask):
             for j in range(3):

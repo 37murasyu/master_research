@@ -6,8 +6,10 @@ USB の経路（``master_research_code.py`` の ``_roi_from_keypoints``・``_exp
 - 前のフレームの点（画素）から、余白を付けた正方形の ROI を決める（``roi_from_keypoints``）
 - 点を見失ったフレームの数だけ ROI を広げる（``expand_roi``）
 - 切り出した画像に対する正規化座標を、全体の画像に対する正規化座標へ戻す（``remap_to_fullframe``）
+- フレームをまたいだ ROI の追跡（``RoiTracker``。``PoseDetector`` が 1 つ持つ）
 - 横の切り出しの範囲（``x_crop_range``）と、切り出した画素座標を全体へ戻す（``uncrop_x_pixels``）
 
+横の切り出しの 2 つは今は試験しか使わないが、混成で使うときに USB と同じ式になるよう一緒に移して残している。
 USB の横の切り出しは、切り出した画像の画素座標を全体の画像用の射影行列で三角測量している（x_start を
 戻していない、KNOWN_ISSUES.md）。移植では ``uncrop_x_pixels``・``remap_to_fullframe`` で必ず全体へ戻す。
 """
@@ -29,6 +31,7 @@ __all__ = [
     "expand_roi",
     "remap_to_fullframe",
     "landmarks_to_pixels",
+    "RoiTracker",
     "x_crop_range",
     "uncrop_x_pixels",
 ]
@@ -116,16 +119,47 @@ def remap_to_fullframe(points: Iterable[Sequence[float]], roi: Roi, full_shape) 
     return [((x0 + float(p[0]) * rw) / float(w), (y0 + float(p[1]) * rh) / float(h), *p[2:]) for p in points]
 
 
-def landmarks_to_pixels(points: Sequence[Sequence[float]] | None, frame_shape, ids: Iterable[int]) -> list[list[int]]:
-    """正規化座標の点のうち ``ids`` を、ID の昇順に画素へ直す。点が無ければ全部 ``[-1, -1]``。
+def landmarks_to_pixels(points: Sequence[Sequence[float]] | None, frame_shape, ids: Sequence[int]) -> list[list[int]]:
+    """正規化座標の点のうち ``ids`` を、``ids`` の順に画素へ直す。点が無ければ全部 ``[-1, -1]``。
 
     本体の ``_extract_keypoints_fast_single`` と同じく visibility は見ない（画像の外は負の座標になり ROI で除かれる）。
+    本体は ID の昇順に並べる。同じ並びにするなら昇順で渡す（``RoiTracker`` は作るときに 1 度だけ並べる）。
     """
-    ids = sorted(ids)
     if not points:
         return [[-1, -1] for _ in ids]
     h, w = frame_shape[:2]
     return [[int(round(float(points[i][0]) * w)), int(round(float(points[i][1]) * h))] for i in ids]
+
+
+class RoiTracker:
+    """フレームをまたいだ ROI の追跡。本体の ``_pose_roi0``・``_pose_roi0_miss`` とその更新と同じ手順。
+
+    前のフレームの点から次の ROI を決める（``observe``）。点を見失ったら、見失ったフレームの数だけ ROI を広げて
+    切り出し（``crop_for``）、``MAX_MISS`` 回を超えたら全画面に戻す。点が少なすぎて ROI を決められないときも
+    見失ったと数える。MediaPipe に依存しない。
+    """
+
+    def __init__(self, ids: Iterable[int]):
+        self._ids = sorted(ids)  # 使う点のランドマーク ID。本体と同じく昇順（ROI そのものは並びに依らない）
+        self._roi: Roi | None = None  # 最後に点から決めた ROI。最初は前の点が無いので全画面
+        self._miss = 0  # その ROI で点を見失い続けているフレームの数
+
+    def crop_for(self, frame_shape) -> Roi | None:
+        """このフレームで切り出す ROI。見失った回数だけ広げる。None なら全画面。"""
+        roi = self._roi
+        for _ in range(self._miss):
+            roi = expand_roi(roi, frame_shape, MISS_GROW_RATIO)
+        return roi
+
+    def observe(self, points: Sequence[Sequence[float]] | None, frame_shape) -> None:
+        """このフレームの点（全体の画像に対する正規化座標。人がいなければ None）から次の ROI を決める。"""
+        roi = roi_from_keypoints(landmarks_to_pixels(points, frame_shape, self._ids), frame_shape)
+        if roi is not None:
+            self._roi, self._miss = roi, 0
+        elif self._roi is not None:
+            self._miss += 1
+            if self._miss > MAX_MISS:
+                self._roi, self._miss = None, 0
 
 
 def _valid_x_range(kpts, frame_width: int) -> tuple[int, int]:

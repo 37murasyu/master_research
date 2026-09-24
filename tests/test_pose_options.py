@@ -10,7 +10,8 @@ USB の経路の姿勢推定の工夫（閾値・縮小・ROI・モデル）を�
 ``hybrid_calibrate``・``hybrid_preview`` は変えずに済む。
 
 ``HYBRID_POSE_ROI=1`` の配線（IMAGE モード、前のフレームの点から ROI を切り出す、点を全体の座標へ戻す、見失ったら
-広げて全画面へ戻す）は、MediaPipe の推定器を偽物に差し替えて確かめる。式そのものは ``test_pose_roi.py``。
+広げて全画面へ戻す）は、MediaPipe の推定器を偽物に差し替えて確かめる。式と追跡の状態の移り変わり
+（``pose_roi.RoiTracker``）そのものは ``test_pose_roi.py``。
 """
 
 from __future__ import annotations

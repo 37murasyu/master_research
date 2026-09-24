@@ -1,4 +1,4 @@
-"""Mac 側の姿勢推定の ROI（関心領域の切り出し）の純粋な関数を固定する（B10）。
+"""Mac 側の姿勢推定の ROI（関心領域の切り出し）の純粋な関数と、フレームをまたいだ追跡（``RoiTracker``）を固定する（B10）。
 
 **なぜこのテストがあるか。**
 
@@ -9,6 +9,9 @@ USB の経路の ROI は ``master_research_code.py`` に直書きされていて
 
 ただし USB の横の切り出しは、切り出した画像の画素座標を全体の画像用の射影行列で三角測量している（x_start を
 戻していない、KNOWN_ISSUES.md）。移植では座標を全体へ戻す関数を足し、その振る舞いを別に固定する。
+
+``RoiTracker`` は ``PoseDetector`` から ROI の追跡の状態（見失った回数だけ広げ、``MAX_MISS`` 回を超えたら全画面）を
+切り出したもの。偽の MediaPipe を使わずに状態の移り変わりを確かめる。
 """
 
 from __future__ import annotations
@@ -152,6 +155,8 @@ def test_landmarks_become_pixels_like_the_main_script():
     points = [(0.5, 0.25, 0.0, 0.9), (-0.1, 0.5, 0.0, 0.9), (1.2, 1.0, 0.0, 0.1)]
     assert pose_roi.landmarks_to_pixels(points, (100, 200), [0, 1, 2]) == [[100, 25], [-20, 50], [240, 100]]
     assert pose_roi.landmarks_to_pixels(None, (100, 200), [0, 1]) == [[-1, -1], [-1, -1]]
+    # 並びは渡した ID の順（毎フレーム並べ直さない。RoiTracker が作るときに 1 度だけ昇順に並べる）
+    assert pose_roi.landmarks_to_pixels(points, (100, 200), [2, 0]) == [[240, 100], [100, 25]]
 
 
 def test_the_remap_puts_the_crop_back_into_the_full_frame():
@@ -174,3 +179,89 @@ def test_the_side_crop_coordinates_go_back_to_the_full_frame():
     # 正規化座標は横だけの ROI として戻す
     (x, y, _, _), = pose_roi.remap_to_fullframe([(0.5, 0.25, 0.0, 1.0)], (76, 0, 1164, 720), (720, 1280))
     assert (x * 1280, y * 720) == pytest.approx((620, 180))
+
+
+# --- ROI の追跡（RoiTracker）----------------------------------------------------------------
+#
+# フレームをまたいだ状態の移り変わり（本体の _pose_roi0・_pose_roi0_miss）。MediaPipe の包み（PoseDetector）の配線は
+# test_pose_options.py で、偽の推定器を通して確かめる。
+
+FULL = (720, 1280, 3)
+IDS = [16, 14, 12, 11, 13, 15, 24, 23]
+
+
+def _points(x=0.4, y=0.4, ids=IDS):
+    """``ids`` の点が (x..x+0.05, y..y+0.15) に散らばる 33 点（全体の画像に対する正規化座標）。"""
+    points = [(0.9, 0.9, 0.0, 1.0)] * 33
+    for k, i in enumerate(sorted(ids)):
+        points[i] = (x + 0.05 * (k % 2), y + 0.15 * (k // 4), 0.0, 1.0)
+    return points
+
+
+def _grown(roi, times):
+    for _ in range(times):
+        roi = pose_roi.expand_roi(roi, FULL)
+    return roi
+
+
+def test_the_tracker_starts_with_the_full_frame_and_follows_the_points():
+    tracker = pose_roi.RoiTracker(IDS)
+    assert tracker.crop_for(FULL) is None, "最初は前の点が無いので全画面"
+    tracker.observe(_points(), FULL)
+    roi = pose_roi.roi_from_keypoints(pose_roi.landmarks_to_pixels(_points(), FULL, sorted(IDS)), FULL)
+    assert roi is not None and tracker.crop_for(FULL) == roi
+    tracker.observe(_points(0.1, 0.2), FULL)
+    moved = pose_roi.roi_from_keypoints(pose_roi.landmarks_to_pixels(_points(0.1, 0.2), FULL, sorted(IDS)), FULL)
+    assert tracker.crop_for(FULL) == moved != roi, "前のフレームの点から次の ROI を決める"
+    assert tracker.crop_for(FULL) == moved, "切り出す場所を聞くだけでは状態は変わらない"
+
+
+def test_the_tracker_grows_the_roi_per_miss_and_then_falls_back_to_the_full_frame():
+    tracker = pose_roi.RoiTracker(IDS)
+    tracker.observe(_points(), FULL)
+    roi = tracker.crop_for(FULL)
+    crops = []
+    for _ in range(pose_roi.MAX_MISS + 3):
+        tracker.observe(None, FULL)
+        crops.append(tracker.crop_for(FULL))
+    assert crops[:pose_roi.MAX_MISS] == [_grown(roi, k) for k in range(1, pose_roi.MAX_MISS + 1)]
+    assert crops[pose_roi.MAX_MISS:] == [None] * 3, "MAX_MISS 回を超えたら全画面"
+
+
+def test_too_few_points_count_as_a_miss():
+    tracker = pose_roi.RoiTracker(IDS)
+    tracker.observe(_points(), FULL)
+    roi = tracker.crop_for(FULL)
+    few = [(-0.1, -0.1, 0.0, 1.0)] * 33
+    for i in IDS[:pose_roi.MIN_VALID_KPTS - 1]:
+        few[i] = (0.5, 0.5, 0.0, 1.0)
+    tracker.observe(few, FULL)
+    assert tracker.crop_for(FULL) == _grown(roi, 1)
+
+
+def test_finding_the_points_again_starts_over_without_growing():
+    """見失って全画面へ戻ったあとは、全画面でいくら見失っても次に見つけた ROI は広げない。"""
+    tracker = pose_roi.RoiTracker(IDS)
+    tracker.observe(_points(), FULL)
+    tracker.observe(None, FULL)
+    tracker.observe(_points(0.2, 0.3), FULL)
+    again = tracker.crop_for(FULL)
+    assert again == pose_roi.roi_from_keypoints(pose_roi.landmarks_to_pixels(_points(0.2, 0.3), FULL, IDS), FULL)
+
+    for _ in range(pose_roi.MAX_MISS + 10):
+        tracker.observe(None, FULL)
+    assert tracker.crop_for(FULL) is None
+    tracker.observe(_points(), FULL)
+    first = tracker.crop_for(FULL)
+    tracker.observe(None, FULL)
+    assert tracker.crop_for(FULL) == _grown(first, 1)
+
+
+def test_the_tracker_only_looks_at_its_ids():
+    tracker = pose_roi.RoiTracker(IDS[:4])
+    points = _points(ids=IDS[:4])
+    for i in IDS[4:]:
+        points[i] = (0.95, 0.05, 0.0, 1.0)   # 使わない点は遠くにあっても ROI に入らない
+    tracker.observe(points, FULL)
+    x0, y0, x1, y1 = tracker.crop_for(FULL)
+    assert x1 < 0.95 * FULL[1] and y0 > 0.05 * FULL[0]
