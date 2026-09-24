@@ -14,7 +14,7 @@ import asyncio
 
 from app.net.mock_sender import MockPhone
 from app.net.server import LandmarkServer
-from app.net.sync_buffer import SyncBuffer
+from app.net.sync_buffer import GridSpec, SyncBuffer
 
 
 async def _run_session(duration: float, jitter_ms: float, loss: float):
@@ -22,7 +22,7 @@ async def _run_session(duration: float, jitter_ms: float, loss: float):
     server = LandmarkServer(
         host="127.0.0.1",
         port=0,
-        buffer=SyncBuffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0),
+        buffer=SyncBuffer(window_sec=2.0, grid=GridSpec(target_hz=30.0, max_gap_ms=100.0)),
         on_pairs=pairs.extend,
     )
     await server.start()
@@ -127,7 +127,7 @@ def test_full_chain_from_phones_to_torques():
         server = LandmarkServer(
             host="127.0.0.1",
             port=0,
-            buffer=SyncBuffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0),
+            buffer=SyncBuffer(window_sec=2.0, grid=GridSpec(target_hz=30.0, max_gap_ms=100.0)),
             on_pairs=lambda pairs: processed.extend(
                 r for r in (measurement.process(p) for p in pairs) if r is not None
             ),

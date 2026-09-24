@@ -15,7 +15,7 @@ import pytest
 
 from app.net import protocol as p
 from app.net.server import LandmarkServer, SessionHandler
-from app.net.sync_buffer import SyncBuffer
+from app.net.sync_buffer import GridSpec, SyncBuffer
 
 
 class FakeClock:
@@ -56,7 +56,7 @@ class TestSessionHandler:
         assert response.t3 >= response.t2, "受信時刻より送信時刻が後であること"
 
     def test_landmarks_are_forwarded_to_the_buffer(self):
-        buffer = SyncBuffer(target_hz=10.0)
+        buffer = SyncBuffer(grid=GridSpec(target_hz=10.0))
         handler = SessionHandler(buffer, clock=FakeClock())
         handler.handle(_landmarks_message("cam0", 0, 0))
         assert buffer.buffered_count("cam0") == 1
@@ -79,7 +79,7 @@ class TestSessionHandler:
         assert handler.errors == 1
 
     def test_keeps_working_after_a_malformed_message(self):
-        buffer = SyncBuffer(target_hz=10.0)
+        buffer = SyncBuffer(grid=GridSpec(target_hz=10.0))
         handler = SessionHandler(buffer, clock=FakeClock())
         handler.handle("{壊れている")
         handler.handle(_landmarks_message("cam0", 0, 0))
@@ -95,7 +95,7 @@ class TestServerIntegration:
             server = LandmarkServer(
                 host="127.0.0.1",
                 port=0,  # 空きポートを自動で取る
-                buffer=SyncBuffer(target_hz=10.0, max_gap_ms=250.0),
+                buffer=SyncBuffer(grid=GridSpec(target_hz=10.0, max_gap_ms=250.0)),
                 on_pairs=pairs.extend,
             )
             await server.start()
@@ -409,7 +409,7 @@ class TestRemoteRoles:
         assert handler.rejection is not None and "cam0" in handler.rejection
 
     def test_frames_for_a_local_role_are_dropped(self):
-        buffer = SyncBuffer(target_hz=10.0)
+        buffer = SyncBuffer(grid=GridSpec(target_hz=10.0))
         handler = SessionHandler(buffer, remote_roles=("cam1",))
 
         handler.handle(_landmarks_message("cam0", 0, 0))
@@ -419,7 +419,7 @@ class TestRemoteRoles:
 
     def test_frames_must_match_the_announced_role(self):
         """cam1 と名乗った接続から cam0 の点が来たら使わない。"""
-        buffer = SyncBuffer(target_hz=10.0)
+        buffer = SyncBuffer(grid=GridSpec(target_hz=10.0))
         handler = SessionHandler(buffer)
         handler.handle(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
 
@@ -536,7 +536,7 @@ class TestInject:
             server = LandmarkServer(
                 host="127.0.0.1",
                 port=0,
-                buffer=SyncBuffer(target_hz=10.0, max_gap_ms=250.0),
+                buffer=SyncBuffer(grid=GridSpec(target_hz=10.0, max_gap_ms=250.0)),
                 on_pairs=pairs.extend,
                 on_landmarks=seen.append,
                 remote_roles=("cam1",),

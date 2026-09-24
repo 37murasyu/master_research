@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 from app.net.protocol import LANDMARK_COUNT, LandmarkFrame
-from app.net.sync_buffer import SyncBuffer
+from app.net.sync_buffer import GridSpec, SyncBuffer
 
 MS = 1_000_000  # 1 ミリ秒 = 10^6 ナノ秒
 
@@ -33,11 +33,9 @@ def _frame(role: str, seq: int, t_ms: float, value: float) -> LandmarkFrame:
     )
 
 
-def _buffer(**kwargs) -> SyncBuffer:
+def _buffer(target_hz: float = 10.0, window_sec: float = 2.0, max_gap_ms: float = 250.0) -> SyncBuffer:
     # 10 Hz（周期 100ms）にしておくと、テストの時刻が読みやすい。
-    params = dict(target_hz=10.0, window_sec=2.0, max_gap_ms=250.0)
-    params.update(kwargs)
-    return SyncBuffer(**params)
+    return SyncBuffer(window_sec=window_sec, grid=GridSpec(target_hz=target_hz, max_gap_ms=max_gap_ms))
 
 
 class TestPairing:
@@ -78,7 +76,7 @@ class TestPairing:
 class TestInterpolation:
     def test_midpoint_is_linearly_interpolated(self):
         """グリッド時刻が 2 サンプルの中間なら、値も中間になること。"""
-        buf = SyncBuffer(target_hz=10.0, window_sec=2.0, max_gap_ms=250.0)
+        buf = _buffer(target_hz=10.0, window_sec=2.0, max_gap_ms=250.0)
         # cam1 を 50ms ずらす。グリッドは cam1 の最初の時刻 50ms から始まる。
         buf.push(_frame("cam0", 0, 0, 0.0))
         buf.push(_frame("cam0", 1, 100, 1.0))
@@ -126,7 +124,7 @@ class TestGapHandling:
         無線ではパケットロスが日常的に起きる。長い穴を線形補間で埋めると、
         実際には動いていた手を「まっすぐ動いた」ことにしてしまう。
         """
-        buf = SyncBuffer(target_hz=10.0, window_sec=5.0, max_gap_ms=150.0)
+        buf = _buffer(target_hz=10.0, window_sec=5.0, max_gap_ms=150.0)
         for i in range(3):
             buf.push(_frame("cam0", i, i * 100, 0.1))
             buf.push(_frame("cam1", i, i * 100, 0.2))
@@ -140,7 +138,7 @@ class TestGapHandling:
             assert t_ms * MS not in emitted, f"{t_ms}ms は欠測区間なので出してはいけない"
 
     def test_recovers_after_the_gap(self):
-        buf = SyncBuffer(target_hz=10.0, window_sec=5.0, max_gap_ms=150.0)
+        buf = _buffer(target_hz=10.0, window_sec=5.0, max_gap_ms=150.0)
         for i in range(3):
             buf.push(_frame("cam0", i, i * 100, 0.1))
             buf.push(_frame("cam1", i, i * 100, 0.2))
@@ -166,7 +164,7 @@ class TestOutOfOrderAndBounds:
 
     def test_buffer_does_not_grow_without_bound(self):
         """長時間の計測でメモリを食い潰さないこと。"""
-        buf = SyncBuffer(target_hz=30.0, window_sec=1.0, max_gap_ms=100.0)
+        buf = _buffer(target_hz=30.0, window_sec=1.0, max_gap_ms=100.0)
         for i in range(3000):  # 100 秒相当
             t = i * 33.3
             buf.push(_frame("cam0", i, t, 0.1))
@@ -181,7 +179,7 @@ class TestOutOfOrderAndBounds:
         混成構成では PC のカメラが先に流れ始め、スマホが QR を読むまで何分も
         片側だけになる。組めないまま溜め続けると、30fps で 10 分に 18,000 フレーム残る。
         """
-        buf = SyncBuffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0)
+        buf = _buffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0)
         for i in range(300):  # 10 秒相当
             buf.push(_frame("cam0", i, i * 33.3, 0.1))
             buf.drain()
@@ -189,7 +187,7 @@ class TestOutOfOrderAndBounds:
 
     def test_pairs_form_once_the_late_role_arrives(self):
         """捨てたあとでも、遅れて来たロールと直近のフレームで組めること。"""
-        buf = SyncBuffer(target_hz=10.0, window_sec=1.0, max_gap_ms=250.0)
+        buf = _buffer(target_hz=10.0, window_sec=1.0, max_gap_ms=250.0)
         for i in range(50):  # cam0 だけ 5 秒
             buf.push(_frame("cam0", i, i * 100, 0.1))
             buf.drain()
@@ -200,7 +198,7 @@ class TestOutOfOrderAndBounds:
         assert pairs[0].t_ns == 4_500 * MS
 
     def test_frames_older_than_the_window_are_discarded(self):
-        buf = SyncBuffer(target_hz=10.0, window_sec=0.5, max_gap_ms=250.0)
+        buf = _buffer(target_hz=10.0, window_sec=0.5, max_gap_ms=250.0)
         for i in range(20):
             buf.push(_frame("cam0", i, i * 100, 0.1))
             buf.push(_frame("cam1", i, i * 100, 0.2))

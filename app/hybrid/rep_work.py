@@ -4,8 +4,9 @@
 掛けていた。同期バッファ（``app.net.sync_buffer``）は 100 ms を超える穴で組を作らないので、組が抜けると
 次の組の dt が 2〜数倍になり、その dt で全フレームを積んで仕事が数倍に化けた。
 
-- 仕事はフレームごとの dt で積む。dt が ``MAX_STEP_S`` を超えるフレーム（長い抜けの直後）は積まない。
-  その区間で腕がどう動いたかは分からないので、またいで積まない
+- 仕事はフレームごとの dt で積む。dt が ``max_step_s`` を超えるフレーム（長い抜けの直後）は積まない。
+  その区間で腕がどう動いたかは分からないので、またいで積まない。上限は同期バッファが補間で埋める穴の上限
+  （``GridSpec.max_gap_s``、既定 100 ms）で、計測（``NetworkMeasurement``）は同期バッファと同じ格子のものを渡す
 - 部位ごとに W+ = Σmax(P,0)·dt（論文 4.5.2 節の FB 尺度の分子、ゲージの値）、W− = Σmin(P,0)·dt（負の値）、
   W± = W+ + W− を持つ
 - 肘の濾波 E±（``energy_pipeline.compute_cycle_energy_filtered``）の材料として、肘角 θ と τ_y の列も持つ。
@@ -26,11 +27,8 @@ import numpy as np
 from app.hybrid.rep_detector import RepConfig
 from app.net.sync_buffer import DEFAULT_GRID
 
-__all__ = ["MAX_STEP_S", "LOOKAHEAD_FRAMES", "MAX_SERIES", "WorkSample", "PartWork", "RepAccumulator"]
+__all__ = ["LOOKAHEAD_FRAMES", "MAX_SERIES", "WorkSample", "PartWork", "RepAccumulator"]
 
-# これより長い dt のフレームは積まない [s]。既定の格子の、同期バッファが補間で埋める穴の上限（100 ms）。
-# 計測（NetworkMeasurement）は同期バッファと同じ GridSpec の max_gap_s を渡す
-MAX_STEP_S = DEFAULT_GRID.max_gap_s
 # 関所が開く前の輪の長さ（フレーム）。回の区切りの先読みの幅（RepConfig.lookback_frames）が正本
 LOOKAHEAD_FRAMES = RepConfig().lookback_frames
 # θ・τ_y の列の上限（30 Hz で 60 秒）
@@ -66,7 +64,7 @@ class RepAccumulator:
         self,
         parts: Iterable[str],
         *,
-        max_step_s: float = MAX_STEP_S,
+        max_step_s: float = DEFAULT_GRID.max_gap_s,
         lookahead: int = LOOKAHEAD_FRAMES,
         max_series: int = MAX_SERIES,
     ):

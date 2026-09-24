@@ -28,7 +28,7 @@ from typing import Callable, Iterable
 
 from app.net import protocol as p
 from app.net.server import DEFAULT_PORT, LandmarkServer, check_injectable, local_ip
-from app.net.sync_buffer import GridSpec, PairedSample, SyncBuffer
+from app.net.sync_buffer import DEFAULT_GRID, GridSpec, PairedSample, SyncBuffer
 
 __all__ = [
     "CALIBRATION",
@@ -178,10 +178,8 @@ class PhoneLink:
         host: str = "0.0.0.0",
         port: int = DEFAULT_PORT,
         advertise_host: str | None = None,
-        target_hz: float = 30.0,
         window_sec: float = 2.0,
-        max_gap_ms: float = 100.0,
-        grid: GridSpec | None = None,
+        grid: GridSpec = DEFAULT_GRID,
         on_pairs: PairsCallback | None = None,
         on_landmarks: LandmarksCallback | None = None,
         on_hello: HelloCheck | None = None,
@@ -196,8 +194,8 @@ class PhoneLink:
         """``session`` を省略すると起動ごとに作る。ランナーは ``stable_session()`` を渡し、
         Pixel が覚えた接続先へ自動でつなぎ直せるようにする。
 
-        ``grid``（``GridSpec``）を渡すと ``target_hz``・``max_gap_ms`` より優先する。計測のランナーは
-        ``MeasurementConfig.grid`` を渡し、同期バッファと計測の格子を揃える。"""
+        ``grid``（``GridSpec``）は同期バッファの格子。計測のランナーは ``MeasurementConfig.grid`` を渡し、
+        同期バッファと計測の格子を揃える。"""
         self.remote_role = remote_role
         self._user_on_tick = on_tick
         self._user_on_stop = on_stop
@@ -211,7 +209,7 @@ class PhoneLink:
         self._server = LandmarkServer(
             host=host,
             port=port,
-            buffer=SyncBuffer(target_hz=target_hz, window_sec=window_sec, max_gap_ms=max_gap_ms, grid=grid),
+            buffer=SyncBuffer(window_sec=window_sec, grid=grid),
             session=session,
             on_pairs=self._deliver_pairs,
             on_landmarks=self._handle_landmarks,

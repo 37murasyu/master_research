@@ -5,8 +5,9 @@
 補間の区間は直線になる。これを EKF の雑音の推定（S6）にかけると「なめらかで雑音が小さい」系列に見えて推定が狂う。
 
 そこで、遅い方のカメラ（点の数が少ない方）の実際の撮影時刻ごとに 1 組を作り、速い方だけを線形補間する（間隔が
-短いので補間の影響が小さい）。補間の規則（線形、visibility は低い方、``max_gap_ns`` を超える穴は埋めない）は
-同期バッファと同じ。三角測量は計測と同じ ``NetworkMeasurement.points_3d``（歪み補正を含む）。
+短いので補間の影響が小さい）。補間の規則（線形、visibility は低い方、``max_gap_ns``（既定は同期バッファの既定の
+格子の ``GridSpec.max_gap_ns``、100 ms）を超える穴は埋めない）は同期バッファと同じ。三角測量は計測と同じ
+``NetworkMeasurement.points_3d``（歪み補正を含む）。
 """
 
 from __future__ import annotations
@@ -25,11 +26,9 @@ from app.net.sync_buffer import DEFAULT_GRID, InterpolatedFrame, PairedSample
 from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 from config import pose_keypoints
 
-__all__ = ["MAX_GAP_NS", "Retriangulated", "read_landmarks", "pairs_at_real_times", "retriangulate"]
+__all__ = ["Retriangulated", "read_landmarks", "pairs_at_real_times", "retriangulate"]
 
 ROLES = ("cam0", "cam1")
-# 同期バッファの既定の格子の穴の上限（GridSpec.max_gap_ns、100 ms）。これを超える穴は補間で埋めない
-MAX_GAP_NS = DEFAULT_GRID.max_gap_ns
 
 
 @dataclass(frozen=True)
@@ -76,7 +75,7 @@ def _interpolate(frames: list[LandmarkFrame], times: list[int], t: int, max_gap_
 
 
 def pairs_at_real_times(frames: dict[str, list[LandmarkFrame]], *, reference: str | None = None,
-                        max_gap_ns: int = MAX_GAP_NS) -> tuple[str, list[PairedSample], int]:
+                        max_gap_ns: int = DEFAULT_GRID.max_gap_ns) -> tuple[str, list[PairedSample], int]:
     """遅い方（``reference``、既定は点の数が少ない方）の撮影時刻ごとに組を作る。戻り値は (reference, 組, 作れなかった数)。"""
     reference = reference or min(ROLES, key=lambda role: len(frames.get(role, [])))
     other = ROLES[1] if reference == ROLES[0] else ROLES[0]
@@ -94,7 +93,7 @@ def pairs_at_real_times(frames: dict[str, list[LandmarkFrame]], *, reference: st
 
 
 def retriangulate(session: str | Path, *, reference: str | None = None,
-                  max_gap_ns: int = MAX_GAP_NS) -> Retriangulated:
+                  max_gap_ns: int = DEFAULT_GRID.max_gap_ns) -> Retriangulated:
     """計測フォルダの 2D から、遅い方のカメラの撮影時刻で 3D を作り直す（校正は計測フォルダに写したもの）。"""
     calibration = load_session_calibration(session)
     # 使うのは状態を持たない points_3d だけ。既定の EKF（雑音の解決と LandmarkEKF の用意）は要らない

@@ -118,13 +118,13 @@ def test_frames_flow_through_the_sync_buffer():
 
     decode できるだけでは足りない。下流まで通ることを確かめる。
     """
-    from app.net.sync_buffer import SyncBuffer
+    from app.net.sync_buffer import GridSpec, SyncBuffer
 
     frames = [p.decode(m) for m in _messages() if json.loads(m).get("type") == "landmarks"]
     by_role = {frame.role: frame for frame in frames}
     assert set(by_role) == {"cam0", "cam1"}, "両方のロールのサンプルが要る"
 
-    buffer = SyncBuffer(target_hz=30.0, window_sec=2.0, max_gap_ms=100.0)
+    buffer = SyncBuffer(window_sec=2.0, grid=GridSpec(target_hz=30.0, max_gap_ms=100.0))
     base = min(frame.t_capture_ns for frame in frames)
 
     # 実サンプルを 100ms 刻みで並べ直して流す

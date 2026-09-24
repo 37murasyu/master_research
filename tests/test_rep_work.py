@@ -13,7 +13,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.hybrid.rep_work import MAX_STEP_S, RepAccumulator, WorkSample
+from app.hybrid.rep_work import RepAccumulator, WorkSample
+from app.net.sync_buffer import DEFAULT_GRID
 
 PARTS = ("elbow_R", "wrist_R")
 
@@ -45,7 +46,7 @@ class TestSums:
         """100 ms を超える dt（組の抜けの直後）はまたがない。その区間で腕がどう動いたかは分からない。"""
         acc = RepAccumulator(PARTS)
         assert acc.add(_sample(10.0, 1 / 30))
-        assert not acc.add(_sample(10.0, MAX_STEP_S + 0.01))
+        assert not acc.add(_sample(10.0, DEFAULT_GRID.max_gap_s + 0.01))
         assert acc.work()["elbow_R"].net == pytest.approx(10.0 / 30)
         assert acc.skipped == 1
 
