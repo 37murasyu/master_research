@@ -260,6 +260,45 @@ class TestBurstAfterStall:
         assert buf.buffered_count("cam1") <= limit
 
 
+class TestEvictionReference:
+    """古い点を捨てる基準は、受信時の PC の時計（``drain(now_ns)``）と点の最新の時刻の早い方。
+
+    点の最新の時刻だけを基準にすると、未来の時刻の点が 1 枚あるだけで基準が先へ引っ張られ、相手の点を
+    捨て尽くす。``--cam0-offset-ms`` で PC のカメラの点を保持時間より先へずらしたときも同じ形で壊れる。
+    """
+
+    def test_a_future_point_does_not_evict_the_other_role(self):
+        buf = _buffer(target_hz=10.0, window_sec=2.0, max_gap_ms=250.0)
+        now_ms = 100_000
+        for i in range(10):
+            buf.push(_frame("cam1", i, now_ms - 1_000 + i * 100, 0.2))
+        buf.push(_frame("cam0", 0, now_ms + 60_000, 0.1))
+        buf.drain(now_ns=now_ms * MS)
+        assert buf.buffered_count("cam1") == 10
+
+    def test_without_the_clock_the_newest_point_is_the_reference(self):
+        """記録の再生は PC の時計と関係の無い時刻を流すので、時計を渡さず点の時刻で捨てる。"""
+        buf = _buffer(target_hz=10.0, window_sec=2.0, max_gap_ms=250.0)
+        for i in range(10):
+            buf.push(_frame("cam1", i, 97_000 + i * 100, 0.2))
+        buf.push(_frame("cam0", 0, 100_000, 0.1))
+        buf.drain()
+        assert buf.buffered_count("cam1") == 2
+
+    def test_a_large_cam0_offset_still_pairs(self):
+        """PC のカメラの点を保持時間（2 s）より先（+3 s）へずらしても、組が出続けること。"""
+        buf = _buffer(target_hz=10.0, window_sec=2.0, max_gap_ms=250.0)
+        offset_ms = 3_000
+        emitted = 0
+        for i in range(100):  # 10 秒
+            t_ms = 100_000 + i * 100
+            buf.push(_frame("cam0", i, t_ms + offset_ms, 0.1))
+            emitted += len(buf.drain(now_ns=(t_ms + 5) * MS))
+            buf.push(_frame("cam1", i, t_ms + 7, 0.2))
+            emitted += len(buf.drain(now_ns=(t_ms + 150) * MS))
+        assert emitted >= (100 - 30) - 3
+
+
 class TestStats:
     def test_counts_emitted_and_dropped(self):
         buf = _buffer()

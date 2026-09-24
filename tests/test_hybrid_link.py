@@ -248,6 +248,30 @@ class TestPhoneLink:
         assert status.callback_errors > 0
         assert status.frames_received > 10, "例外の後も受信を続けていること"
 
+    def test_status_counts_points_dropped_by_capture_time(self):
+        """PC の時計より未来の撮影時刻の点は捨て、状態（time_rejected）に出す。"""
+        import websockets
+
+        link = PhoneLink(host="127.0.0.1", port=0)
+        link.start()
+
+        async def send_a_future_point() -> None:
+            async with websockets.connect(link.url) as ws:
+                await ws.send(p.encode(p.Hello("cam1", "Pixel 7a", link.session, "id")))
+                future = time.monotonic_ns() + 60_000_000_000
+                await ws.send(p.encode(p.LandmarkFrame(
+                    "cam1", 0, future, 1280, 720, synthetic_pose(0.0, "cam1"),
+                )))
+                await ws.send(p.encode(p.SyncRequest(t1=1)))
+                await asyncio.wait_for(ws.recv(), timeout=5)
+
+        try:
+            asyncio.run(send_a_future_point())
+            assert _wait_until(lambda: link.status().time_rejected == 1)
+            assert link.nearest_remote(time.monotonic_ns(), tolerance_ns=120_000_000_000) is None
+        finally:
+            link.stop()
+
     def test_occupied_port_fails_at_start(self):
         import socket
 

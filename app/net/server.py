@@ -37,6 +37,7 @@ __all__ = [
     "LandmarkServer",
     "DEFAULT_PORT",
     "CLOSE_TAKEN_OVER",
+    "MAX_FUTURE_NS",
     "check_injectable",
     "close_reason",
     "local_ip",
@@ -91,6 +92,11 @@ Clock = Callable[[], int]
 
 # 同じ役割の新しい接続に席を譲って閉じるときのコード。4000〜4999 はアプリが自由に使える範囲。
 CLOSE_TAKEN_OVER = 4000
+
+# 端末の点の撮影時刻が、受信時の PC の時計より先でよい上限 [ns]。端末の時刻合わせの誤差（往復の半分。
+# Wi-Fi で数十 ms）に余裕を見た値。これより先の時刻は時刻合わせの誤りか壊れた電文で、同期バッファに入れると
+# 格子がその時刻までの穴を「補間できない」と飛ばし、以後の組が全滅する。
+MAX_FUTURE_NS = 500_000_000
 
 
 def close_reason(text: str, limit: int = 123) -> str:
@@ -160,6 +166,8 @@ class SessionHandler:
         self.errors = 0
         # 役割の食い違いで捨てた電文の数。
         self.rejected = 0
+        # 撮影時刻が受信時の PC の時計から外れていて捨てた点の数（``_in_time``）。
+        self.time_rejected = 0
 
     def retire(self, reason: str) -> None:
         """席を譲る。閉じ終わるまでに届いた電文も使わない。"""
@@ -175,6 +183,16 @@ class SessionHandler:
             return False
         # 名乗った役割と違う点は使わない。混ざると補間が 2 台の間を行き来する。
         return self.hello is None or role == self.hello.role
+
+    def _in_time(self, t_capture_ns: int) -> bool:
+        """撮影時刻が、受信時の PC の時計から見て使える範囲にあるか。
+
+        先すぎる点（``MAX_FUTURE_NS`` より先）は、同期バッファに入れると以後の組を全滅させる。保持時間より
+        古い点は、相手の点がもう捨てられているので組にならない。PC のカメラの点（``LandmarkServer.inject``）は
+        ここを通らないので、``--cam0-offset-ms`` でずらした点は捨てない。
+        """
+        now = self._clock()
+        return now - self._buffer.window_ns <= t_capture_ns <= now + MAX_FUTURE_NS
 
     def handle(self, raw: str | bytes) -> str | None:
         """受信メッセージを処理し、返信が必要なら文字列で返す。
@@ -202,6 +220,9 @@ class SessionHandler:
                 return None
             self.role = message.role
             self.frames_received += 1
+            if not self._in_time(message.t_capture_ns):
+                self.time_rejected += 1
+                return None
             if self._accept_frame is not None and not self._accept_frame(message):
                 return None
             self._buffer.push(message)
@@ -280,7 +301,7 @@ class LandmarkServer:
         self._accept_frame = accept_frame
         self._require_hello = require_hello
         self._injected = 0
-        self._finished_counts = dict(frames_received=0, errors=0, rejected=0)
+        self._finished_counts = dict(frames_received=0, errors=0, rejected=0, time_rejected=0)
 
         self._server: Server | None = None
         self._handlers: dict[int, SessionHandler] = {}
@@ -407,7 +428,8 @@ class LandmarkServer:
         self._flush_pairs()
 
     def _flush_pairs(self) -> None:
-        pairs = self.buffer.drain()
+        # 古い点を捨てる基準に受信時の PC の時計を渡す。未来の時刻の点が基準を先へ引っ張らないように。
+        pairs = self.buffer.drain(now_ns=self._clock())
         if pairs and self._on_pairs is not None:
             self._on_pairs(pairs)
 
@@ -467,6 +489,7 @@ class LandmarkServer:
             "frames_injected": self._injected,
             "protocol_errors": self._finished_counts["errors"] + sum(h.errors for h in self._handlers.values()),
             "role_mismatches": self._finished_counts["rejected"] + sum(h.rejected for h in self._handlers.values()),
+            "time_rejected": self._finished_counts["time_rejected"] + sum(h.time_rejected for h in self._handlers.values()),
             **self.buffer.stats,
         }
 
@@ -563,7 +586,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 f"受信 {stats['frames_received']}  ペア {stats['emitted']}  "
                 f"欠測破棄 {stats['dropped_gap']}  "
                 f"位相差 {stats['mean_role_skew_ms']:.1f}ms(最大{stats['max_role_skew_ms']:.1f})  "
-                f"不正 {stats['protocol_errors']}"
+                f"不正 {stats['protocol_errors']}  時刻外 {stats['time_rejected']}"
             )
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass

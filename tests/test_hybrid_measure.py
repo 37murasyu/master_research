@@ -212,7 +212,8 @@ def test_rejected_frame_does_not_enter_sync_buffer(tmp_path):
         buffer, on_hello=session.check_hello, accept_frame=session.accept_frame
     )
     handler.handle(p.encode(Hello("cam1", "Pixel", "s", "pixel-1")))
-    bad = LandmarkFrame("cam1", 0, 1, 640, 360, [(0.5, 0.5, 0, 1)] * 33)
+    # 撮影時刻は PC の時計の今の頃にする（時刻外の点は解像度を見る前に SessionHandler が捨てる）
+    bad = LandmarkFrame("cam1", 0, time.monotonic_ns(), 640, 360, [(0.5, 0.5, 0, 1)] * 33)
     handler.handle(p.encode(bad))
     assert not buffer.drain()
     assert session.size_drops == 1

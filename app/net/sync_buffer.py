@@ -216,12 +216,16 @@ class SyncBuffer:
         frames.insert(index, frame)
 
     # -- 出力 --------------------------------------------------------------
-    def drain(self) -> list[PairedSample]:
-        """今の時点で組めるペアをすべて返す。"""
+    def drain(self, now_ns: int | None = None) -> list[PairedSample]:
+        """今の時点で組めるペアをすべて返す。
+
+        ``now_ns`` は受信時の PC の時計（受信サーバが渡す）。古い点を捨てる基準（``_evict``）を、点の最新の
+        時刻とこれの早い方にする。記録の再生のように PC の時計と関係の無い時刻を流すときは渡さない。
+        """
         if not self._ensure_grid_origin():
             # 片方しか来ていない間も古いものは捨てる。混成構成では PC のカメラが
             # 先に流れ始め、スマホが繋がるまで片側だけが溜まり続けるため。
-            self._evict()
+            self._evict(now_ns)
             return []
 
         pairs: list[PairedSample] = []
@@ -245,7 +249,7 @@ class SyncBuffer:
             self._next_grid_ns = t + self.grid.period_ns
             self._next_grid_index += 1
 
-        self._evict()
+        self._evict(now_ns)
         return pairs
 
     # -- 内部 --------------------------------------------------------------
@@ -349,13 +353,20 @@ class SyncBuffer:
             nearest.append(min(candidates, key=lambda x: abs(x - t)))
         self._stats.observe_skew((max(nearest) - min(nearest)) / 1_000_000)
 
-    def _evict(self) -> None:
-        """時間窓より古いフレームを捨てる。長時間の計測でメモリを食わないため。"""
+    def _evict(self, now_ns: int | None) -> None:
+        """時間窓より古いフレームを捨てる。長時間の計測でメモリを食わないため。
+
+        基準は点の最新の時刻と、受信時の PC の時計（``now_ns``）の早い方。点の時刻だけを基準にすると、
+        未来の時刻の点が 1 枚あるだけで基準が先へ引っ張られ、相手の点を捨て尽くして以後の組が全滅する
+        （``--cam0-offset-ms`` で PC のカメラの点を保持時間より先へずらしたときも同じ）。
+        """
         newest = max(
             (f[-1].t_capture_ns for f in self._frames.values() if f), default=None
         )
         if newest is None:
             return
+        if now_ns is not None:
+            newest = min(newest, now_ns)
         cutoff = newest - self.window_ns
 
         for frames in self._frames.values():

@@ -155,6 +155,8 @@ class LinkStatus:
     max_skew_ms: float = 0.0
     protocol_errors: int = 0
     role_mismatches: int = 0
+    # 撮影時刻が受信時の PC の時計から外れていて捨てた端末の点の数（先すぎる・保持時間より古い）。
+    time_rejected: int = 0
     captures_received: int = 0
     capture_timeouts: int = 0
     callback_errors: int = 0
@@ -401,6 +403,7 @@ class PhoneLink:
             max_skew_ms=float(stats["max_role_skew_ms"]),
             protocol_errors=int(stats["protocol_errors"]),
             role_mismatches=int(stats["role_mismatches"]),
+            time_rejected=int(stats["time_rejected"]),
             captures_received=captures,
             capture_timeouts=self._scheduler.timeouts,
             callback_errors=errors,
