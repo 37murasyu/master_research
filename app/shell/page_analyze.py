@@ -123,6 +123,9 @@ class AnalyzePage(RunnerPage):
     def widgets_enabled_while_running(self) -> list[QtWidgets.QWidget]:
         return [self._stop_button]
 
+    def start_widgets(self) -> list[QtWidgets.QWidget]:
+        return [self._run_button]
+
     def build_side_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)

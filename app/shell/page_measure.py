@@ -413,13 +413,19 @@ class MeasurePage(RunnerPage):
 
     def _refresh_main_button(self) -> None:
         """主ボタンを押せるか。実行中は押せる（停止）が、停止を求めて子が終わるのを待つ間は押せない。
-        止まっているときは開始できない理由があれば押せない。"""
+        止まっているときは開始できない理由（ほかのページが実行中・再生のフォルダ）があれば押せない。"""
         problem = None
-        if self._header_phase != "running" and self._input.replay_folder:
-            problem = replay_folder_problem(self._settings.get(_REPLAY_FOLDER))
+        if self._header_phase != "running":
+            problem = self._blocked_by
+            if problem is None and self._input.replay_folder:
+                problem = replay_folder_problem(self._settings.get(_REPLAY_FOLDER))
         self._main_button.setEnabled(problem is None and self._state != "stopping")
         self._start_blocked.setText(problem or "")
         self._start_blocked.setVisible(problem is not None)
+
+    def _refresh_blocked(self) -> None:
+        # ほかのページが実行中の理由も、主ボタンの左の欄（_start_blocked）に出す（見出しの共通の欄は使わない）
+        self._refresh_main_button()
 
     def _on_state(self, state: str) -> None:
         super()._on_state(state)

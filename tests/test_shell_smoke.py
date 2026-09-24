@@ -271,6 +271,69 @@ class TestStopDirectory:
         assert not list(tmp_path.glob("wt_stop_*")), "起動に失敗したのに停止用のディレクトリが残った"
 
 
+class TestOnePageAtATime:
+    """どれかのページが実行中なら、ほかのページの開始は押せず、理由が出る。
+
+    計測とキャリブレーションを同時に走らせられ、同じカメラや Pixel の接続を取り合っていた。
+    """
+
+    @pytest.fixture
+    def window(self, qt_app, monkeypatch):
+        from app.shell.main_window import MainWindow
+
+        monkeypatch.setattr(MainWindow, "_save_settings", lambda self: None)
+        window = MainWindow(Settings())
+        yield window
+        window.close()
+
+    def test_a_running_measurement_blocks_the_other_pages(self, window):
+        measure, calibrate, analyze = window._pages
+        assert calibrate._start_button.isEnabled() and analyze._run_button.isEnabled()
+
+        for state in ("starting", "running", "stopping"):
+            measure._runner.state_changed.emit(state)
+            assert not calibrate._start_button.isEnabled(), state
+            assert not analyze._run_button.isEnabled(), state
+            for page in (calibrate, analyze):
+                assert page._blocked_label.isVisibleTo(page) and "計測" in page._blocked_label.text(), state
+        assert not measure._blocked_label.isVisibleTo(measure), "実行中のページ自身には理由を出さない"
+
+        measure._runner.state_changed.emit("stopped")
+        assert calibrate._start_button.isEnabled() and analyze._run_button.isEnabled()
+        assert not calibrate._blocked_label.isVisibleTo(calibrate)
+
+    def test_a_running_calibration_blocks_the_measure_main_button_with_a_reason(self, window):
+        measure, calibrate, _analyze = window._pages
+        calibrate._runner.state_changed.emit("running")
+        assert not measure._main_button.isEnabled()
+        assert measure._start_blocked.isVisibleTo(measure) and "キャリブレーション" in measure._start_blocked.text()
+        assert calibrate._stop_button.isEnabled(), "実行中のページは中止できる"
+
+        calibrate._runner.state_changed.emit("stopped")
+        assert measure._main_button.isEnabled()
+        assert not measure._start_blocked.isVisibleTo(measure)
+
+    def test_the_measurement_and_the_calibration_do_not_run_together(self, window, monkeypatch):
+        import sys
+
+        from app import entry
+
+        started = []
+        child = "import time\ntime.sleep(30)\n"
+        monkeypatch.setattr(entry, "worker_command",
+                            lambda role, passthrough=None, module=None: started.append(role) or [sys.executable, "-c", child])
+        measure, calibrate, _analyze = window._pages
+        try:
+            measure._main_button.click()
+            calibrate._start_button.click()
+            assert started == ["realtime"]
+            assert not calibrate.is_running
+        finally:
+            for page in window._pages:
+                page._runner._process.kill()
+                page._runner._process.waitForFinished(5000)
+
+
 class TestStopping:
     """停止を求めてから子が終わるまで（state "stopping"）の画面。"""
 

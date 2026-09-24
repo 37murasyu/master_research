@@ -25,6 +25,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1100, 720)
 
         self._pages: list[RunnerPage] = []
+        self._labels: list[str] = []  # ページの名前（左の一覧と同じ。_pages と同じ並び）
         self._build_ui()
 
     # -- 画面 --------------------------------------------------------------
@@ -51,6 +52,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._nav.addItem(label)
             self._stack.addWidget(page)
             self._pages.append(page)
+            self._labels.append(label)
+            page.busy_changed.connect(self._sync_start_blocks)
 
         # 計測画面の校正の「変更」リンクで、キャリブレーション画面へ移る
         measure.calibration_requested.connect(
@@ -62,6 +65,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._nav.setCurrentRow(0)
 
         self.statusBar().showMessage(f"設定: {self._settings_path}")
+
+    def _sync_start_blocks(self) -> None:
+        """どれかのページが実行中なら、ほかのページの開始を押せなくし、理由を出す。
+
+        計測とキャリブレーションを同時に走らせると、同じカメラや Pixel の接続を取り合う。
+        """
+        for page in self._pages:
+            busy = [label for label, other in zip(self._labels, self._pages) if other is not page and other.is_busy]
+            page.set_blocked_by(f"{busy[0]}の実行中は開始できません" if busy else None)
 
     def _build_nav(self) -> QtWidgets.QListWidget:
         nav = QtWidgets.QListWidget()

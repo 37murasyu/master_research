@@ -164,6 +164,10 @@ class RunnerPage(QtWidgets.QWidget):
         header_widgets()                  ヘッダに置く追加ウィジェット
         widgets_disabled_while_running()  実行中（停止を待つ間も）に触れなくするもの
         widgets_enabled_while_running()   実行中だけ押せるもの（中止ボタンなど。停止を待つ間は押せない）
+        start_widgets()                   開始の操作。ほかのページが実行中の間は押せなくする（set_blocked_by）
+
+    ページどうしは互いを知らない。どれかが実行中かは ``busy_changed`` で MainWindow に知らせ、
+    MainWindow がほかのページに ``set_blocked_by`` で開始できない理由を渡す。
     """
 
     TITLE: str = ""
@@ -172,6 +176,9 @@ class RunnerPage(QtWidgets.QWidget):
 
     # 子がまだ動いている状態（停止を求めて終わるのを待つ "stopping" を含む）
     BUSY_STATES = ("starting", "running", "stopping")
+
+    # 実行の状態が変わった（is_busy を読み直す）。ページ自身の _on_state が済んでから出る
+    busy_changed = QtCore.Signal()
 
     def __init__(
         self,
@@ -183,10 +190,14 @@ class RunnerPage(QtWidgets.QWidget):
         self._settings = settings
         # 最後に届いた実行の状態（WorkerRunner.state_changed）
         self._state = "stopped"
+        # ほかのページが実行中で、このページの開始を押せない理由（MainWindow が渡す）。押せるなら None
+        self._blocked_by: str | None = None
 
         self._runner = WorkerRunner(role, self)
         self._runner.output.connect(self.append_log)
+        # つなぐ順に呼ばれるので、busy_changed は _on_state（サブクラスの分も）が済んでから出る
         self._runner.state_changed.connect(self._on_state)
+        self._runner.state_changed.connect(lambda _state: self.busy_changed.emit())
 
         self._build_ui()
         self._on_state("stopped")
@@ -217,6 +228,11 @@ class RunnerPage(QtWidgets.QWidget):
         row.addWidget(title)
         row.addStretch(1)
 
+        # ほかのページが実行中で開始できない理由（_refresh_blocked）。計測画面は主ボタンの左の欄に出す
+        self._blocked_label = QtWidgets.QLabel()
+        self._blocked_label.setVisible(False)
+        row.addWidget(self._blocked_label)
+
         self._badge = StatusBadge()
         row.addWidget(self._badge)
         for widget in self.header_widgets():
@@ -245,6 +261,9 @@ class RunnerPage(QtWidgets.QWidget):
     def widgets_enabled_while_running(self) -> list[QtWidgets.QWidget]:
         return []
 
+    def start_widgets(self) -> list[QtWidgets.QWidget]:
+        return []
+
     # -- 共通の振る舞い ----------------------------------------------------
     def append_log(self, text: str) -> None:
         self._log.append_text(text)
@@ -258,6 +277,26 @@ class RunnerPage(QtWidgets.QWidget):
         # 停止を待つ間は中止も押せない（もう求めてある）
         for widget in self.widgets_enabled_while_running():
             widget.setEnabled(busy and state != "stopping")
+        self._refresh_blocked()
+
+    def set_blocked_by(self, reason: str | None) -> None:
+        """ほかのページが実行中なら、その理由（開始を押せなくする）。無ければ None。"""
+        self._blocked_by = reason
+        self._refresh_blocked()
+
+    def _refresh_blocked(self) -> None:
+        """止まっている間だけ、ほかのページが実行中なら開始の操作を押せなくし、理由を見出しに出す。"""
+        blocked = self._blocked_by is not None and not self.is_busy
+        if not self.is_busy:
+            for widget in self.start_widgets():
+                widget.setEnabled(not blocked)
+        self._blocked_label.setText(self._blocked_by or "")
+        self._blocked_label.setVisible(blocked)
+
+    @property
+    def is_busy(self) -> bool:
+        """子がまだ動いているか（起動中・実行中・停止を待つ間）。"""
+        return self._state in self.BUSY_STATES
 
     def shutdown(self) -> None:
         """ウィンドウを閉じるとき、子プロセスを残さない（終わるまで待つ。猶予を過ぎたら強制終了）。"""
