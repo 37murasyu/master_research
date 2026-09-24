@@ -143,17 +143,28 @@ class ExtendedKalman1D:
             H = np.array([[1.0, 0.0, 0.0]], dtype=float)
         return z_pred, H
 
+    def _start(self, z: Optional[float]) -> None:
+        """観測 ``z`` で状態を初期化する（位置 = z、速度・加速度 0、P = I）。
+
+        初めて観測したとき（``step``）と、外から作り直すとき（``LandmarkEKF.reset_series``）で共有する。
+        ``z`` が None なら作った直後の未初期化の状態に戻す（次の観測で初期化する）。
+        """
+        self.x[:] = 0.0
+        self.P = np.eye(3, dtype=float)
+        self._gap_s = 0.0
+        if z is None:
+            self.initialized = False
+            return
+        self.x[0] = float(z)
+        self.initialized = True
+
     def step(self, z: Optional[float], dt: float) -> Tuple[float, float, float]:
         if dt <= 0:
             raise ValueError("dt must be positive")
         if not self.initialized:
             if z is None:
                 return float("nan"), float("nan"), float("nan")
-            self.x[:] = 0.0
-            self.x[0] = float(z)
-            self.P = np.eye(3, dtype=float)
-            self.initialized = True
-            self._gap_s = 0.0
+            self._start(z)
             return float(self.x[0]), float(self.x[1]), float(self.x[2])
 
         self._predict(dt)
@@ -367,6 +378,53 @@ class LandmarkEKF:
                 out[i, j] = y[-1]
         return out
 
+    def _start_rows(self, rows: np.ndarray, z: np.ndarray) -> None:
+        """ベクトル化版の系列 ``rows``（(N,) の真偽）を観測 ``z``（(N,)）で初期化する。
+
+        ``ExtendedKalman1D._start`` と同じ値（位置 = z、速度・加速度 0、P = I、欠測の長さ 0）。
+        初めて観測したとき（``_step_vectorized`` の 1)）と ``reset_series`` で共有する。``z`` は有限であること。
+        """
+        X = self._X
+        X[rows] = 0.0
+        X[rows, 0] = z[rows]
+        self._P[rows] = self._I3
+        self._init[rows] = True
+        self._gap[rows] = 0.0
+
+    def _forget_rows(self, rows: np.ndarray) -> None:
+        """ベクトル化版の系列 ``rows`` を作った直後の未初期化の状態に戻す（次の観測で初期化する）。"""
+        self._X[rows] = 0.0
+        self._P[rows] = self._I3
+        self._init[rows] = False
+        self._gap[rows] = 0.0
+
+    def reset_series(self, mask: np.ndarray, z: np.ndarray) -> None:
+        """``mask``（(n_points,) の真偽）の点の状態を観測 ``z``（(n_points, 3)）で初期化し直す。
+
+        その点を新しく観測し始めたとき（未初期化の系列に初めて観測が来た ``step``）と同じ状態にする:
+        位置 = z、速度・加速度 0、P = I、欠測の長さ 0。雑音パラメータは引き継ぐ。点の中で z が NaN の軸は
+        未初期化に戻す（次の観測で初期化する。``step`` はそれまで NaN を返す）。``mask`` の外の点は触らない。
+
+        ``z`` は EKF が追う値として使う。前処理の BPF（``bandpass_enabled``）は通さず、その状態も触らない。
+        """
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self.n_points,):
+            raise ValueError(f"mask shape must be {(self.n_points,)}, got {mask.shape}")
+        z = np.asarray(z, dtype=float)
+        if z.shape != (self.n_points, 3):
+            raise ValueError(f"z shape must be {(self.n_points, 3)}, got {z.shape}")
+        if self.vectorized:
+            flat = z.reshape(-1)
+            rows = np.repeat(mask, 3)
+            valid = np.isfinite(flat)
+            self._start_rows(rows & valid, flat)
+            self._forget_rows(rows & ~valid)
+            return
+        for i in np.flatnonzero(mask):
+            for j in range(3):
+                z_val = z[i, j]
+                self.filters[i][j]._start(float(z_val) if np.isfinite(z_val) else None)
+
     def _step_vectorized(self, arr: np.ndarray, dt: float):
         """ExtendedKalman1D.step を (n_points*3) 本まとめて配列演算で実行する。
 
@@ -382,11 +440,7 @@ class LandmarkEKF:
         # 1) 今フレームで初期化されるもの
         new = (~init) & valid
         if new.any():
-            X[new] = 0.0
-            X[new, 0] = z[new]
-            P[new] = self._I3
-            init[new] = True
-            gap[new] = 0.0
+            self._start_rows(new, z)
 
         # 2) 既に初期化済みだったものだけ predict（今回初期化した分は除く）
         pred = init & ~new

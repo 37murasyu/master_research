@@ -119,6 +119,9 @@ class GridEkf:
 
     def _new_filter(self, cfg) -> LandmarkEKF:
         s = self.settings
+        # 作り直し（_reinit）は reset_series を使うので逐次版でも動くが、ベクトル化版に固定する。受信スレッドで
+        # 30 Hz に回すには逐次版（系列ごとの ExtendedKalman1D の Python のループ）は遅く、混成は EKF_VECTORIZED を
+        # 読まず、出どころ（app.hybrid.measurement）にも EKF_VECTORIZED=True と記録している
         return LandmarkEKF(
             len(self.landmark_ids), fs=1.0 / self.dt, cfg=cfg,
             bpf_low=s.bpf_low, bpf_high=s.bpf_high, bpf_order=s.bpf_order, vectorized=True,
@@ -138,17 +141,9 @@ class GridEkf:
     def _reinit(self, points: np.ndarray, raw: np.ndarray) -> None:
         """``points`` の点の状態を観測 ``raw`` で初期化し直す（位置 = 観測、速度・加速度 0、P = I）。
 
-        ``LandmarkEKF`` のベクトル化の状態（``_X``・``_P``・``_init``・``_gap``）を直接書く。初めて観測したときの
-        初期化（``_step_vectorized`` の 1)）と同じ値にする。
+        ``LandmarkEKF.reset_series`` を使う（初めて観測したときの初期化と同じ式）。
         """
-        ekf = self._ekf
-        rows = np.repeat(points, 3)
-        z = raw.reshape(-1)
-        ekf._X[rows] = 0.0
-        ekf._X[rows, 0] = z[rows]
-        ekf._P[rows] = np.eye(3)
-        ekf._init[rows] = np.isfinite(z[rows])
-        ekf._gap[rows] = 0.0
+        self._ekf.reset_series(points, raw)
 
     def step(self, raw: np.ndarray, missing: int = 0) -> tuple[np.ndarray, np.ndarray]:
         """``missing`` 個の格子が抜けた後の観測 ``raw``（点 × 3）で更新し、(位置, 速度) を返す。"""
