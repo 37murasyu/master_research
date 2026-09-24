@@ -2,9 +2,11 @@
 
     python -m app.runners.hybrid_replay <計測フォルダ> [--from 20] [--to 90] [--speed 1]
 
-GUI からは、環境変数 ``HYBRID_REPLAY=<計測フォルダ>``（任意で ``HYBRID_REPLAY_FROM``・``HYBRID_REPLAY_TO``・
-``HYBRID_REPLAY_SPEED``）を付けて GUI を起動し、入力「Mac＋Pixel」で計測を開始する。``hybrid_measure`` が
-この環境変数を見てここへ回す。カメラと Pixel は使わない。記録は ``hybrid/replay/`` に書く（本番の記録と混ざらない）。
+GUI からは独立の role ``hybrid_replay``（``app.entry.WORKER_MODULES``）で引数なしに起動する。計測フォルダは設定
+``HYBRID_REPLAY``、範囲と速さは ``HYBRID_REPLAY_FROM``・``HYBRID_REPLAY_TO``・``HYBRID_REPLAY_SPEED``（空なら既定）を
+環境変数で受け取る。これらは再生の子にしか渡らない（``app.entry.worker_environment``）ので、親のシェルに残った
+``export`` で実機の計測（``hybrid_measure``）が再生になることはない。停止は計測と同じ停止ファイル。
+カメラと Pixel は使わない。記録は ``hybrid/replay/`` に書く（本番の記録と混ざらない）。
 
 設定（被験者番号・1RM・EKF・関所など）は計測の子と同じ ``hybrid_measure.measurement_config`` で環境変数から作る。
 記録を流すのは別のスレッド（本番の受信スレッドの代わり）、行を書くのはメインスレッド（本番と同じ）。

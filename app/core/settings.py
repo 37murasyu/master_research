@@ -260,6 +260,38 @@ CURATED: dict[str, dict[str, Any]] = {
         "group": "被験者",
         "description": "体重 [kg]。",
     },
+    # --- 記録の再生（role hybrid_replay）だけが読む項目 ---------------------
+    # 既定値つきで全件渡すので、再生の子には親のシェルに残った値が効かない。ほかの子へは
+    # app.entry.worker_environment が渡さない（HYBRID_REPLAY で始まる名前をまとめて落とす）。
+    # フォルダは計測画面の専用の欄（入力「記録の再生」）で選ぶので、設定フォームには出さない。
+    "HYBRID_REPLAY": {
+        "type": "str",
+        "code_default": "",
+        "group": "記録の再生",
+        "description": "流し直す Mac＋Pixel の計測フォルダ（meta.json のあるもの）。",
+    },
+    "HYBRID_REPLAY_FROM": {
+        "type": "float",
+        "code_default": "0",
+        "ui_visible": True,
+        "group": "記録の再生",
+        "description": "記録の何秒目から流すか。",
+    },
+    # 数の欄では「終わりまで」を表せないので文字の欄にする（空なら終わりまで。子は数として読む）
+    "HYBRID_REPLAY_TO": {
+        "type": "str",
+        "code_default": "",
+        "ui_visible": True,
+        "group": "記録の再生",
+        "description": "記録の何秒目まで流すか。空なら終わりまで。",
+    },
+    "HYBRID_REPLAY_SPEED": {
+        "type": "float",
+        "code_default": "1",
+        "ui_visible": True,
+        "group": "記録の再生",
+        "description": "流す速さ。1 で実時間、0 で待たない。",
+    },
 }
 
 

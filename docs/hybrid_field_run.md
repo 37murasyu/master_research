@@ -66,10 +66,15 @@
    重力の出どころ・処理時間を見る。最初の本計測の `kpts3d_raw_<stamp>.csv` から解析ページ（または `python -m app.runners.tune_ekf`）で
    EKF の較正プロファイルを作り、設定 `HYBRID_EKF_PROFILE` に `~/Documents/WheelchairTorque/hybrid/ekf_profiles` を入れる
 
-**被験者なしの練習（記録を流し直す）**: `HYBRID_REPLAY=<計測フォルダ> .venv/bin/python -m app` で GUI を起動し、入力「Mac＋Pixel」で開始すると、
-カメラと Pixel を使わずに記録を実時間で流し、ゲージが「▶ 再生」の印つきで動く（任意で `HYBRID_REPLAY_FROM=20`・`HYBRID_REPLAY_SPEED=1`）。
+**被験者なしの練習（記録を流し直す）**: 計測画面の「実験者用の詳細設定」で入力を「記録の再生」にし、「記録」の行の「選ぶ…」で
+計測フォルダ（`meta.json` のあるもの。既定は `~/Documents/WheelchairTorque/hybrid/measure` から選び始める）を選んで開始すると、
+カメラと Pixel を使わずに記録を実時間で流し、ゲージが「▶ 再生」の印つきで動く。フォルダを選ぶまで主ボタンは押せない。
+流す範囲と速さは入れ子の「開発・診断用」の `HYBRID_REPLAY_FROM`・`HYBRID_REPLAY_TO`（空なら終わりまで）・`HYBRID_REPLAY_SPEED`
+（1 で実時間、0 で待たない）。記録は `~/Documents/WheelchairTorque/hybrid/replay` に書き、終わった後の「出力フォルダ」でそこが開く。
+再生は実機の計測とは別の役割なので、シェルに `HYBRID_REPLAY` を export しても「Mac＋Pixel」の計測は再生にならない（環境変数は
+再生の子にも渡らず、画面で選んだ値だけが渡る）。端末からは `.venv/bin/python -m app.runners.hybrid_replay <計測フォルダ> --from 20` でも流せる。
 合成の押し上げは `.venv/bin/python -m tools.synth_session --out ~/Documents/WheelchairTorque/hybrid/synth --reps 10` で作れる。
-2026-09-23 の実機の記録は先頭が壊れているので `HYBRID_REPLAY_FROM=20` から流す。ただしこの記録は置き方の失敗で両腕とも骨の長さが大きく
+2026-09-23 の実機の記録は先頭が壊れているので `HYBRID_REPLAY_FROM` を 20 にして流す。ただしこの記録は置き方の失敗で両腕とも骨の長さが大きく
 揺れ、骨の長さの見張り（先頭の窓の中央値から ±25%）が 20〜90 s の左腕 74%・右腕 79% のフレームをゲージに積まないので、ゲージはほとんど
 動かない（偽の過負荷を出さないための働き）。ゲージの動きを確かめるには合成の押し上げを流す。
 

@@ -175,21 +175,23 @@ def test_the_demo_moves_the_gauge_without_torque(fakes, capsys, monkeypatch):
     assert json.loads((Path(folder) / "meta.json").read_text(encoding="utf-8"))["demo"] is True
 
 
-def test_hybrid_replay_takes_over_before_any_device_opens(monkeypatch):
-    """GUI は子へ引数を渡さないので、``HYBRID_REPLAY`` があれば計測の入口が再生（``app.runners.hybrid_replay``）へ渡す。
+def test_hybrid_measure_ignores_hybrid_replay(monkeypatch):
+    """``hybrid_measure`` は常に実機の計測。``HYBRID_REPLAY`` があっても再生へ回さない。
 
-    カメラ・姿勢推定・PhoneLink は作らない（再生は記録した 2D を流すだけで、Mac のカメラも Pixel も要らない）。
+    以前は環境変数を見て再生へ回していたので、親のシェルに残った ``export HYBRID_REPLAY=...`` で本番の計測が
+    黙って再生になった。再生は独立の role（``hybrid_replay``）で、GUI は「記録の再生」の入力で選ぶ。
     """
     import app.runners.hybrid_replay as hybrid_replay
 
-    calls = []
+    def replay_main(argv=None):
+        raise AssertionError("HYBRID_REPLAY を見て再生へ回した")
 
-    def boom(*args, **kwargs):
-        raise AssertionError("再生のときに機器を開いた")
+    def load_calibration(name):
+        raise ValueError("校正が無い（実機の道を通った印）")
 
     monkeypatch.setenv("HYBRID_REPLAY", "/somewhere/measure/20260923_000000_000000")
-    monkeypatch.setattr(hybrid_replay, "main", lambda argv=None: calls.append(argv) or 0)
-    for name in ("MacCamera", "PoseDetector", "PhoneLink", "LiveSession", "load_calibration"):
-        monkeypatch.setattr(hybrid_measure, name, boom)
-    assert hybrid_measure.main([]) == 0
-    assert calls == [[]]
+    monkeypatch.setattr(hybrid_replay, "main", replay_main)
+    monkeypatch.setattr(hybrid_measure, "load_calibration", load_calibration)
+    assert hybrid_measure.main([]) == 2
+    source = Path(hybrid_measure.__file__).read_text(encoding="utf-8")
+    assert "REPLAY_ENV" not in source and "hybrid_replay" not in source

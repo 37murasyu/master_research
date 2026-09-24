@@ -23,6 +23,7 @@ from app.gauge.protocol import GaugeFrame, PartReading  # noqa: E402
 
 HYBRID = "hybrid_measure"
 USB = "realtime"
+REPLAY = "hybrid_replay"
 
 # 停止ファイルが置かれるまで待つだけの子。WorkerRunner.stop が停止ファイルを置くと抜ける。
 _CHILD_WAITS_FOR_STOP_FILE = (
@@ -56,8 +57,8 @@ def page(qt_app, settings):
 
 
 def _choose_input(page, role: str) -> None:
-    """入力（USB カメラ 2 台／Mac＋Pixel）のラジオを押す。"""
-    (page._input_hybrid if role == HYBRID else page._input_usb).click()
+    """入力（USB カメラ 2 台／Mac＋Pixel／記録の再生）のラジオを押す。"""
+    {USB: page._input_usb, HYBRID: page._input_hybrid, REPLAY: page._input_replay}[role].click()
     assert page._runner.role == role
 
 
@@ -88,6 +89,22 @@ def _start_hybrid(monkeypatch, page) -> None:
     _choose_input(page, HYBRID)
     _fake_start(monkeypatch, page)
     page._main_button.click()
+
+
+def _session_folder(tmp_path):
+    """再生できる計測フォルダ（中身は meta.json だけ。子は起動しないので足りる）。"""
+    folder = tmp_path / "measure" / "20260923_000000_000000"
+    folder.mkdir(parents=True)
+    (folder / "meta.json").write_text("{}", encoding="utf-8")
+    return folder
+
+
+def _start_replay(monkeypatch, page, tmp_path) -> list[str]:
+    _choose_input(page, REPLAY)
+    page._replay_edit.setText(str(_session_folder(tmp_path)))
+    calls = _fake_start(monkeypatch, page)
+    page._main_button.click()
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -353,20 +370,43 @@ def _folder_link_url(page, monkeypatch):
 
 
 class TestAdvancedSettings:
-    def test_input_is_a_pair_of_radio_buttons(self, page):
+    def test_input_is_three_radio_buttons(self, page):
         from app.core.qt import QtWidgets
 
         radios = page.findChildren(QtWidgets.QRadioButton)
-        assert [r.text() for r in radios] == ["USB カメラ 2 台", "Mac＋Pixel"]
+        assert [r.text() for r in radios] == ["USB カメラ 2 台", "Mac＋Pixel", "記録の再生"]
         group = radios[0].group()
-        assert group is not None and group is radios[1].group() and group.exclusive()
+        assert group is not None and all(r.group() is group for r in radios) and group.exclusive()
         assert page._input_usb.isChecked() and page._runner.role == USB
-        assert not page.findChildren(QtWidgets.QComboBox), "入力のコンボボックスが残っている（n=2 は R2-03）"
+        assert not page.findChildren(QtWidgets.QComboBox), "入力のコンボボックスが残っている（少数は R2-03）"
+
+    def test_inputs_come_from_one_table(self, page):
+        """入力ごとの事実（role・名前・ゲージ・接続・校正の行・出力フォルダ）は ``MEASURE_INPUTS`` の 1 か所だけに書く。
+
+        ラジオの並びも表示の切り替えもこの表を引く。画面のコードに role の文字列の比較が散っていると、
+        入力を 1 つ足すたびに全部を探して直すことになり、1 か所の直し漏れで振る舞いが食い違う。
+        """
+        from pathlib import Path
+
+        from app.core.qt import QtWidgets
+        import app.shell.page_measure as module
+
+        inputs = module.MEASURE_INPUTS
+        radios = page.findChildren(QtWidgets.QRadioButton)
+        assert [r.text() for r in radios] == [i.label for i in inputs]
+        for spec in inputs:
+            assert module.measure_input(spec.role) is spec
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert '"hybrid_measure"' in source and source.count('"hybrid_measure"') == 1, "role の文字列が表の外にもある"
+        assert "_HYBRID_ROLE" not in source
 
     def test_radio_switches_role(self, page):
         page._input_hybrid.click()
         assert page._runner.role == HYBRID
         assert not page._joules_switch.isHidden()
+        page._input_replay.click()
+        assert page._runner.role == REPLAY, "再生は実機の計測（hybrid_measure）とは別の role"
+        assert not page._joules_switch.isHidden(), "再生もゲージ窓に J を出す"
         page._input_usb.click()
         assert page._runner.role == USB
         assert page._joules_switch.isHidden()
@@ -428,7 +468,8 @@ class TestAdvancedSettings:
         assert _row_names(form) & visible == visible - {"SUBJECT_ID"}
 
     def test_settings_disabled_while_running_with_reason(self, page):
-        editors = (page._input_usb, page._input_hybrid, page._subject_edit, page._body_mass, page._form)
+        editors = (page._input_usb, page._input_hybrid, page._input_replay, page._subject_edit, page._body_mass,
+                   page._replay_edit, page._replay_choose, page._form)
         assert page._locked_reason.isHidden()
 
         page._runner.state_changed.emit("running")
@@ -481,6 +522,17 @@ class TestAdvancedSettings:
         assert not page._output_link.isHidden(), "異常終了でも途中までの出力はある"
         url = _folder_link_url(page, monkeypatch)
         assert url == QtCore.QUrl.fromLocalFile(str(hybrid_paths.measurement_root()))
+
+    def test_output_folder_link_after_replay_is_the_replay_root(self, page, monkeypatch, tmp_path):
+        """再生の記録は本番の計測と混ざらないよう ``replay_root`` に書くので、リンクもそこを開く。"""
+        from app.core.qt import QtCore
+        from app.hybrid import paths as hybrid_paths
+
+        _start_replay(monkeypatch, page, tmp_path)
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(0)
+        url = _folder_link_url(page, monkeypatch)
+        assert url == QtCore.QUrl.fromLocalFile(str(hybrid_paths.replay_root()))
 
 
 # ---------------------------------------------------------------------------
@@ -651,3 +703,99 @@ class TestImmediateSave:
         page.settings_edited.connect(lambda: edited.append(True))
         page._joules_switch.setChecked(not page._joules_switch.isChecked())
         assert edited == [True]
+
+
+# ---------------------------------------------------------------------------
+# 記録の再生（独立の role hybrid_replay）
+# ---------------------------------------------------------------------------
+
+
+class TestReplayInput:
+    def test_folder_row_only_for_replay(self, page):
+        page._advanced.set_open(True)
+        for role in (USB, HYBRID):
+            _choose_input(page, role)
+            assert not page._replay_edit.isVisibleTo(page), role
+            assert not page._replay_choose.isVisibleTo(page), role
+        _choose_input(page, REPLAY)
+        assert page._replay_edit.isVisibleTo(page)
+        assert page._replay_choose.isVisibleTo(page)
+        assert page._replay_choose.text() == "選ぶ…"
+        assert not page._calibration_time.isVisibleTo(page), "再生は記録の校正を使う（今の校正は使わない）"
+
+    def test_folder_row_edits_the_setting(self, qt_app, tmp_path):
+        from app.shell.page_measure import MeasurePage
+
+        settings = Settings({"HYBRID_REPLAY": str(tmp_path)})
+        page = MeasurePage(settings)
+        try:
+            assert page._replay_edit.text() == str(tmp_path)
+            page._replay_edit.setText("/elsewhere")
+            assert settings.get("HYBRID_REPLAY") == "/elsewhere"
+        finally:
+            page.shutdown()
+
+    def test_folder_is_not_in_the_nested_form(self, page):
+        assert "HYBRID_REPLAY" not in _row_names(page._form)
+
+    def test_choose_button_opens_a_folder_dialog_at_the_measurement_root(self, page, monkeypatch, tmp_path):
+        from app.core.qt import QtWidgets
+        from app.hybrid import paths as hybrid_paths
+
+        asked = []
+
+        def get_existing_directory(parent, caption, start):
+            asked.append(start)
+            return str(tmp_path)
+
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getExistingDirectory", get_existing_directory)
+        _choose_input(page, REPLAY)
+        page._replay_choose.click()
+        assert asked == [str(hybrid_paths.measurement_root())]
+        assert page._replay_edit.text() == str(tmp_path)
+
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getExistingDirectory", lambda *args: "")
+        page._replay_choose.click()  # 取り消し
+        assert page._replay_edit.text() == str(tmp_path)
+
+    @pytest.mark.parametrize("folder, reason", [
+        ("", "再生する計測フォルダを選んでください"),
+        ("no_such_folder", "計測フォルダがありません"),
+        ("not_a_session", "計測フォルダではありません"),
+    ])
+    def test_main_button_is_disabled_with_reason_until_a_folder_is_chosen(self, page, tmp_path, folder, reason):
+        (tmp_path / "not_a_session").mkdir()
+        assert page._main_button.isEnabled() and page._start_blocked.isHidden()
+
+        _choose_input(page, REPLAY)
+        page._replay_edit.setText(str(tmp_path / folder) if folder else "")
+        assert not page._main_button.isEnabled()
+        assert not page._start_blocked.isHidden()
+        assert page._start_blocked.text() == reason
+
+        page._replay_edit.setText(str(_session_folder(tmp_path)))
+        assert page._main_button.isEnabled()
+        assert page._start_blocked.isHidden()
+
+        page._replay_edit.setText("")
+        _choose_input(page, USB)
+        assert page._main_button.isEnabled(), "USB の計測は再生のフォルダによらない"
+        assert page._start_blocked.isHidden()
+
+    def test_replay_start_launches_the_replay_role_and_opens_the_gauge_window(self, page, monkeypatch, tmp_path):
+        calls = _start_replay(monkeypatch, page, tmp_path)
+        assert calls == [REPLAY]
+        window = page._gauge_window
+        assert window.isVisible(), "再生も子がゲージの行を出すので窓を開く"
+        assert window.gauge.state.phase is gm.Phase.WAITING
+        assert page._main_button.isEnabled() and page._main_button.text() == "停止"
+
+        frame = GaugeFrame(link="connected", rep=1, source="replay", parts=_frame().parts)
+        page._runner.gauge_frame.emit(frame)
+        assert window.gauge.state.frame == frame
+        assert "計測中 2 回目" in page._run_status.text()
+        assert page._link_status.isHidden(), "再生は Pixel を使わない（ゲージ側が「▶ 再生」を出す）"
+
+        page._runner.state_changed.emit("stopped")
+        page._runner.finished.emit(0)
+        assert window.gauge.state.phase is gm.Phase.DONE
