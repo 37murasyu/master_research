@@ -1,7 +1,8 @@
 """計測の出力を確かめる（§6-2・§6-3・§3-2）。録画を計測に読み込ませる再生もここから行う。
 
 - ``check``: 出力フォルダ（``OUTPUT_DIR``、既定は ``output_data``）を読んで確かめる。合否を出すのは構造
-  （ファイルの有無、行の対応、実機での処理間隔）だけ。値（トルク、ゲージ、EKF の RMS 差・棄却率）は並べて出す。
+  （ファイルの有無、行の対応、実機での処理間隔、肩・肘・手首の 3D がそろった行の割合）だけ。値（トルク、ゲージ、
+  骨の長さ、EKF の RMS 差・棄却率）は並べて出す。
   期待範囲は S6 の実測で決める（``docs/superpowers/specs/2026-09-08-ekf-self-tuning-design.md`` :364）
 - ``replay``: 録画（``tools/record_stereo.py`` のフォルダか、受け取った ``cameras_raw/<試技>/``）を計測
   （``python -m app --role realtime``、GUI と同じ起動）に読み込ませ、終わったら ``check`` にかける。
@@ -294,6 +295,42 @@ MIN_SEGMENT_SHARE = 0.95
 MAX_FOREARM_STD_M = 0.015
 MIN_RAY_ANGLE_DEG = 15.0
 MIN_INSIDE_SHARE = 0.95
+# USB の構造の検査: 肩・肘・手首の 3D がそろった行の割合の下限。人が画面に入るまでの数秒などで抜けるのは普通なので
+# 半分とする。灰色の映像のように 3D が 1 点も取れない回（トルクが 0 のまま CSV はそろう）を落とすため
+TRACKED_POINTS = (11, 12, 13, 14, 15, 16)
+MIN_TRACKED_SHARE = 0.5
+
+
+def _segment_lengths(points: np.ndarray, ids) -> dict[str, dict[str, Any]]:
+    """部位（肩幅・上腕・前腕）ごとの長さの中央値、範囲に入る割合、範囲内のばらつき。
+
+    ``points`` は (行, 点, 3) [m]、並びは ``ids`` の順。長さが 1 つも有限でなければ中央値と割合は None。
+    """
+    slot = {int(lid): i for i, lid in enumerate(ids)}
+    segments = {}
+    for name, (a, b, low, high) in SEGMENTS.items():
+        if a in slot and b in slot:
+            length = np.linalg.norm(points[:, slot[a]] - points[:, slot[b]], axis=1)
+            length = length[np.isfinite(length)]
+        else:
+            length = np.array([])
+        inside = length[(length >= low) & (length <= high)]
+        segments[name] = {
+            "median_m": float(np.median(length)) if length.size else None,
+            "share": float(inside.size / length.size) if length.size else None,
+            "std_m": float(np.std(inside)) if inside.size > 1 else None,   # 範囲内の値だけのばらつき
+            "range_m": [low, high],
+        }
+    return segments
+
+
+def _tracked_rows(points: np.ndarray, ids) -> tuple[int, int]:
+    """肩・肘・手首（``TRACKED_POINTS``）の 3D がすべて有限の行の数と、全体の行の数。"""
+    slot = {int(lid): i for i, lid in enumerate(ids)}
+    if not all(lid in slot for lid in TRACKED_POINTS):
+        return 0, int(points.shape[0])
+    arm = points[:, [slot[lid] for lid in TRACKED_POINTS]]
+    return int(np.isfinite(arm).all(axis=(1, 2)).sum()), int(points.shape[0])
 
 
 def _camera_centres(folder: Path) -> list[np.ndarray]:
@@ -324,18 +361,7 @@ def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mappin
     else:
         table = pd.read_csv(files["kpts3d"])
         points = table.drop(columns="frame").to_numpy(float).reshape(len(table), len(ids), 3)
-    segments = {}
-    for name, (a, b, low, high) in SEGMENTS.items():
-        length = np.linalg.norm(points[:, slot[a]] - points[:, slot[b]], axis=1)
-        length = length[np.isfinite(length)]
-        inside = length[(length >= low) & (length <= high)]
-        segments[name] = {
-            "median_m": float(np.median(length)) if length.size else None,
-            "share": float(inside.size / length.size) if length.size else None,
-            "std_m": float(np.std(inside)) if inside.size > 1 else None,   # 範囲内の値だけのばらつき
-            "range_m": [low, high],
-        }
-    quality: dict[str, Any] = {"segments": segments}
+    quality: dict[str, Any] = {"segments": _segment_lengths(points, ids)}
     try:
         centres = _camera_centres(folder)
     except (OSError, ValueError):
@@ -732,6 +758,12 @@ def check_run(out_dir: str | Path, log: str | Path | None = None, timestamp: str
             ok = interval is not None and abs(interval - dt) / dt <= DT_TOLERANCE
             add("処理間隔: dt と実際の間隔が 20% 以内", ok,
                 f"dt {dt:.4f} s / 実際 {interval:.4f} s" if interval else "間隔が取れない")
+        # 3D が 1 点も取れない回（人が写っていない・灰色の映像）でも、ファイルと行はそろいトルクは 0 のまま書かれる
+        tracked, rows = _tracked_rows(capture.points, capture.landmark_ids)
+        add(f"3D: 肩・肘・手首がそろった行 {MIN_TRACKED_SHARE:.0%} 以上", rows > 0 and tracked / rows >= MIN_TRACKED_SHARE,
+            f"{tracked} / {rows} 行" + ("" if rows and tracked else "、人を見つけていない。映像と写り方を確かめる"))
+        # 骨の長さは混成と同じ節（値として並べる。USB の置き方・校正の目安は混成と違うので合否にしない）
+        report["quality"] = {"segments": _segment_lengths(capture.points, capture.landmark_ids)}
         if files["kpts3d"] is not None:
             report["ekf"] = _ekf_stats(capture, files["kpts3d"], base_dir=out_dir)
         if expect_profile:

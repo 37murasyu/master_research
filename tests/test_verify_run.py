@@ -41,8 +41,11 @@ def _truth(n: int) -> np.ndarray:
 
 
 def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip=(), log=True,
-             provenance=None) -> Path:
-    """計測 1 回ぶんの出力フォルダ（master_research_code.py が書くものと同じ名前・列）。"""
+             provenance=None, lost_rows=()) -> Path:
+    """計測 1 回ぶんの出力フォルダ（master_research_code.py が書くものと同じ名前・列）。
+
+    ``lost_rows`` の行は、人を見つけられなかったフレームとして生 CSV の 3D を NaN にする。
+    """
     out = tmp_path / "run"
     out.mkdir()
     truth = _truth(N)
@@ -50,6 +53,7 @@ def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip
     if raw_offset is not None:
         lid, axis, value = raw_offset
         raw[:, IDS.index(lid), "xyz".index(axis)] += value
+    raw[list(lost_rows)] = np.nan
     meta = {"unit": "m", "dt": DT, "src_fps": 30.0, "file_mode": file_mode, "EKF_ENABLE": True,
             "EKF_Q_ACC": 0.1, "EKF_R": 1e-4, "EKF_GATE_STD": 3.0, "RT_POSE_FIXED_HZ_ON": False,
             "ekf_noise": {"origin": "env", "path": None, "reason": None, "profile_dt": None, "sources": {}}}
@@ -146,6 +150,40 @@ class TestStructure:
         kpts = next(out.glob("kpts3d_0923*_gZ-.csv"))
         pd.read_csv(kpts).iloc[:50].to_csv(kpts, index=False)
         assert not _check(vr.check_run(out), "行: 生 CSV と kpts3d が 1 行ずつ対応")["ok"]
+
+
+TRACKED = "3D: 肩・肘・手首がそろった行 50% 以上"
+
+
+class TestTracked3d:
+    """灰色の偽の録画のように 3D が 1 点も取れない回でも、ファイルと行はそろい、トルクは 0 のまま書かれる。
+    以前はこれが「構造の検査はすべて合格」になった。肩・肘・手首がそろった行の割合を構造の検査に入れ、
+    混成と同じ骨の長さの節を USB の報告にも出す。"""
+
+    def test_a_recording_without_any_3d_fails(self, tmp_path):
+        out = make_run(tmp_path, lost_rows=range(N))
+        report = vr.check_run(out, log=out / "run.log")
+        check = _check(report, TRACKED)
+        assert not check["ok"] and f"0 / {N} 行" in check["detail"]
+        assert vr.main(["check", str(out), "--log", str(out / "run.log")]) == 1
+
+    def test_some_lost_frames_still_pass(self, tmp_path):
+        """人が画面に入るまでの数秒などで 3D が抜けるのは普通。半分以上そろっていれば構造は合格のまま。"""
+        report = vr.check_run(make_run(tmp_path, lost_rows=range(40)), log=tmp_path / "run" / "run.log")
+        assert _check(report, TRACKED)["ok"]
+        assert not [c for c in report["checks"] if not c["ok"]]
+
+    def test_the_bone_lengths_are_reported(self, tmp_path):
+        report = vr.check_run(make_run(tmp_path, lost_rows=range(10)))
+        segments = report["quality"]["segments"]
+        truth = _truth(1)[0]
+        forearm = float(np.linalg.norm(truth[IDS.index(16)] - truth[IDS.index(14)]))
+        assert segments["前腕R"]["median_m"] == pytest.approx(forearm)
+        assert segments["肩幅"]["share"] == 0.0, "11–12 は 0.11 m で範囲（0.25〜0.55 m）の外"
+        text = vr.format_report(report)
+        assert "[配置と 3D の質]" in text and "前腕R: 中央値 0.224 m" in text
+        # USB の校正・置き方は混成と違うので、長さは値として並べるだけ（合否は混成だけ）
+        assert not [c for c in report["checks"] if c["name"].startswith(("3D: 肩幅", "3D: 前腕"))]
 
 
 class TestTorqueAndGauge:
