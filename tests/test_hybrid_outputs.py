@@ -184,6 +184,7 @@ class TestMeta:
         assert meta["body_mass_kg"] == 65.0
         assert meta["dyn_gate"] is True
         assert meta["ekf"]["enabled"] is True and meta["ekf"]["origin"] == "builtin"
+        assert meta["ekf"]["max_gap_s"] == 0.5 and meta["ekf"]["settings"]["max_gap_s"] == 0.5
         assert meta["arm_length_guard"] == {"tolerance": 0.25, "rejected_frames": {"L": 0, "R": 0}}
         assert meta["forearm_len_m"]["R"] == pytest.approx(0.25, abs=0.01)
         bands = session.measurement.bands
@@ -218,6 +219,7 @@ class TestRawCapture:
         assert meta["dt"] == pytest.approx(1 / 30)
         assert meta["ekf_noise"]["origin"] == "builtin"
         assert meta["EKF_ENABLE"] is True and meta["EKF_ROBUST_GATE"] is True
+        assert meta["EKF_MAX_GAP_S"] == 0.5, "点ごとの欠測の上限は実際に使った値（指定なしなら 0.5 s）"
         assert meta["HYBRID_EKF_PROFILE"] is None
         # 先頭の窓が閉じたときに書き足す
         assert meta["ekf_run_length_m"] == pytest.approx(0.28, abs=0.01)
