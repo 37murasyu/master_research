@@ -89,8 +89,10 @@ def status(now: float | None, band: tuple[float, float] | None) -> Status:
     """``now < lo`` は SHORT、``lo ≤ now < hi`` は IN_BAND、``now ≥ hi`` は OVER。
 
     band か now が None なら NONE（帯が無い、または値がまだ無い部位）。
+    now が NaN のときも NONE（比較がすべて偽になり、放っておくと OVER に落ちる。
+    ``fraction`` が NaN を 0 として弧を描かないのとそろえる）。
     """
-    if band is None or now is None:
+    if band is None or now is None or math.isnan(now):
         return Status.NONE
     lo, hi = band
     if now < lo:

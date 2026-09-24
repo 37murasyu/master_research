@@ -38,6 +38,8 @@ hiddenimports = sorted(
         # 静的解析では見つからない。手で足す（本体はまだ別の作業ツリーで作成中だが、
         # この一覧はビルド時にしか読まれないので先に足してよい）。
         "app.gauge.demo",
+        # ``python -m app.gauge.fonts``（書体の診断）も同じく手で足す
+        "app.gauge.fonts",
     }
 )
 

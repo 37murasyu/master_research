@@ -24,7 +24,7 @@ import functools
 from dataclasses import dataclass
 
 from app.core.qt import QtCore, QtGui, QtSvg, QtWidgets
-from app.core.resources import japanese_font_path
+from app.gauge import fonts as gauge_fonts
 from app.gauge import model as gm
 from app.gauge import scene as sc
 from app.gauge.protocol import GaugeFrame
@@ -100,48 +100,26 @@ def _layout(w: float, h: float) -> tuple[float, float, float]:
 # 字体
 # ---------------------------------------------------------------------------
 
-# 候補の並び（Hiragino Sans → Hiragino Kaku Gothic ProN → 同梱 IPAex ゴシック）。
-# 初回だけ addApplicationFont を呼び、以後はキャッシュを返す
-# （呼ぶたびにフォントを登録し直すのは無駄なため）。
-_FONT_FAMILIES: tuple[str, ...] | None = None
+# 書体の選び方は ``app.gauge.fonts``（設定 GAUGE_FONT_PRESET の組。Mac に入っている
+# フォントワークスの書体を探し、無ければヒラギノ角ゴ → 同梱の IPAex ゴシック）。
 
 
-def _font_family_candidates() -> tuple[str, ...]:
-    global _FONT_FAMILIES  # pylint: disable=global-statement
-    if _FONT_FAMILIES is not None:
-        return _FONT_FAMILIES
-    families = ["Hiragino Sans", "Hiragino Kaku Gothic ProN"]
-    font_id = QtGui.QFontDatabase.addApplicationFont(str(japanese_font_path()))
-    if font_id != -1:
-        families.extend(QtGui.QFontDatabase.applicationFontFamilies(font_id))
-    _FONT_FAMILIES = tuple(families)
-    return _FONT_FAMILIES
+def _run_font(run: sc.Run, label_role: str = "") -> QtGui.QFont:
+    """``Run`` から ``QFont`` を作る。大きさは ``setPixelSize``（task-7-brief.md）。
 
-
-@functools.lru_cache(maxsize=64)
-def _font(pixel_size: int, weight: int) -> QtGui.QFont:
-    """大きさ・太さの組ごとに ``QFont`` を 1 度だけ作って使い回す。
-
-    毎フレーム同じ組の字体を作り直すのは無駄なため。QFont は
-    QGuiApplication が要るので、import 時ではなく最初に呼ばれたときに作る。
-    返した ``QFont`` は共有なので、呼び出し側で書き換えないこと。
+    ``label_role`` で書体の役（見出し・数字・文字）が決まる。
     """
-    font = QtGui.QFont()
-    font.setFamilies(list(_font_family_candidates()))
-    font.setPixelSize(pixel_size)
-    font.setWeight(QtGui.QFont.Weight(weight))
-    return font
-
-
-def _run_font(run: sc.Run) -> QtGui.QFont:
-    """``Run`` から ``QFont`` を作る。大きさは ``setPixelSize``（task-7-brief.md）。"""
-    return _font(max(1, round(run.size)), run.weight)
+    return gauge_fonts.make_font(gauge_fonts.role_for_label(label_role), max(1, round(run.size)), run.weight)
 
 
 @functools.lru_cache(maxsize=1024)
-def _text_advance(text: str, pixel_size: int, weight: int) -> float:
-    """文字列の幅（``QFontMetricsF.horizontalAdvance``）。同じ組は測り直さない。"""
-    return QtGui.QFontMetricsF(_font(pixel_size, weight)).horizontalAdvance(text)
+def _text_advance(text: str, role: str, pixel_size: int, weight: int, generation: int) -> float:
+    """文字列の幅（``QFontMetricsF.horizontalAdvance``）。同じ組は測り直さない。
+
+    ``generation``（``gauge_fonts.font_generation``）を鍵に含めるので、書体の組を変えれば測り直す。
+    """
+    font = gauge_fonts.make_font(role, pixel_size, weight)
+    return QtGui.QFontMetricsF(font).horizontalAdvance(text)
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +183,9 @@ def _draw_line(painter: QtGui.QPainter, line: sc.Line) -> None:
 
 def _draw_label(painter: QtGui.QPainter, label: sc.Label) -> None:
     """``Run`` を左から順に並べる。大きさ違いの幅は ``QFontMetricsF`` で測る。"""
-    keys = [(max(1, round(run.size)), run.weight) for run in label.runs]
-    fonts = [_font(*key) for key in keys]
-    widths = [_text_advance(run.text, *key) for run, key in zip(label.runs, keys)]
+    fonts = [_run_font(run, label.role) for run in label.runs]
+    role, generation = gauge_fonts.role_for_label(label.role), gauge_fonts.font_generation()
+    widths = [_text_advance(run.text, role, max(1, round(run.size)), run.weight, generation) for run in label.runs]
     total_width = sum(widths)
 
     if label.align == "left":
@@ -346,6 +324,7 @@ class _StaticKey:
     w: int
     h: int
     dpr: float
+    fonts: int  # 書体の組を変えたら作り直す（gauge_fonts.font_generation）
 
 
 class GaugeWidget(QtWidgets.QWidget):
@@ -439,7 +418,7 @@ class GaugeWidget(QtWidgets.QWidget):
     # -- 内部: 描画 ------------------------------------------------------------
 
     def _ensure_static_pixmap(self, w: int, h: int, dpr: float) -> None:
-        key = _StaticKey(w, h, dpr)
+        key = _StaticKey(w, h, dpr, gauge_fonts.font_generation())
         if self._static_pixmap is not None and self._static_key == key:
             return
         self._static_pixmap = self._build_static_pixmap(w, h, dpr)

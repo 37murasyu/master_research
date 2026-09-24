@@ -129,3 +129,17 @@ Task 16: cloud で仕上げ。校正の日時と「変更」リンク（2165f45�
 - Ruling 18: 即時保存は計画どおり J スイッチだけ（ほかの欄は従来どおり窓を閉じるときに保存）— 計画書 Task 16 の範囲 — 誤りなら他の欄の変更で settings_edited を出す数行
 Test（cloud・Linux）: 1400 passed / 12 failed。12 件は変更前の HEAD でも同じく落ちる環境差（mediapipe 無し、GUI 無しの cv2、フォント差での widget の画素比較）
 残り: Task 18（.app の確認）は Mac で controller が行う
+Task 14: review（cloud）— Approved。finished より先に state "stopped" が出る順（worker.py:194-195）なので、✓／✕ が停止中に上書きされないことを確認
+Task 15: review（cloud）— Important 1: 保存済みの体重が 20〜200 の外だと、欄は丸めた値を見せるのに設定は元の値のまま子へ渡る → 結線してから値を入れ、設定を欄の値にそろえて修正（試験 test_body_mass_setting_matches_what_the_field_shows）
+Task 16: review（cloud）— Approved
+Minor（parked）を解消:
+  - StatusText の知らない state は ValueError（黙って「停止中」にしない）
+  - status() は NaN を NONE にする（fraction と同じ扱い）
+  - 帯の数字の中央揃えの分岐と CENTER_LABEL_LIFT の試験を追加（値 10 は据え置き。目視は Task 18）
+  - LineDemux: 行の途中の PREFIX が塊の境目で割れても、末尾の PREFIX の頭をためてフレームとして拾う
+  - pictograms の <svg> の組み立てを _svg に 1 つにした
+  - 緑の判定の彩度 0.25 の理由をコメントに書き、_to_rgb01 の ValueError の試験を追加
+書体（作業者の依頼）: app/gauge/fonts.py を追加。Mac にアクティベート済みのフォントワークスの書体を名前で探して使う（.app には同梱しない）
+- Ruling 19: 書体の組は設定 GAUGE_FONT_PRESET（rodin 既定・tsukushi・kaimin・system）。マティス EB は作業者の指示で使わない — 見出しのゴシック案（ロダン＋UD角ゴ_ラージ）を既定にした — 誤りなら code_default を変えるだけ
+- Ruling 20: 役は 3 つ（見出し＝header_title、数字＝value_text・header_rep・band_label、文字＝残り）。数字には tnum を指定（Qt 6.7 以上）
+- 見つからない書体はヒラギノ（見出しが明朝の組はヒラギノ明朝）→ IPAex。実機での見え方は Task 18 で `--role script --module app.gauge.fonts` と `app.gauge.demo --snapshot DIR --fonts all` で確かめる

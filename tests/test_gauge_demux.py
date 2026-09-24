@@ -170,3 +170,22 @@ def test_throughput_handles_30hz_easily():
     assert len(frames) == 3000
     per_line = elapsed / 6000
     assert per_line < 0.0002, f"1行あたり {per_line * 1000:.4f} ms かかった"
+
+
+def test_prefix_split_mid_line_across_chunks_still_becomes_frame():
+    # 行の途中に出た PREFIX が、塊の境目でさらに割れる二重の縁（"…@@GA" ＋ "UGE {…}"）
+    line = _gauge_line()
+    head, tail = line[:4], line[4:]
+    demux = LineDemux()
+    log1, frames1 = demux.feed(("progress 50%" + head).encode("utf-8"))
+    log2, frames2 = demux.feed(tail.encode("utf-8"))
+    assert log1 + log2 == "progress 50%"
+    assert frames1 + frames2 == [_gauge_frame()]
+
+
+def test_trailing_at_sign_that_is_not_a_prefix_reaches_the_log():
+    demux = LineDemux()
+    log1, _ = demux.feed(b"mail me @")
+    log2, frames = demux.feed(b" example\n")
+    assert log1 + log2 == "mail me @ example\n"
+    assert frames == []

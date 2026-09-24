@@ -799,3 +799,17 @@ class TestReplayInput:
         page._runner.state_changed.emit("stopped")
         page._runner.finished.emit(0)
         assert window.gauge.state.phase is gm.Phase.DONE
+
+
+@pytest.mark.parametrize("saved, shown", [(300.0, 200.0), (5.0, 20.0), (72.5, 72.5)])
+def test_body_mass_setting_matches_what_the_field_shows(qt_app, saved, shown):
+    from app.shell.page_measure import MeasurePage
+
+    settings = Settings()
+    settings.set("BODY_MASS_KG", saved)
+    page = MeasurePage(settings)
+    try:
+        assert page._body_mass.value() == shown
+        assert settings.get("BODY_MASS_KG") == shown, "欄の見た目と子に渡す値がずれている"
+    finally:
+        page.shutdown()

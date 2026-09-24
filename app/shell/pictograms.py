@@ -19,6 +19,16 @@ from __future__ import annotations
 __all__ = ["figure_svg", "header_icon_svg"]
 
 
+def _svg(view_box: str, body: str) -> str:
+    """QtSvg が読める SVG Tiny 1.2 の文書で ``body`` を包む。"""
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" '
+        f'viewBox="{view_box}">\n'
+        f"{body}\n"
+        "</svg>\n"
+    )
+
+
 def figure_svg(
     *,
     figure: str,
@@ -65,13 +75,7 @@ def figure_svg(
         f'<path id="shins" d="M386 266L387 392M414 266L413 392" '
         f'fill="none" stroke="{figure}" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>',
     ]
-    body = "\n".join(elements)
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" '
-        'viewBox="0 0 800 450">\n'
-        f"{body}\n"
-        "</svg>\n"
-    )
+    return _svg("0 0 800 450", "\n".join(elements))
 
 
 def header_icon_svg(*, figure: str, plate: str) -> str:
@@ -93,9 +97,4 @@ def header_icon_svg(*, figure: str, plate: str) -> str:
         '<path d="M21 31h6M21 31v12M27 31v12"/>'
         "</g>"
     )
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" '
-        'viewBox="0 0 48 48">\n'
-        f"{body}\n"
-        "</svg>\n"
-    )
+    return _svg("0 0 48 48", body)

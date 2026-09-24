@@ -292,6 +292,19 @@ CURATED: dict[str, dict[str, Any]] = {
         "group": "記録の再生",
         "description": "流す速さ。1 で実時間、0 で待たない。",
     },
+    # ゲージの書体の組（app.gauge.fonts.PRESETS）。Mac に入っているフォントワークスの書体を使う。
+    # 入っていない書体はヒラギノ → 同梱の IPAex ゴシックへ落ちる。手元の見え方は
+    # `python -m app.gauge.fonts` で確かめられる。
+    "GAUGE_FONT_PRESET": {
+        "type": "str",
+        "code_default": "rodin",
+        "ui_visible": True,
+        "group": "表示",
+        "description": (
+            "ゲージの書体の組。rodin（見出しロダン＋UD角ゴ_ラージ）／tsukushi（見出し筑紫A見出ミン）／"
+            "kaimin（見出し解ミン 宙）／system（従来のヒラギノ角ゴ）。"
+        ),
+    },
 }
 
 

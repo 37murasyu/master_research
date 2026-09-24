@@ -205,7 +205,7 @@ def _parse_size(text: str) -> tuple[int, int]:
     return w, h
 
 
-def _cmd_snapshot(directory: str, size: str) -> int:
+def _cmd_snapshot(directory: str, size: str, fonts: str | None = None) -> int:
     try:
         w, h = _parse_size(size)
     except ValueError as exc:
@@ -223,11 +223,17 @@ def _cmd_snapshot(directory: str, size: str) -> int:
     # 持ち回る必要はない（インスタンスを作る、という呼び出しだけが要る）。
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
-    out_dir = Path(directory)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for name, state in SCENARIOS.items():
-        image = render_image(state, w, h)
-        image.save(str(out_dir / f"{name}.png"))
+    from app.gauge import fonts as gauge_fonts
+
+    # --fonts all は、書体の組ごとに DIR/<組の名前>/ へ書く（見比べるため）
+    presets = list(gauge_fonts.PRESETS) if fonts == "all" else [fonts]
+    for preset in presets:
+        out_dir = Path(directory) / preset if fonts == "all" else Path(directory)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        gauge_fonts.set_preset(preset)
+        for name, state in SCENARIOS.items():
+            image = render_image(state, w, h)
+            image.save(str(out_dir / f"{name}.png"))
 
     return 0
 
@@ -380,6 +386,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="--emit を子プロセスで走らせ、WorkerRunner に届いたフレームを数える（--count などはそのまま子へ）",
     )
+    parser.add_argument(
+        "--fonts",
+        metavar="PRESET",
+        help="書体の組（rodin・tsukushi・kaimin・system）。--snapshot では all で組ごとに書く。"
+        "省略すると設定 GAUGE_FONT_PRESET の既定",
+    )
     return parser
 
 
@@ -391,7 +403,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.emit:
         return _cmd_emit(count=args.count, interval=args.interval, exit_code=args.exit_code)
     if args.snapshot:
-        return _cmd_snapshot(args.snapshot, args.size)
+        return _cmd_snapshot(args.snapshot, args.size, args.fonts)
+    if args.fonts:
+        from app.gauge import fonts as gauge_fonts
+
+        gauge_fonts.set_preset(args.fonts)
     return _cmd_live()
 
 

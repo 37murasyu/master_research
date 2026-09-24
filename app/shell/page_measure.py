@@ -31,6 +31,7 @@ from typing import Callable
 
 from app.core.qt import QtCore, QtGui, QtWidgets
 from app.core.settings import SCHEMA, Settings, measurement_output_dir
+from app.gauge import fonts as gauge_fonts
 from app.gauge.protocol import GaugeFrame
 from app.gauge.window import GaugeWindow
 from app.hybrid import paths as hybrid_paths
@@ -161,6 +162,7 @@ class MeasurePage(RunnerPage):
     def __init__(self, settings: Settings, parent: QtWidgets.QWidget | None = None):
         # RunnerPage.__init__ が _on_state を呼ぶので、そこで触るものは先に作っておく。
         # ゲージ窓は親を持たない独立の窓（第 2 モニタに全画面で出すため）。閉じるのは shutdown。
+        gauge_fonts.set_preset(settings.get("GAUGE_FONT_PRESET"))
         self._gauge_window = GaugeWindow(show_joules=bool(settings.get("GAUGE_SHOW_JOULES")))
         # 今（または最後）の実行の入力。入力の選択は実行の後で変わりうるので、終了時の振る舞いは
         # 選択ではなくこちらで決める。
@@ -251,8 +253,11 @@ class MeasurePage(RunnerPage):
         self._body_mass = QtWidgets.QDoubleSpinBox()
         self._body_mass.setDecimals(1)
         self._body_mass.setRange(20.0, 200.0)
-        self._body_mass.setValue(float(self._settings.get("BODY_MASS_KG")))
         self._body_mass.valueChanged.connect(lambda value: self._settings.set("BODY_MASS_KG", value))
+        # 結線してから値を入れる。保存値が範囲外なら欄は丸めた値を見せるので、設定もそれにそろえる
+        # （先に入れると、欄は 200 と見せたまま子には 300 が渡る）
+        self._body_mass.setValue(float(self._settings.get("BODY_MASS_KG")))
+        self._settings.set("BODY_MASS_KG", self._body_mass.value())
         mass = _hrow(self._body_mass, QtWidgets.QLabel("kg"))  # 単位は欄の直後（R9-08）
 
         # 使う校正の日時（R13-05）と「変更」リンク（R16-10）。混成の校正なので混成のときだけ出す
@@ -322,6 +327,8 @@ class MeasurePage(RunnerPage):
         # start の中で出た "running" の時点では _run_input が前回のままなので、ここで出し直す
         self._refresh_header()
         if spec.gauge:
+            # 開発・診断用の欄で書体の組を変えていれば、ここで効かせる
+            gauge_fonts.set_preset(self._settings.get("GAUGE_FONT_PRESET"))
             self._gauge_window.begin(
                 show_joules=bool(self._settings.get("GAUGE_SHOW_JOULES")),
                 avoid_screen=self.window().screen(),

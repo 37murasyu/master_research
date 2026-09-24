@@ -48,6 +48,9 @@ def test_header_title_meets_4_5():
 def test_no_green_in_palette():
     # 緑は使わない（constraints.md）。HSL の色相 90〜170° で彩度が 0.25 を超える
     # 色が、役割の色にも図柄の色にも 1 つも無いことを確かめる。
+    # 0.25 は「灰色に近い色は色相が意味を持たず、緑には見えない」ための足切り。
+    # 彩度 0.20 ほどの灰み（補足 #94a3b8、仮に同じ彩度で色相 145° の #94b8a3 でも）は
+    # 灰色に見えるので拾わず、それより彩度の高い「緑と読める色」だけを拾う。
     for name, color in theme.PALETTE.items():
         hue, saturation = theme.hue_saturation(color)
         is_green = 90.0 <= hue <= 170.0 and saturation > 0.25
@@ -88,3 +91,14 @@ def test_known_low_contrast_is_listed():
         assert theme.contrast_ratio(*pair) >= theme.TEXT_CONTRAST_MIN, pair
     for pair in graphic_pairs - known.keys():
         assert theme.contrast_ratio(*pair) >= theme.GRAPHIC_CONTRAST_MIN, pair
+
+
+@pytest.mark.parametrize("color", ["#fff", "#12345", "#1234567", "", "red"])
+def test_non_six_digit_color_is_rejected(color):
+    with pytest.raises(ValueError):
+        theme.contrast_ratio(color, "#000000")
+
+
+def test_non_hex_digits_are_rejected():
+    with pytest.raises(ValueError):
+        theme.relative_luminance("#gggggg")
