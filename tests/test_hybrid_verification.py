@@ -248,6 +248,22 @@ def _expected(t: float) -> np.ndarray:
     return truth[:, [0, 2, 1]] * -0.01
 
 
+def cut_the_last_frame(session: Path) -> None:
+    """kill で ``landmarks2d`` の最後のフレームが途中（33 行に満たず、最終行も改行の無い途中）で切れた形にする。
+
+    記録器は届いた順に書き、1 秒ごとにしか書き出さないので、書き込みの区切りがフレームの途中に来うる。
+    Pixel の点は Mac より遅れて届くので、最後に書いたのを Pixel の最後のフレームにする（撮影時刻は Mac の最後の
+    点より前で、組に使われる）。
+    """
+    path = next(session.glob("landmarks2d_*.csv"))
+    header, *rows = path.read_bytes().split(b"\n")[:-1]   # 最後の改行の後の空を除く
+    end = max(i for i, row in enumerate(rows) if row.startswith(b"cam1,")) + 1
+    frame = rows[end - 33:end]   # 1 フレームは 33 行が続く
+    rest = rows[:end - 33] + rows[end:]
+    # 23 行と、24 行目の途中まで
+    path.write_bytes(b"\n".join([header, *rest, *frame[:23]]) + b"\n" + frame[23][:5])
+
+
 class TestRealTimePairs:
     def test_the_slower_camera_sets_the_times(self, tmp_path):
         result = rt.retriangulate(make_body_run(tmp_path))
@@ -260,6 +276,22 @@ class TestRealTimePairs:
         for k in (5, 20, 40):
             t = result.t_ns[k] / 1e9
             assert np.max(np.abs(result.points[k] - _expected(t))) < 0.01, "補間か三角測量がずれている"
+
+    def test_a_frame_cut_by_a_kill_is_dropped_and_counted(self, tmp_path, capsys):
+        """kill で途中まで書かれた最後のフレームは捨て、捨てた数を知らせる。三角測量し直し（hybrid-raw）も通る。
+
+        以前は点の足りないフレームをそのまま返し、三角測量し直しと再生が IndexError で落ちた。
+        """
+        session = make_body_run(tmp_path, seconds=2.0)
+        whole = rt.read_landmarks(session)
+        cut_the_last_frame(session)
+        frames = rt.read_landmarks(session)
+        assert all(len(frame.landmarks) == 33 for role in frames.values() for frame in role)
+        assert set(frames) == set(rt.ROLES), "途中の行からロールが増えた"
+        assert sum(map(len, frames.values())) == sum(map(len, whole.values())) - 1
+        assert "フレーム 1 個" in capsys.readouterr().err
+        assert len(rt.retriangulate(session).t_ns) > 0
+        assert vr.hybrid_raw_capture(session).exists()
 
     def test_a_long_gap_in_the_other_camera_is_not_bridged(self, tmp_path):
         """同期バッファと同じく、100 ms を超える穴は補間で埋めない。"""

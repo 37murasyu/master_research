@@ -2,6 +2,7 @@
 
 import sys
 import threading
+import time
 from config import pose_keypoints
 from app.hybrid.gravity import read_board_up
 from app.hybrid.recorder import Recorder
@@ -12,9 +13,12 @@ from app.runners.network_measure import (
     NetworkMeasurement,
 )
 
+# Pixel（cam1）の点がこれより長く途絶えたら、ゲージの接続表示を waiting に戻す [s]
+LINK_TIMEOUT_S = 1.0
+
 
 class MeasurementSession:
-    def __init__(self, calibration, *, root=None, config=None, metadata=None, tracker=None):
+    def __init__(self, calibration, *, root=None, config=None, metadata=None, tracker=None, clock=time.monotonic):
         self.calibration = calibration
         self.root = root
         self.metadata = metadata or {}
@@ -41,6 +45,11 @@ class MeasurementSession:
         # 何で止まったか（stop_request・key・ctrl_c・failed・error）。記録を閉じるときに meta.json へ残す（§3-2 の確認用）
         self.stop_reason = None
         self.consecutive = {"cam0": 0, "cam1": 0}
+        # ゲージの接続表示（_update_link）の材料。最後に Pixel の点を受けた時刻（clock）と、Pixel がつながっているかを
+        # 返す関数（計測の子は PhoneLink の状態を見る関数を入れる。無ければ点の途絶えだけで決める）
+        self._clock = clock
+        self._last_remote = None
+        self.remote_connected = None
 
     @property
     def directory(self):
@@ -124,6 +133,12 @@ class MeasurementSession:
         raise exc
 
     def on_landmarks(self, frame):
+        if self.failed.is_set():
+            # 止めると決めた後に届いた点は捨てる。記録の開始で落ちた後に Pixel の点ごとに始め直すと、
+            # meta の無い空の計測フォルダが点の数だけ残る
+            return
+        if frame.role == "cam1":
+            self._last_remote = self._clock()
         # 記録は Pixel の点が初めて届いたときに始める。Mac の点は起動直後から流れるが、
         # Pixel が繋がらないまま終えると、中身の無い「完了」の計測フォルダが残る。
         if self.recorder is None and frame.role != "cam1":
@@ -158,7 +173,19 @@ class MeasurementSession:
         except Exception as exc:
             self._failure(exc)
 
+    def _update_link(self):
+        """ゲージの接続表示を、Pixel がつながっていて最後の点から ``LINK_TIMEOUT_S`` 以内なら connected、でなければ waiting に。
+
+        点が一度も届いていない間は触らない（始めは waiting、最初の点で ``_ensure`` が connected にする）。
+        """
+        if self.tracker is None or self._last_remote is None:
+            return
+        fresh = self._clock() - self._last_remote <= LINK_TIMEOUT_S
+        self.tracker.set_link(fresh and (self.remote_connected is None or bool(self.remote_connected())))
+
     def flush(self):
+        """受信スレッドの定期処理（PhoneLink の on_tick、50 ms ごと）。ゲージの接続表示を更新し、記録を書き出す。"""
+        self._update_link()
         if self.recorder is None:
             return  # まだ記録を始めていない
         try:

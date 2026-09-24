@@ -14,14 +14,16 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
+import io
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 
 from app.hybrid.calibration_io import load_session_calibration
 from app.hybrid.ekf import EkfSettings
-from app.net.protocol import LandmarkFrame
+from app.net.protocol import LANDMARK_COUNT, LandmarkFrame
 from app.net.sync_buffer import DEFAULT_GRID, InterpolatedFrame, PairedSample
 from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 from config import pose_keypoints
@@ -43,18 +45,42 @@ class Retriangulated:
 
 
 def read_landmarks(session: str | Path) -> dict[str, list[LandmarkFrame]]:
-    """``landmarks2d_*.csv`` をロールごとの ``LandmarkFrame``（撮影時刻の昇順）に戻す。"""
+    """``landmarks2d_*.csv`` をロールごとの ``LandmarkFrame``（撮影時刻の昇順）に戻す。
+
+    計測を kill で止めると、最後のフレームが途中までしか書かれていないことがある（記録器は 1 秒ごとにしか
+    書き出さず、書き込みの区切りがフレームの途中に来うる）。改行の無い最終行と、点が ``LANDMARK_COUNT`` 個で
+    ないフレームは捨て、捨てた数を標準エラーに出す（点の足りないフレームを流すと三角測量が IndexError で落ちる）。
+    """
     path = next(Path(session).glob("landmarks2d_*.csv"))
-    table = pd.read_csv(path).sort_values(["role", "t_ns", "seq", "landmark"])
+    data = path.read_bytes()
+    # 途中の行は、数の列が欠けると列の型（t_ns の整数）まで崩すので、表に読む前に落とす
+    complete = data[:data.rfind(b"\n") + 1]
+    partial = len(complete) < len(data)
     frames: dict[str, list[LandmarkFrame]] = {role: [] for role in ROLES}
+    if not complete:
+        _report_dropped(path, 0, partial)
+        return frames  # 見出しの行も書き終えていない
+    table = pd.read_csv(io.BytesIO(complete)).sort_values(["role", "t_ns", "seq", "landmark"])
+    dropped = 0
     for (role, seq, t_ns), rows in table.groupby(["role", "seq", "t_ns"], sort=False):
+        if len(rows) != LANDMARK_COUNT:
+            dropped += 1
+            continue
         marks = [tuple(float(v) for v in row) for row in rows[["x", "y", "z", "visibility"]].to_numpy()]
         first = rows.iloc[0]
         frames.setdefault(role, []).append(
             LandmarkFrame(role, int(seq), int(t_ns), int(first["width"]), int(first["height"]), marks))
     for role in frames:
         frames[role].sort(key=lambda f: f.t_capture_ns)
+    _report_dropped(path, dropped, partial)
     return frames
+
+
+def _report_dropped(path: Path, dropped: int, partial: bool) -> None:
+    if dropped or partial:
+        line = "と改行の無い最終行" if partial else ""
+        print(f"[landmarks2d] {path.name} は途中で切れている（kill など）。点が {LANDMARK_COUNT} 個でないフレーム "
+              f"{dropped} 個{line}を捨てました", file=sys.stderr)
 
 
 def _interpolate(frames: list[LandmarkFrame], times: list[int], t: int, max_gap_ns: int) -> InterpolatedFrame | None:

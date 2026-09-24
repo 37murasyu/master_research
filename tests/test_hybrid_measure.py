@@ -2,6 +2,7 @@ import json
 import time
 import cv2 as cv
 import numpy as np
+import pytest
 from config import pose_keypoints
 from app.hybrid.checkerboard import Intrinsics, Stereo, Board
 from app.hybrid.calibration_io import save_calibration, load_calibration
@@ -10,7 +11,7 @@ from app.hybrid.link import PhoneLink, OFF
 from app.hybrid.live import LiveSession
 from app.net.mock_sender import MockPhone
 from app.net.protocol import LandmarkFrame, Hello
-from app.runners.network_measure import NetworkMeasurement
+from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 from test_network_measure import _body_points, _pair_from_pixels
 from test_hybrid_link import _run_phone
 from hybrid_fakes import FakeCamera
@@ -123,6 +124,61 @@ def test_no_measurement_folder_until_the_phone_streams(tmp_path):
     session.on_landmarks(LandmarkFrame("cam1", 0, 2, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
     session.close()
     assert session.directory is not None and session.directory.exists()
+
+
+def test_the_gauge_link_follows_the_pixel(tmp_path):
+    """ゲージ（と GUI）の接続表示は、Pixel の点が 1 s 途絶えるか接続が切れたら waiting に戻り、再開で connected に戻る。
+
+    以前は記録を始めたときに 1 回 connected にするだけで、Pixel が切れても connected のままだった。
+    更新は受信スレッドの定期処理（on_tick＝flush）で行う。
+    """
+    from app.gauge.tracker import GaugeTracker
+
+    now = [100.0]
+    connected = [True]
+    tracker = GaugeTracker()
+    session = MeasurementSession(calibration(tmp_path), root=tmp_path / "measure", tracker=tracker,
+                                 clock=lambda: now[0])
+    session.remote_connected = lambda: connected[0]
+
+    def pixel(seq):
+        session.on_landmarks(LandmarkFrame("cam1", seq, seq + 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
+
+    def link():
+        session.flush()
+        return tracker.snapshot().link
+
+    assert link() == "waiting", "点が来る前"
+    pixel(0)
+    assert link() == "connected"
+    now[0] += 0.9
+    assert link() == "connected", "1 s 以内の途切れ"
+    now[0] += 0.2
+    assert link() == "waiting", "最後の点から 1 s を超えた"
+    pixel(1)
+    assert link() == "connected", "点が戻った"
+    connected[0] = False
+    assert link() == "waiting", "接続が切れた"
+    session.close()
+
+
+def test_a_record_that_failed_to_start_is_not_started_again(tmp_path):
+    """記録の開始で落ちたら（体重が NaN で meta.json を書けない）、止めると決めた後の Pixel の点では始め直さない。
+
+    以前は Pixel の点ごとに記録を始め直し、meta の無い空の計測フォルダが点の数だけ残った。
+    """
+    session = MeasurementSession(calibration(tmp_path), root=tmp_path / "measure",
+                                 config=MeasurementConfig(body_mass_kg=float("nan")))
+
+    def pixel(seq):
+        return LandmarkFrame("cam1", seq, seq + 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33)
+
+    with pytest.raises(ValueError):
+        session.on_landmarks(pixel(0))
+    for seq in range(1, 5):
+        session.on_landmarks(pixel(seq))
+    assert session.failed.is_set() and session.exit_code == 1
+    assert len(list((tmp_path / "measure").iterdir())) == 1
 
 
 def test_identity_and_dimension_rejection(tmp_path):
@@ -252,5 +308,7 @@ def test_camera_size_mismatch_returns_two(tmp_path, monkeypatch):
     def wrong(*args, **kwargs):
         raise ValueError("size mismatch")
 
+    # 校正したカメラ（識別子 "mac"）を開いた。止まるのは識別子の違いではなく寸法の違い
+    monkeypatch.setattr(hybrid_measure, "mac_identity", lambda index: "mac")
     monkeypatch.setattr(hybrid_measure, "MacCamera", wrong)
     assert hybrid_measure.main(["--calibration", str(cal.directory)]) == 2

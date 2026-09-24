@@ -13,16 +13,33 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from app.gauge import protocol
+from app.hybrid.calibration_io import update_meta
 from app.net.protocol import LandmarkFrame
 from app.runners import hybrid_measure
 from hybrid_pushup import PushUp, calibrated_pairs
 from test_hybrid_measure import calibration
 
 ONE_RM_TABLE = "subject_id,elbow_L_outer,elbow_R_outer,wrist_L,wrist_R\n0,20,22,8,9\n"
+
+
+def _mac_identity(index):
+    """校正ランナーと同じ形（``calibration_io.mac_identity``、``<機種>:camera<番号>``）の Mac のカメラの識別子。"""
+    return f"Mac14,2:camera{index}"
+
+
+def _set_mac_camera(cal, device_id):
+    """校正の meta の Mac のカメラの識別子（``cameras[0].device_id``）を書き換える。None なら鍵を消す（古い校正）。"""
+    cameras = [dict(camera) for camera in cal.meta["cameras"]]
+    cameras[0].pop("device_id", None)
+    if device_id is not None:
+        cameras[0]["device_id"] = device_id
+    update_meta(cal.directory, cameras=cameras)
 
 
 class FakeCamera:
@@ -46,6 +63,8 @@ class FakeLink:
     def __init__(self, **kwargs):
         self.callbacks = kwargs
         self.url = "ws://fake"
+        self.remote_role = "cam1"
+        self.connected = True
         FakeLink.instances.append(self)
 
     def start(self):
@@ -54,11 +73,18 @@ class FakeLink:
     def stop(self):
         self.callbacks["on_stop"]()
 
+    def status(self):
+        return SimpleNamespace(devices={"cam1": "pixel-1"} if self.connected else {})
+
 
 class FakeLive:
-    """1 周ごとに押し上げの組を 3 組ずつ流す（Pixel 側の受信を模す）。流し終えたら停止を要求する。"""
+    """1 周ごとに Pixel の点を 1 つと押し上げの組を 3 組ずつ流す（Pixel 側の受信を模す）。流し終えたら停止を要求する。
+
+    ``disconnect`` なら、最後の組を流したところで Pixel の接続を切る。
+    """
 
     pairs: list = []
+    disconnect = False
 
     def __init__(self, camera, detector, link, **kwargs):
         self.link = link
@@ -67,13 +93,14 @@ class FakeLive:
 
     def step(self, **kwargs):
         cb = self.link.callbacks
-        if self.steps == 2:
-            cb["on_landmarks"](LandmarkFrame("cam1", 0, 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
         if self.steps >= 2:
+            cb["on_landmarks"](LandmarkFrame("cam1", self.steps, self.steps, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
             chunk = FakeLive.pairs[self.index:self.index + 3]
             self.index += 3
             if chunk:
                 cb["on_pairs"](chunk)
+            if FakeLive.disconnect and self.index >= len(FakeLive.pairs):
+                self.link.connected = False
             cb["on_tick"]()
         self.steps += 1
         FakeStop.done = self.index >= len(FakeLive.pairs)
@@ -98,6 +125,7 @@ def fakes(monkeypatch, tmp_path):
     FakeLink.instances.clear()
     FakeStop.done = False
     FakeLive.pairs = calibrated_pairs(PushUp(reps=2))
+    FakeLive.disconnect = False
     monkeypatch.setattr(hybrid_measure, "MacCamera", FakeCamera)
     monkeypatch.setattr(hybrid_measure, "PoseDetector", FakeDetector)
     monkeypatch.setattr(hybrid_measure, "PhoneLink", FakeLink)
@@ -105,6 +133,7 @@ def fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(hybrid_measure, "poll_window", lambda: -1)
     monkeypatch.setattr(hybrid_measure, "StopRequest", FakeStop)
     monkeypatch.setattr(hybrid_measure, "stable_session", lambda renew=False: "abcd1234")
+    monkeypatch.setattr(hybrid_measure, "mac_identity", _mac_identity)
     monkeypatch.setattr("app.hybrid.recorder.measurement_root", lambda: tmp_path / "measure")
     table = tmp_path / "one_rm.csv"
     table.write_text(ONE_RM_TABLE, encoding="utf-8")
@@ -114,7 +143,10 @@ def fakes(monkeypatch, tmp_path):
     monkeypatch.delenv("HYBRID_DYN_GATE", raising=False)
     monkeypatch.delenv("HYBRID_EKF_PROFILE", raising=False)
     monkeypatch.delenv("DEMO_MONO_GAUGE_ON", raising=False)
-    return calibration(tmp_path)
+    monkeypatch.delenv("CAM0", raising=False)
+    cal = calibration(tmp_path)
+    _set_mac_camera(cal, _mac_identity(0))  # 校正は既定の 0 番のカメラで取った
+    return cal
 
 
 def _gauge_lines(out: str) -> list[str]:
@@ -139,6 +171,18 @@ def test_every_loop_writes_one_gauge_line(fakes, capsys):
     assert elbow.prev is not None and elbow.prev > 5.0
     assert max(f.parts["elbow_R"].now or 0.0 for f in frames) > 5.0, "押し上げの途中で now が増える"
     assert set(frames[-1].parts) == set(protocol.PART_NAMES)
+
+
+def test_the_gauge_line_says_waiting_after_the_pixel_disconnects(fakes, capsys):
+    """Pixel の接続が切れたら、次の定期処理（on_tick）でゲージの行の link が waiting に戻る（GUI の接続表示）。
+
+    以前は記録を始めたときに 1 回 connected にするだけで、切れても connected のままだった。
+    """
+    FakeLive.disconnect = True
+    assert hybrid_measure.main(["--calibration", str(fakes.directory)]) == 0
+    frames = [protocol.decode(line) for line in _gauge_lines(capsys.readouterr().out)]
+    assert any(frame.link == "connected" for frame in frames)
+    assert frames[-1].link == "waiting"
 
 
 def test_the_settings_reach_the_measurement(fakes, capsys, monkeypatch):
@@ -173,6 +217,86 @@ def test_the_demo_moves_the_gauge_without_torque(fakes, capsys, monkeypatch):
     assert max(f.parts["elbow_R"].now or 0.0 for f in frames) > 1.0
     folder = next(line.split("保存: ", 1)[1] for line in captured.out.splitlines() if line.startswith("保存: "))
     assert json.loads((Path(folder) / "meta.json").read_text(encoding="utf-8"))["demo"] is True
+
+
+def _recording_camera(monkeypatch):
+    """開いたカメラの番号を残す MacCamera の偽物。"""
+    opened = []
+
+    def camera(index, size=None):
+        opened.append(index)
+        return FakeCamera(index, size)
+
+    monkeypatch.setattr(hybrid_measure, "MacCamera", camera)
+    return opened
+
+
+def test_a_mac_camera_other_than_the_calibrated_one_stops(fakes, capsys, monkeypatch, tmp_path):
+    """校正は 1 番のカメラ、計測は 0 番なら、カメラを開かずに終了コード 2 で止め、両方の識別子を理由に出す。
+
+    以前は Pixel の端末 ID しか見なかった。Camo や iPhone の連係カメラで番号がずれたまま計測すると、別のカメラの
+    画像に校正を当て、3D とトルクが丸ごと狂ったまま complete の記録が残った。止めるのは記録を始める前（記録は
+    Pixel の最初の点で始まる）なので、計測フォルダは作らない。
+    """
+    _set_mac_camera(fakes, _mac_identity(1))
+    opened = _recording_camera(monkeypatch)
+    code = hybrid_measure.main(["--calibration", str(fakes.directory), "--camera", "0"])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert opened == [], "校正と違うカメラを開いた"
+    assert _mac_identity(1) in err and _mac_identity(0) in err
+    assert not (tmp_path / "measure").exists(), "止めたのに計測フォルダができた"
+
+
+def test_the_calibrated_mac_camera_is_measured(fakes, capsys, monkeypatch):
+    """校正と同じ番号（設定 CAM0 から読む番号）なら、そのまま計測する。"""
+    _set_mac_camera(fakes, _mac_identity(1))
+    monkeypatch.setenv("CAM0", "1")
+    opened = _recording_camera(monkeypatch)
+    assert hybrid_measure.main(["--calibration", str(fakes.directory)]) == 0
+    assert opened == [1]
+    assert "保存: " in capsys.readouterr().out
+
+
+def _unidentifiable(index):
+    raise subprocess.CalledProcessError(1, ["sysctl", "-n", "hw.model"])
+
+
+@pytest.mark.parametrize("case", ["old_calibration", "no_identity"])
+def test_an_unverifiable_mac_camera_only_warns(fakes, capsys, monkeypatch, case):
+    """meta に識別子が無い古い校正と、今のカメラの識別子を取れない（sysctl の失敗）ときは、警告だけで計測する。"""
+    if case == "old_calibration":
+        _set_mac_camera(fakes, None)
+    else:
+        monkeypatch.setattr(hybrid_measure, "mac_identity", _unidentifiable)
+    opened = _recording_camera(monkeypatch)
+    assert hybrid_measure.main(["--calibration", str(fakes.directory)]) == 0
+    captured = capsys.readouterr()
+    assert opened == [0]
+    assert "保存: " in captured.out
+    assert "確かめられない" in captured.err
+
+
+@pytest.mark.parametrize("argv", [["--body-mass", "nan"], ["--body-mass", "inf"], ["--preview-hz", "nan"]])
+def test_a_non_finite_argument_is_refused_at_the_entrance(fakes, capsys, tmp_path, argv):
+    """体重・表示 Hz の NaN・inf は入口で断る（終了コード 2）。
+
+    以前は ``nan <= 0`` が偽なので検査を通り、記録の開始（meta.json は NaN を書けない）で落ちて、Pixel の点ごとに
+    meta の無い空の計測フォルダを作った。
+    """
+    with pytest.raises(SystemExit) as exc:
+        hybrid_measure.main(["--calibration", str(fakes.directory), *argv])
+    assert exc.value.code == 2
+    assert "体重" in capsys.readouterr().err
+    assert not (tmp_path / "measure").exists()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_a_non_finite_body_mass_setting_uses_the_default(monkeypatch, capsys, value):
+    """設定 BODY_MASS_KG の NaN・inf は、数でない値と同じく既定の体重にする（起動の段階で落とさない）。"""
+    monkeypatch.setenv("BODY_MASS_KG", value)
+    assert hybrid_measure._default_body_mass() == 60.0
+    assert "BODY_MASS_KG" in capsys.readouterr().err
 
 
 def test_hybrid_measure_ignores_hybrid_replay(monkeypatch):

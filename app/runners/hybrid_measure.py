@@ -9,15 +9,17 @@
 import argparse
 from contextlib import ExitStack
 import csv
+import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import cv2 as cv
 import config
 from app.core.stop_request import StopRequest
 from app.gauge.thresholds import PARTS, load_one_rm, subject_index
 from app.gauge.tracker import GaugeTicker, GaugeTracker
-from app.hybrid.calibration_io import load_calibration
+from app.hybrid.calibration_io import load_calibration, mac_identity
 from app.hybrid.session import stable_session
 from app.hybrid.link import PhoneLink, CaptureMode
 from app.hybrid.live import LiveSession
@@ -78,15 +80,46 @@ def measurement_config(body_mass_kg: float, gravity_mode: str) -> MeasurementCon
 
 
 def _default_body_mass(fallback: float = 60.0) -> float:
-    """設定 BODY_MASS_KG を読む。数でなければ既定値（起動の段階で落とさない）。"""
+    """設定 BODY_MASS_KG を読む。数でなければ（NaN・inf も）既定値（起動の段階で落とさない）。"""
     raw = os.environ.get("BODY_MASS_KG")
     if not raw:
         return fallback
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
         print(f"BODY_MASS_KG={raw!r} は数ではないため {fallback} kg を使います", file=sys.stderr)
         return fallback
+    return value
+
+
+def check_mac_camera(calibration, index) -> str | None:
+    """今開く Mac のカメラ（番号 ``index``）が校正したカメラと同じかを確かめる。違えば止める理由を返す。
+
+    識別子は校正ランナーが meta の ``cameras[0].device_id`` に書いたのと同じ ``mac_identity``（``<機種>:camera<番号>``）。
+    Camo や iPhone の連係カメラで番号がずれたまま計測すると、別のカメラの画像に校正を当て、3D とトルクが丸ごと
+    狂ったまま記録が complete になる。識別子を取れない（sysctl が無い・失敗した）ときと、meta に識別子が無い
+    古い校正は確かめようがないので、警告だけ出して続ける。
+
+    見るのは機種と番号だけなので、同じ番号に別の装置が入れ替わったことまでは分からない（``mac_identity`` の注記）。
+    """
+    cameras = calibration.meta.get("cameras") or [{}]
+    expected = cameras[0].get("device_id")
+    if not expected:
+        print("[Mac カメラ] 校正の meta に Mac のカメラの識別子が無い（古い校正）ため、"
+              "校正したカメラと同じかを確かめられない。そのまま計測します", file=sys.stderr)
+        return None
+    try:
+        current = mac_identity(index)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[Mac カメラ] カメラの識別子を取得できない（{exc}）ため、"
+              "校正したカメラと同じかを確かめられない。そのまま計測します", file=sys.stderr)
+        return None
+    if current != expected:
+        return (f"校正した Mac のカメラ（{expected}）と、今開くカメラ（{current}）が違います。"
+                "校正したときのカメラ番号を --camera（設定 CAM0）で指定するか、校正し直してください")
+    return None
 
 
 def main(argv=None):
@@ -108,12 +141,19 @@ def main(argv=None):
         args.camera = default_camera_index()
     if args.body_mass is None:
         args.body_mass = _default_body_mass()
-    if args.body_mass <= 0 or args.preview_hz < 0:
-        parser.error("体重は正の値、表示 Hz は0以上にしてください")
+    # NaN は比べるとどれも偽なので、有限かを先に見る（通すと記録の開始で meta.json を書けずに落ちる）
+    if not (math.isfinite(args.body_mass) and args.body_mass > 0
+            and math.isfinite(args.preview_hz) and args.preview_hz >= 0):
+        parser.error("体重は正の値、表示 Hz は0以上の値（どちらも NaN・inf は不可）にしてください")
     stop = StopRequest.from_environment()
     stop.install_signal_handlers()
     try:
         calibration = load_calibration(args.calibration)
+        # 開く前に確かめる。記録は Pixel の最初の点で始まるので、ここで止めれば計測フォルダは残らない
+        mismatch = check_mac_camera(calibration, args.camera)
+        if mismatch:
+            print(mismatch, file=sys.stderr)
+            return 2
         with ExitStack() as stack:
             try:
                 camera = MacCamera(args.camera, size=calibration.intrinsics[0].size)
@@ -151,6 +191,8 @@ def main(argv=None):
                 on_tick=measurement.flush,
                 on_stop=measurement.close,
             )
+            # ゲージの接続表示（measurement.flush）は、Pixel が名乗った接続が残っているかも見る
+            measurement.remote_connected = lambda: link.remote_role in link.status().devices
             stack.callback(cv.destroyAllWindows)
             link.start()
             stack.callback(link.stop)
