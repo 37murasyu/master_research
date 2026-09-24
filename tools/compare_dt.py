@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 力積 Σ τ·dt の dt 依存は 2 通りに分けて見ないと誤解する。
     #   (1) トルク系列を固定して dt だけ変える  → dt に正比例（÷9）
-    #   (2) トルクも新しい dt で計算し直す      → τ 側の ×729 が乗って ×81
+    #   (2) トルクも新しい dt で計算し直す      → τ 側の ×81（ω̇ ∝ 1/dt²）が乗って ×9
     # 実際の修正で起きるのは (2)。(1) は「積分係数としての dt」の効きだけを見る対照。
     fixed_series = pd.Series(inertia[0, 0] * new["ang_acc"])
     imp_coeff_old = compute_impulse(fixed_series, args.old_dt)[0]
@@ -177,9 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     print(f"- 慣性テンソル対角 = {np.diag(inertia)}")
     print(
-        "\n> 角速度が `1/dt²`、角加速度が `1/dt³` でスケールするのは、"
-        "`link_vector_calculator_module.py:100` が角速度を `cross(v_prev, v)/|r|²` で"
-        "計算しているため。標準形 `(r × ṙ)/|r|²` なら順に `1/dt`、`1/dt²` になる。"
+        "\n> 角速度が `1/dt`、角加速度が `1/dt²` でスケールするのは、"
+        "`link_vector_calculator_module.py` が角速度を標準形 `(r × ṙ)/|r|²`（`ṙ = Δr/dt`）で計算し、"
+        "角加速度をその差分 `Δω/dt` で出すため。加速度も `Δ²r/dt²` で `1/dt²`。"
+        "直す前（R-2）は別式 `cross(v_prev, v)/|r|²` で、順に `1/dt²`・`1/dt³` だった。"
         "詳細は `tests/test_dynamics_dt.py` の `TestScalingLaws` を参照。"
     )
     return 0
