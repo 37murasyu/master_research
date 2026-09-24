@@ -79,6 +79,21 @@ class TestSessionHandler:
         assert handler.handle("これはJSONではない") is None
         assert handler.errors == 1
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            json.dumps({"type": "landmarks", "role": "cam0", "seq": 0, "t_capture_ns": 1, "w": 1280, "h": 720,
+                        "lm": [[10**400, 0.5, 0, 1]] * p.LANDMARK_COUNT}),
+            '{"type":"landmarks","lm":' + "[" * 100_000 + "]" * 100_000 + "}",
+        ],
+        ids=["huge-int-coordinate", "deep-nesting"],
+    )
+    def test_hostile_message_is_counted_not_raised(self, raw):
+        """以前は OverflowError・RecursionError が外へ出て、受信サーバが接続ごと 1011 で切っていた。"""
+        handler = SessionHandler(SyncBuffer(), clock=FakeClock())
+        assert handler.handle(raw) is None
+        assert handler.errors == 1
+
     def test_keeps_working_after_a_malformed_message(self):
         buffer = SyncBuffer(grid=GridSpec(target_hz=10.0))
         handler = SessionHandler(buffer, clock=FakeClock())
@@ -201,6 +216,32 @@ class TestServerIntegration:
         pairs = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
         assert pairs, "ペアが 1 つも出ていない"
         assert all(set(pair.frames) == {"cam0", "cam1"} for pair in pairs)
+
+    def test_a_hostile_message_keeps_the_connection(self):
+        """壊れた電文 1 通で接続を切らず、protocol_errors に数える（以前は 1011 で切れ、数えなかった）。"""
+
+        async def scenario():
+            server = LandmarkServer(host="127.0.0.1", port=0, buffer=SyncBuffer())
+            await server.start()
+            try:
+                import websockets
+
+                async with websockets.connect(f"ws://127.0.0.1:{server.port}") as ws:
+                    await ws.send(p.encode(p.Hello("cam1", "Pixel 7a", "s", "id-1")))
+                    await ws.send(json.dumps({
+                        "type": "landmarks", "role": "cam1", "seq": 0, "t_capture_ns": time.monotonic_ns(),
+                        "w": 1280, "h": 720, "lm": [[10**400, 0.5, 0, 1]] * p.LANDMARK_COUNT,
+                    }))
+                    await ws.send(p.encode(p.SyncRequest(t1=1)))
+                    reply = p.decode(await asyncio.wait_for(ws.recv(), timeout=5))
+                    return reply, server.stats
+            finally:
+                await server.stop()
+
+        reply, stats = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+        assert isinstance(reply, p.SyncResponse), "壊れた電文の後も同じ接続で時刻同期に応える"
+        assert stats["protocol_errors"] == 1
+        assert stats["clients"] == 1
 
     def test_stats_count_points_dropped_by_capture_time(self):
         """撮影時刻で捨てた点は統計（time_rejected）に出す。接続が切れた後も数え続ける。"""
