@@ -170,8 +170,11 @@ class MeasurePage(RunnerPage):
         self._body_mass = QtWidgets.QDoubleSpinBox()
         self._body_mass.setDecimals(1)
         self._body_mass.setRange(20.0, 200.0)
-        self._body_mass.setValue(float(self._settings.get("BODY_MASS_KG")))
         self._body_mass.valueChanged.connect(lambda value: self._settings.set("BODY_MASS_KG", value))
+        # 結線してから値を入れる。保存値が範囲外なら欄は丸めた値を見せるので、設定もそれにそろえる
+        # （先に入れると、欄は 200 と見せたまま子には 300 が渡る）
+        self._body_mass.setValue(float(self._settings.get("BODY_MASS_KG")))
+        self._settings.set("BODY_MASS_KG", self._body_mass.value())
         mass = QtWidgets.QWidget()
         mass_layout = QtWidgets.QHBoxLayout(mass)
         mass_layout.setContentsMargins(0, 0, 0, 0)
