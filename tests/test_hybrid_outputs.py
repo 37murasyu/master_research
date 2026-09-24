@@ -65,7 +65,7 @@ class TestCycleWork:
         session, _ = _session(tmp_path)
         table = pd.read_csv(_file(session, "cycle_work"))
         assert list(table.columns) == ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score",
-                                       "status"]
+                                       "status", "n_frames"]
         elbow = table[table.joint == "elbow_R"].iloc[0]
         assert elbow.work_j == pytest.approx(elbow.work_pos_j + elbow.work_neg_j)
         assert elbow.work_pos_j == pytest.approx(22.0, rel=0.25)
@@ -74,6 +74,38 @@ class TestCycleWork:
         assert elbow.score == pytest.approx(elbow.work_pos_j / w1rm, rel=1e-6)
         shoulder = table[table.joint == "shoulder_R"].iloc[0]
         assert np.isnan(shoulder.w1rm_j) and np.isnan(shoulder.score), "帯が無ければ空"
+
+
+class TestPartsWithoutWork:
+    """有限の仕事率を 1 フレームも積まなかった部位は 0.0 ではなく空欄（2026-09-24 のレビュー）。
+
+    見えない腕のトルクは NaN で仕事は積まれないのに、cycle_work・cycle_energy には 0.0 J と普通の値で書いていた。
+    部位ごとの積んだフレーム数（n_frames）を末尾に足し、0 フレームの部位の仕事・スコア・E± は空欄にする。
+    """
+
+    def test_a_hidden_arm_is_blank_not_zero(self, tmp_path):
+        cal = calibration(tmp_path)
+        session = MeasurementSession(
+            cal, root=tmp_path / "measure",
+            config=MeasurementConfig(body_mass_kg=65.0, one_rm=ONE_RM, subject_id="00"))
+        session.on_landmarks(LandmarkFrame("cam1", 0, 1, 1280, 720, [(0.5, 0.5, 0.0, 1.0)] * 33))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            session.on_pairs(calibrated_pairs(PushUp(reps=1, rest_s=6.0), hide=(13,)))   # 左肘がずっと見えない
+        session.close()
+        assert session.measurement.cycle_count == 1
+        table = pd.read_csv(_file(session, "cycle_work"))
+        for joint in ("wrist_L", "elbow_L", "shoulder_L"):
+            row = table[table.joint == joint].iloc[0]
+            assert row.n_frames == 0
+            assert np.isnan([row.work_j, row.work_pos_j, row.work_neg_j, row.score]).all(), f"{joint} が 0.0 J"
+        right = table[table.joint == "elbow_R"].iloc[0]
+        assert right.n_frames > 30 and right.work_pos_j > 10.0
+        assert np.isnan(session.measurement.cycle_work["elbow_L"][0])
+        energy = pd.read_csv(_file(session, "cycle_energy"))
+        left = energy[energy.part == "elbow_L"].iloc[0]
+        assert np.isnan(left.e_pos) and np.isnan(left.e_neg) and left.n_frames == 0
+        assert energy[energy.part == "elbow_R"].iloc[0].n_frames == right.n_frames
 
 
 class TestUnfinishedRep:
@@ -109,6 +141,7 @@ class TestUnfinishedRep:
         assert elbow.work_pos_j == pytest.approx(22.0, rel=0.3), "上げの仕事は積んである"
         assert elbow.work_j == pytest.approx(elbow.work_pos_j + elbow.work_neg_j)
         assert elbow.score == pytest.approx(elbow.work_pos_j / elbow.w1rm_j)
+        assert elbow.n_frames > 20
         frames = pd.read_csv(_file(session, "frames"))
         assert elbow.frame == frames.frame.iloc[-1] and elbow.t_ns == frames.t_ns.iloc[-1]
         assert frames.cycle_detected.sum() == 1, "未完の回は確定した回に数えない"
@@ -235,7 +268,8 @@ class TestCycleEnergy:
     def test_one_row_per_elbow_per_rep(self, tmp_path):
         session, _ = _session(tmp_path, reps=2)
         table = pd.read_csv(_file(session, "cycle_energy"))
-        assert list(table.columns) == ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u"]
+        assert list(table.columns) == ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u",
+                                       "n_frames"]
         assert sorted(table.part) == ["elbow_L", "elbow_L", "elbow_R", "elbow_R"]
         assert (table.fc_current == 1.2).all() and (table.n_u == 80).all()
         assert table.dt_sec.iloc[0] == pytest.approx(1 / 30)

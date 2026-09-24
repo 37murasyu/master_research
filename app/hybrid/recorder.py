@@ -1,6 +1,7 @@
 """Incremental measurement writer. Construct and call only on the receiver loop thread."""
 
 import csv
+import math
 import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +25,17 @@ CLOSED = "closed"
 UNFINISHED = "unfinished"
 
 
-def _work_columns(pos, neg, w1rm):
-    """cycle_work の W+・W−・W_1RM・スコア。無いものは空欄。"""
+def _blank(value):
+    """有限でない値（仕事を積まなかった部位の NaN・None）は空欄にする。csv は NaN を "nan" と書く。"""
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return ""
+    return value
+
+
+def _work_columns(pos, neg, w1rm, frames):
+    """cycle_work の W+・W−・W_1RM・スコア。無いもの・仕事を 1 フレームも積まなかった部位の仕事とスコアは空欄。"""
+    if not frames:
+        return ["", "", "" if w1rm is None else w1rm, ""]
     score = pos / w1rm if w1rm else ""
     return [pos, neg, "" if w1rm is None else w1rm, score]
 
@@ -35,7 +45,12 @@ def _cycle_columns(result, key):
     work = result.cycle_parts.get(key)
     if work is None:
         return ["", "", "", ""]
-    return _work_columns(work.pos, work.neg, result.cycle_w1rm.get(key))
+    return _work_columns(work.pos, work.neg, result.cycle_w1rm.get(key), work.frames)
+
+
+def _frames(work):
+    """積んだフレーム数の列（部位の仕事が無ければ空欄）。"""
+    return "" if work is None else work.frames
 
 
 class Recorder:
@@ -124,15 +139,18 @@ class Recorder:
         )
         self.torques = writer("local_torque", ["frame", "t_ns", "joint", "x", "y", "z"])
         # work_j は符号付きの W±（既存の列）。W+ = Σmax(P,0)·dt、W− = Σmin(P,0)·dt、score = W+ / W_1RM（論文 4.5.2 節）。
-        # status は closed（確定した回）か unfinished（止めたときに開いたままだった回。close で末尾に書く）
+        # status は closed（確定した回）か unfinished（止めたときに開いたままだった回。close で末尾に書く）。
+        # n_frames は有限の仕事率を積んだフレーム数。0 の部位（見えない腕）は仕事・スコアを 0.0 ではなく空欄にする
         self.work = writer("cycle_work", ["frame", "t_ns", "joint", "work_j", "work_pos_j", "work_neg_j", "w1rm_j", "score",
-                                          "status"])
+                                          "status", "n_frames"])
         # ゲージに出した値（今の回の W+ [J]）。毎フレーム 1 行。帯と定義は閉じるときに .json へ
         self._gauge_parts = PART_NAMES
         self._gauge_path = self.directory / f"gauge_energy_{stamp}.csv"
         self.gauge = writer("gauge_energy", ["frame", "t_ns", "rep", "dyn_active", *self._gauge_parts])
-        # 肘の濾波 E±（USB の cycle_energy_debug_* と同じ量。回の確定ごとに肘の左右で 1 行ずつ）
-        self.energy = writer("cycle_energy", ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u"])
+        # 肘の濾波 E±（USB の cycle_energy_debug_* と同じ量。回の確定ごとに肘の左右で 1 行ずつ）。n_frames は cycle_work と
+        # 同じ積んだフレーム数で、0 なら E± は空欄
+        self.energy = writer("cycle_energy", ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u",
+                                              "n_frames"])
         # OFFLINE_WRIST_CAPTURE: 前腕（肘→手首）(N,3) と手首の局所 τ_y (N,)。閉じるときに npy へ（USB と同じ名前）
         self._wrist = {"R": ([], []), "L": ([], [])} if offline_wrist else None
         # EKF の手前の生 3D（EKF の較正 tune_ekf の入力）。同期バッファの格子（既定 1/30 s）で、抜けた格子は NaN の行で埋める
@@ -254,7 +272,8 @@ class Recorder:
             for key, value in result.local_torques.items()
         )
         self.work.writerows(
-            [self.frames, result.t_ns, key, value, *_cycle_columns(result, key), CLOSED]
+            [self.frames, result.t_ns, key, _blank(value), *_cycle_columns(result, key), CLOSED,
+             _frames(result.cycle_parts.get(key))]
             for key, value in result.cycle_work_j.items()
         )
         gauge = result.gauge_now
@@ -269,7 +288,8 @@ class Recorder:
                 [self.frames, *(value for part in self.TORQUE_VECTOR_PARTS
                                 for value in torques.get(part, (float("nan"),) * 3))])
         self.energy.writerows(
-            [self.frames, result.t_ns, part, e["e_pos"], e["e_neg"], e["fc"], self.grid.period_s, e["n_u"]]
+            [self.frames, result.t_ns, part, _blank(e["e_pos"]), _blank(e["e_neg"]), e["fc"], self.grid.period_s, e["n_u"],
+             e.get("n_frames", "")]
             for part, e in result.cycle_energy.items()
         )
         self.frames += 1
@@ -289,8 +309,9 @@ class Recorder:
         if not rep:
             return
         self.work.writerows(
-            [rep["frame"], rep["t_ns"], key, part["work_j"],
-             *_work_columns(part["work_pos_j"], part["work_neg_j"], part.get("w1rm_j")), UNFINISHED]
+            [rep["frame"], rep["t_ns"], key, _blank(part["work_j"]),
+             *_work_columns(part["work_pos_j"], part["work_neg_j"], part.get("w1rm_j"), part["frames"]), UNFINISHED,
+             part["frames"]]
             for key, part in rep["parts"].items()
         )
 
