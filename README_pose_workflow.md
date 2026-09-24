@@ -5,10 +5,12 @@
 ## 1. 依存パッケージ
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements_min.txt
 ```
 
-(既に mediapipe / opencv-python / numpy が入っていれば不要)
+(`requirements.txt` は同じものを入れる入口。mediapipe は Solutions API（`mp.solutions.pose`、`video_pose_extractor.py` が使う）の
+ある 0.10.14 に固定してある。OpenCV は mediapipe が要る `opencv-contrib-python` だけにする。`opencv-python` を一緒に入れると
+同じ `cv2` に上書きで入り、どちらが使われるか分からなくなる)
 
 ## 2. 3Dランドマーク抽出
 
@@ -71,7 +73,7 @@ python pose_sequence_comparison.py output_data/poses/cam0_output_0925_062008_pos
 
 | 現象 | 対処 |
 |------|------|
-| mediapipe import 失敗 | `pip install --upgrade mediapipe` |
+| mediapipe import 失敗 | `pip install -r requirements_min.txt`（版を上げない。0.10.20 以降は `mp.solutions` が無い） |
 | GPU 利用したい | MediaPipe Pose は現状 CPU 依存 (一部構成除く) |
 | 文字化け | `--ascii-output` |
 | メモリ不足 (巨大動画) | `--stride` で間引き or FFmpegで短縮 |

@@ -1,32 +1,7 @@
-### Core numerical / vision
-numpy
-scipy
-pandas
-opencv-python
-matplotlib
-japanize-matplotlib
-mediapipe
-pygame
-pillow
-pyyaml
+# 依存の一覧の正本は requirements_min.txt（計測・GUI・解析の実行に要るもの）。ここは古い手順の
+# `pip install -r requirements.txt` のための入口で、パッケージを直接並べない（並べると食い違う:
+# opencv-python と opencv-contrib-python の二重、mediapipe の版の固定漏れ、PyQt5（GPL）入りで PySide6 無し）。
+-r requirements_min.txt
 
-### Networking / cloud / I/O
-requests
-boto3
-pyserial
-bleak
-
-### UI / visualization
-PyQt5
-pyqtgraph
-plotly
-wordcloud
-manim
-
-### ML / time-series
-scikit-learn
-tslearn
-
-### Windows-only helpers
-wmi; platform_system == "Windows"
-comtypes; platform_system == "Windows"
+# 開発・テスト・ビルド: pip install -r requirements_dev.txt
+# 解析・可視化の追加（plotly・scikit-learn・tslearn・PyQt5 など。計測には要らない）: pip install -r requirements_extra.txt
