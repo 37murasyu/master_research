@@ -90,6 +90,18 @@ def test_joule_text_rounds_to_integer():
     assert m.joule_text(float("nan")) == ""
 
 
+def test_joule_text_draws_negative_as_zero():
+    """設計書 §7「値が NaN・負: 0 として描く」。弧（fraction）は 0 なのに数字だけ「-5 J」と出ていた。"""
+    assert m.joule_text(-5.0) == "0"
+    assert m.joule_text(-0.4) == "0"
+
+
+def test_fraction_without_positive_upper_edge_is_zero():
+    """分母の上端が 0 以下の帯でも例外を投げない（描画ループを止めない）。"""
+    assert m.fraction(1.0, (-1.0, 0.0)) == 0.0
+    assert m.fraction(1.0, (-10.0, -5.0)) == 0.0
+
+
 def test_band_labels():
     assert m.band_labels((174.6, 212.6)) == ("175", "213 J")
     # band が無い部位は両方とも空文字。

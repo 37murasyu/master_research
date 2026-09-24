@@ -62,8 +62,8 @@ def fraction(now: float | None, band: tuple[float, float] | None) -> float:
     """弧の割合 ``f = clamp(now / (1.25·hi), 0, 1)``（constraints.md「弧の割合」）。
 
     ``now`` が None・NaN・負なら 0（Global Constraints の式の定義域外）。
-    ``band`` が None のとき（分母の ``hi`` が無い）も同じく 0 にする。
-    protocol.decode を通った値なら band は常に lo<hi の組か None しか来ないが、
+    ``band`` が None のとき（分母の ``hi`` が無い）や、``hi`` が 0 以下のときも同じく 0 にする。
+    protocol.decode を通った値なら band は常に lo<hi かつ hi>0 の組か None しか来ないが、
     この関数は呼び出し側の組み合わせを信用せず、壊れた入力で例外を投げない
     （描画ループが 30Hz で回り続けるので、1 部位のために止まってはいけない）。
     """
@@ -72,6 +72,8 @@ def fraction(now: float | None, band: tuple[float, float] | None) -> float:
     if math.isnan(now) or now < 0:
         return 0.0
     lo, hi = band
+    if not hi > 0:
+        return 0.0
     f = now / (1.25 * hi)
     return max(0.0, min(1.0, f))
 
@@ -112,10 +114,13 @@ def status_label(value: Status) -> str:
 
 
 def joule_text(value: float | None) -> str:
-    """整数に丸めた文字。値が無い（None・非有限）なら空文字。"""
+    """整数に丸めた文字。値が無い（None・非有限）なら空文字。
+
+    負は 0 として出す（設計書 §7「値が NaN・負: 0 として描く」。弧の ``fraction`` とそろえる）。
+    """
     if value is None or not math.isfinite(value):
         return ""
-    return str(round(value))
+    return str(round(max(0.0, value)))
 
 
 def band_labels(band: tuple[float, float] | None) -> tuple[str, str]:

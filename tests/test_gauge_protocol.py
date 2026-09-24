@@ -210,7 +210,9 @@ class TestDecodeRejects:
         assert frame.parts["elbow_L"].now == 12.3
 
     def test_decode_turns_invalid_band_into_none(self):
-        for bad_band in ([10.0], [10.0, 20.0, 30.0], [20.0, 10.0], [10.0, 10.0], ["a", "b"], "10,20"):
+        # 上端が 0 以下の帯も無効（弧の割合 now / (1.25·hi) の分母になる）
+        for bad_band in ([10.0], [10.0, 20.0, 30.0], [20.0, 10.0], [10.0, 10.0], ["a", "b"], "10,20",
+                         [-1.0, 0.0], [-10.0, -5.0]):
             body = {
                 "v": 2,
                 "link": "connected",
