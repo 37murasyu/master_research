@@ -46,9 +46,9 @@ UI 側の計画と台帳: `docs/superpowers/plans/2026-09-24-subject-gauge.md`�
 - 設計の見直しとして次の機会に回すもの:
   - 同期の格子（30 Hz・100 ms）を `SyncBuffer` から配る（今は `1/30` が 10 か所近くに直書き）
   - `LandmarkEKF` に公開の作り直し（`GridEkf._reinit` が私的な状態を書く。USB と共有のモジュールなので今回は触らない）
-  - 再生を環境変数 `HYBRID_REPLAY` ではなく別の role にする（親のシェルに残った `export` で本番が再生になりうる。
-    計測画面の「出力フォルダ」は再生でも `hybrid/measure` を開く）
-  - 計測画面の role の文字列の比較を役割の記述にまとめる
+  - （済み）再生を環境変数 `HYBRID_REPLAY` ではなく別の role `hybrid_replay` にする。計測画面の入力「記録の再生」で
+    選び、「出力フォルダ」は `hybrid/replay` を開く。`HYBRID_REPLAY*` は再生の子にしか渡らない
+  - （済み）計測画面の role の文字列の比較を入力の記述 `MEASURE_INPUTS` にまとめる
 
 ## 3. 検証（このコンテナ、Linux・Python 3.11・PySide6 offscreen）
 
@@ -74,7 +74,7 @@ UI 側の計画と台帳: `docs/superpowers/plans/2026-09-24-subject-gauge.md`�
    凍結版で `--role script --module app.gauge.demo --snapshot <絶対パス>` と `--via-worker` を確かめる（UI 側の計画 Task 18）
 3. GUI（`python -m app`）の計測画面で「実験者用の詳細設定」を開き、Mac＋Pixel・被験者番号 00・体重を入れて開始 →
    ゲージ窓が作業者の窓と別の画面（無ければ 1280×720 の窓）に出て「接続待ち」になること。被験者なしなら
-   `HYBRID_REPLAY=<合成の計測フォルダ> python -m app` で同じ画面が「▶ 再生」で動く
+   入力「記録の再生」で合成の計測フォルダを選んで開始すると、同じ画面が「▶ 再生」で動く
 4. 実機の手順は `docs/hybrid_field_run.md` §0 から（最初の 2 秒は静止、盤を立てる校正、終了コード 3 の意味、停止後の `verify_run check`）
 5. 実機でしか分からないこと: 置き方、実際の押し上げで回が閉じるか、実際の W_pos が W_0.70 に届く大きさか、GPU の発熱後の fps、
    第 2 モニタの全画面、高 DPI での見た目、.app の許可の取り直し

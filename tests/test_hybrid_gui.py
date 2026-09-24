@@ -56,14 +56,17 @@ def test_input_switch_disables_during_run():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     assert app is not None
 
-    # 計測画面の入力はラジオ 2 つ（詳細設定の開示の中。R2-01）
+    # 計測画面の入力はラジオ 3 つ（詳細設定の開示の中。R2-01）
     page = MeasurePage(Settings())
+    radios = (page._input_usb, page._input_hybrid, page._input_replay)
     page._input_hybrid.click()
     assert page._runner.role == "hybrid_measure"
+    page._input_replay.click()
+    assert page._runner.role == "hybrid_replay"
     page._on_state("running")
-    assert not page._input_usb.isEnabled() and not page._input_hybrid.isEnabled()
+    assert not any(radio.isEnabled() for radio in radios)
     page._on_state("stopped")
-    assert page._input_usb.isEnabled() and page._input_hybrid.isEnabled()
+    assert all(radio.isEnabled() for radio in radios)
     page.shutdown()
 
     page = CalibratePage(Settings())
