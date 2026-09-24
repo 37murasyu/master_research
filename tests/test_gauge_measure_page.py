@@ -846,6 +846,18 @@ class TestReplayInput:
         assert window.gauge.state.phase is gm.Phase.DONE
 
 
+def test_opening_the_page_leaves_the_default_body_mass_out_of_the_saved_differences(qt_app):
+    """欄の 65.0 を設定に入れ直しても、既定の "65" と同じ値なので差分にしない（毎回保存されていた）。"""
+    from app.shell.page_measure import MeasurePage
+
+    settings = Settings()
+    page = MeasurePage(settings)
+    try:
+        assert "BODY_MASS_KG" not in settings.overrides
+    finally:
+        page.shutdown()
+
+
 @pytest.mark.parametrize("saved, shown", [(300.0, 200.0), (5.0, 20.0), (72.5, 72.5)])
 def test_body_mass_setting_matches_what_the_field_shows(qt_app, saved, shown):
     from app.shell.page_measure import MeasurePage

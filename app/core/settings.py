@@ -363,6 +363,20 @@ def _from_str(setting: Setting, raw: str) -> Any:
     return raw
 
 
+def _same_value(setting: Setting, raw: str, other: str | None) -> bool:
+    """2 つの文字列が同じ値を表すか。型に直して比べる。
+
+    文字列のまま比べると、既定の "65" と欄が渡す 65.0（"65.0"）や、"1e-3" と 0.001 が
+    別の値になり、既定のままの項目が毎回差分として保存されていた。
+    """
+    if other is None:
+        return False
+    try:
+        return _from_str(setting, raw) == _from_str(setting, other)
+    except ValueError:
+        return raw == other
+
+
 class Settings:
     """設定値の集合。既定値との差分だけを保持する。"""
 
@@ -394,7 +408,7 @@ class Settings:
     def set(self, name: str, value: Any) -> None:
         setting = self._setting(name)
         raw = _to_str(setting, value)
-        if raw == setting.effective_default:
+        if _same_value(setting, raw, setting.effective_default):
             self._overrides.pop(name, None)  # 既定に戻ったら差分から外す
         else:
             self._overrides[name] = raw

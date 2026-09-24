@@ -134,6 +134,22 @@ class TestPersistence:
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert list(payload["values"]) == ["DEMO_MONO_GAUGE_ON"]
 
+    @pytest.mark.parametrize("name, value", [
+        ("BODY_MASS_KG", 65.0),  # 既定は "65"。欄は 65.0 を渡す
+        ("EKF_Q_ACC", 0.001),  # 既定は "1e-3"
+        ("SKIP_FRAMES", 0),
+        ("HYBRID_REPLAY_SPEED", 1.0),
+    ])
+    def test_setting_the_default_as_a_value_keeps_no_difference(self, name, value, tmp_path):
+        """既定値は文字列でなく値で比べる。"65.0" と "65" を別の値として毎回差分に保存していた。"""
+        s = st.Settings()
+        s.set(name, value)
+        assert name not in s.overrides
+
+        path = tmp_path / "settings.json"
+        s.save(path)
+        assert json.loads(path.read_text(encoding="utf-8"))["values"] == {}
+
     def test_load_missing_file_returns_defaults(self, tmp_path):
         s = st.Settings.load(tmp_path / "does_not_exist.json")
         assert s.get("DEMO_MONO_GAUGE_ON") is False
