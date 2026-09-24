@@ -182,7 +182,7 @@ CURATED: dict[str, dict[str, Any]] = {
         "type": "bool",
         "code_default": "0",
         "group": "混成ステレオ",
-        "description": "Mac 側の姿勢推定で人の周りだけを切り出して推定する（IMAGE モードになる）。",
+        "description": "Mac 側の姿勢推定で人の周りだけを切り出して推定する（既定は無効。有効にすると追跡を使わない IMAGE モードになり、Pixel 側と推定の条件が変わるので試すときは比べて確かめる）。",
     },
     "HYBRID_DYN_GATE": {
         "type": "bool",

@@ -1073,9 +1073,11 @@ USB のゲージは肘 12.727、オフラインのスコアは肘 15 を使う�
 - **Mac のカメラ（13）**: OpenCV 5.0 の AVFoundation 経路は露出・WB・焦点を設定できない（`set` はすべて失敗、`get` は −1。実測 29.8 fps）。
   best effort で試して結果を meta の `mac_camera` に残すだけ（pyobjc は入れていない）
 - **Mac の姿勢推定（14）**: `HYBRID_POSE_*` で受ける（GUI が渡す USB 向けの `POSE_ROI_ON=1`・`MP_INPUT_SCALE=0.5` を漏らさない）。既定は今と同じ
-  （lite / VIDEO / 0.5 / 縮小 1.0 / ROI なし）。ROI の配線は未実装（`HYBRID_POSE_ROI=1` は警告して全画面）
-- **USB の横の切り出しの不具合（確定、未修正）**: `master_research_code.py:2818` で切り出した画像の画素座標を、全体画像用の P0/P1（:2942）で
-  三角測量している（x_start を戻していない）。論文のデータの作り方に影響するかは未確認
+  （lite / VIDEO / 0.5 / 縮小 1.0 / ROI なし）。`HYBRID_POSE_ROI=1` で USB と同じ式の ROI（`app/hybrid/pose_roi.py`、本体の関数を
+  試験で抜き出して数値の一致を確かめる）を IMAGE モードで使い、点は全体の正規化座標へ戻す。見失ったら広げ、4 回を超えたら全画面
+- **USB の横の切り出しの不具合（確定、USB は未修正）**: `master_research_code.py:2818` で切り出した画像の画素座標を、全体画像用の P0/P1（:2942）で
+  三角測量している（x_start を戻していない）。論文のデータの作り方に影響するかは未確認。混成の移植では戻す
+  （`pose_roi.uncrop_x_pixels`・`remap_to_fullframe`。混成の推定は横の切り出しを使っていない）
 - **検証の道具**: `app/hybrid/replay.py`・`python -m app.runners.hybrid_replay <計測フォルダ>`（GUI は `HYBRID_REPLAY` を付けて起動）で記録を
   計測と同じ道筋で流し直す。`python -m tools.synth_session` で合成の押し上げの計測フォルダを作る。合成 13 cm×10 回で回 10、
   肘の W_pos 約 19.7 J（S≈0.30）・手首 約 6.9 J（S≈0.51）＝どちらも「不足」。**普通の押し上げでは帯に届かない見込み**（過去の実データの S と同じ桁）
@@ -1084,7 +1086,7 @@ USB のゲージは肘 12.727、オフラインのスコアは肘 15 を使う�
 - **同梱の EKF が追える帯域は約 0.65 Hz**: 1 Hz・振幅 10 cm の動きでは頑健な門が追従を失い、1 次元の試算で 0.8 m ずれたままになる（押し上げの
   約 0.5 Hz は追える）。対策に発散の見張り（観測から 15 cm 以上のずれが 3 フレーム続いた点を観測で初期化し直す、meta の `ekf.divergence_resets`）を入れた
 - 受信スレッドの `process` の時間: 合成で中央値 1.7〜5.8 ms、最大 17 ms（30 Hz の予算 33 ms に収まる）
-- 残り: 実機での確認、ROI の配線、解析ページの EKF の説明文（`HYBRID_EKF_PROFILE` への書き換え）、オフライン用の書き出し
+- 残り: 実機での確認（ROI を含む）、解析ページの EKF の説明文（`HYBRID_EKF_PROFILE` への書き換え）、オフライン用の書き出し
 
 ## 混成ステレオ経路の申し送り（2026-09-23）
 
