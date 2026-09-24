@@ -49,7 +49,7 @@ from app.core.settings import OUTPUT_DIR_ENV, Settings  # noqa: E402
 from app.core.stop_request import STOP_FILE_ENV  # noqa: E402
 from app.hybrid.retriangulate import retriangulate  # noqa: E402
 from app.tuning.ekf_likelihood import innovation_loglik  # noqa: E402
-from app.tuning.ekf_profile import builtin_entry, read_profile  # noqa: E402
+from app.tuning.ekf_profile import builtin_entry, resolve_profile  # noqa: E402
 from app.tuning.raw_capture import (  # noqa: E402
     HYBRID_RETRI_SOURCE, RawCaptureWriter, read_raw_capture, sidecar_path)
 from tools.parse_fps_stats import parse_file  # noqa: E402
@@ -132,8 +132,10 @@ def _profile_path(path: str, base_dir: Path | None) -> Path | None:
 def _noise_params(provenance: Mapping[str, Any], dt: float, base_dir: Path | None = None):
     """実行時に EKF が使った雑音パラメータの出どころと、系列 (ID, 軸) → (q, r, gate) を返す関数。
 
-    プロファイルが見つからなければ関数の代わりに None を返す。プロファイル由来の q・r は、実行時と同じく
-    体格の比（サイドカーの ``ekf_scale_ratio``）の 2 乗を掛ける（``ekf_profile.SeriesEntry.scaled``）。
+    プロファイルが見つからなければ関数の代わりに None を返す。プロファイル由来の値は実行時と同じ解決で求める:
+    dt で選び（``ekf_profile.resolve_profile``）、q・r に体格の比（サイドカーの ``ekf_scale_ratio``）の 2 乗を掛け
+    （``SeriesEntry.scaled``）、プロファイルに無い系列は全体の中央値で埋める（``ProfileResolution.series_noise``）。
+    実行時が選べないプロファイル（dt が合わない・壊れている）なら ValueError。
     """
     noise = provenance.get("ekf_noise") or {}
     origin = noise.get("origin") or "env"
@@ -141,13 +143,17 @@ def _noise_params(provenance: Mapping[str, Any], dt: float, base_dir: Path | Non
         found = _profile_path(noise["path"], base_dir)
         if found is None:
             return origin, None
-        profile = read_profile(found)
-        series = profile["series"]
-        factor = float(provenance.get("ekf_scale_ratio") or 1.0) ** 2
+        try:
+            resolution = resolve_profile(found, dt=dt, scale_ratio=float(provenance.get("ekf_scale_ratio") or 1.0))
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"{found.name} を較正プロファイルとして読めない（{error!r}）") from error
+        if resolution.reason is not None:
+            raise ValueError(f"{found.name} は dt {dt:.5f} s の実行時に選ばれない（{resolution.reason}）")
 
         def lookup(lid, axis):
-            entry_ = series[str(lid)][axis]
-            return float(entry_["q_acc"]) * factor, float(entry_["r"]) * factor, float(entry_["gate_std"])
+            chosen = resolution.series_noise([int(lid)])
+            k = AXES.index(axis)
+            return float(chosen.q_acc[k]), float(chosen.r[k]), float(chosen.gate_std[k])
         return origin, lookup
     if origin == "builtin":
         builtin = builtin_entry(dt)
@@ -157,8 +163,12 @@ def _noise_params(provenance: Mapping[str, Any], dt: float, base_dir: Path | Non
 
 
 def _noise_lookup(provenance: Mapping[str, Any], dt: float, base_dir: Path | None) -> tuple[str, Any, str]:
-    """``_noise_params`` に、較正プロファイルが見つからないときの注記を添える。"""
-    origin, lookup = _noise_params(provenance, dt, base_dir)
+    """``_noise_params`` に、較正プロファイルが見つからない・使えないときの注記を添える。"""
+    try:
+        origin, lookup = _noise_params(provenance, dt, base_dir)
+    except ValueError as error:
+        origin = (provenance.get("ekf_noise") or {}).get("origin") or "env"
+        return origin, None, f"較正プロファイルを使えないので棄却率は出さない: {error}"
     note = ""
     if lookup is None:
         note = f"較正プロファイル {(provenance.get('ekf_noise') or {}).get('path')} が見つからないので棄却率は出さない"

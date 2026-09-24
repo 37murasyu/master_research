@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ import pytest
 
 from app.core.settings import OUTPUT_DIR_ENV, Settings
 from app.core.stop_request import STOP_FILE_ENV
+from app.tuning.ekf_profile import SeriesEntry, resolve_profile
 from app.tuning.raw_capture import RawCaptureWriter
 from tools import verify_run as vr
 
@@ -99,6 +101,16 @@ def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip
             "[STOP] 停止要求を受けました。ループを抜けて CSV を書き出します\n"
             "✅ aim_torque（ベクトル形式）を保存しました: x\n", encoding="utf-8")
     return out
+
+
+def _entry(q_acc: float, r: float, gate_std: float) -> dict:
+    """較正プロファイルの 1 系列（build_profile が書く形）。"""
+    return asdict(SeriesEntry(q_acc=q_acc, r=r, gate_std=gate_std, n_eff=500, rho1=0.0, source="fit"))
+
+
+def _write_profile(path: Path, series: dict, dt: float = DT) -> None:
+    path.write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m", "dt": dt, "series": series}),
+                    encoding="utf-8")
 
 
 def _check(report, name):
@@ -223,11 +235,9 @@ class TestEkf:
 
     def test_rejection_rate_uses_the_profile(self, tmp_path):
         profile = tmp_path / "ekf_profile.json"
-        entry = {"q_acc": 0.1, "r": 1e-4, "gate_std": 1e9}
-        series = {str(lid): {axis: dict(entry) for axis in "xyz"} for lid in IDS}
+        series = {str(lid): {axis: _entry(0.1, 1e-4, 1e9) for axis in "xyz"} for lid in IDS}
         series["13"]["y"]["gate_std"] = 1e-12
-        profile.write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m", "series": series}),
-                           encoding="utf-8")
+        _write_profile(profile, series)
         out = make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": str(profile)}})
         ekf = vr.check_run(out)["ekf"]
         assert ekf["noise_origin"] == "profile"
@@ -238,9 +248,7 @@ class TestEkf:
     def test_the_body_scale_ratio_is_applied_like_the_runtime(self, tmp_path):
         """実行時はプロファイルの q・r に体格比の 2 乗を掛ける（ekf_profile.SeriesEntry.scaled）。"""
         profile = tmp_path / "ekf_profile.json"
-        series = {str(lid): {axis: {"q_acc": 0.1, "r": 1e-4, "gate_std": 3.0} for axis in "xyz"} for lid in IDS}
-        profile.write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m", "series": series}),
-                           encoding="utf-8")
+        _write_profile(profile, {str(lid): {axis: _entry(0.1, 1e-4, 3.0) for axis in "xyz"} for lid in IDS})
         origin, lookup = vr._noise_params({"ekf_noise": {"origin": "profile", "path": str(profile)},
                                            "ekf_scale_ratio": 2.0}, DT)
         assert origin == "profile"
@@ -249,10 +257,33 @@ class TestEkf:
     def test_a_relative_profile_path_is_found_next_to_the_run(self, tmp_path):
         """サイドカーの path は本体の作業フォルダ（再生なら出力フォルダ）からの相対のことがある。"""
         out = make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": "ekf_profile.json"}})
-        series = {str(lid): {axis: {"q_acc": 0.1, "r": 1e-4, "gate_std": 1e9} for axis in "xyz"} for lid in IDS}
-        (out / "ekf_profile.json").write_text(json.dumps({"schema_version": 1, "frame": "runtime", "unit": "m",
-                                                          "series": series}), encoding="utf-8")
+        _write_profile(out / "ekf_profile.json",
+                       {str(lid): {axis: _entry(0.1, 1e-4, 1e9) for axis in "xyz"} for lid in IDS})
         assert vr.check_run(out)["ekf"]["noise_origin"] == "profile"
+
+    def test_a_series_missing_from_the_profile_is_filled_like_the_runtime(self, tmp_path):
+        """点を足す前のプロファイル（ここでは 16 が無い）でも実行時は動く（無い系列は全体の中央値で埋める、
+        ProfileResolution.series_noise）。check が KeyError で落ちてはいけない。棄却率も同じ埋め方の値で数える。"""
+        profile = tmp_path / "ekf_profile.json"
+        series = {str(lid): {axis: _entry(0.1 * (1 + i), 1e-4, 3.0) for axis in "xyz"} for i, lid in enumerate(IDS)
+                  if lid != 16}
+        _write_profile(profile, series)
+        provenance = {"ekf_noise": {"origin": "profile", "path": str(profile)}, "ekf_scale_ratio": 2.0}
+        _, lookup = vr._noise_params(provenance, DT)
+        runtime = resolve_profile(profile, dt=DT, scale_ratio=2.0).series_noise([16])
+        assert lookup(16, "y") == pytest.approx((runtime.q_acc[1], runtime.r[1], runtime.gate_std[1]))
+        assert lookup(16, "y")[0] == pytest.approx(0.3 * 4.0), "11〜15 の q の中央値 0.3 に体格比の 2 乗"
+        ekf = vr.check_run(make_run(tmp_path, provenance=provenance))["ekf"]
+        assert all(row["rejection_rate"] is not None for row in ekf["series"] if row["landmark"] == 16)
+
+    def test_a_profile_that_the_runtime_cannot_pick_is_named(self, tmp_path):
+        """dt の合わないプロファイルは実行時も選ばない。check は落ちずに、棄却率を出さない理由を書く。"""
+        profile = tmp_path / "ekf_profile.json"
+        _write_profile(profile, {str(lid): {axis: _entry(0.1, 1e-4, 3.0) for axis in "xyz"} for lid in IDS},
+                       dt=8 / 30)
+        ekf = vr.check_run(make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": str(profile)}}))["ekf"]
+        assert all(row["rejection_rate"] is None for row in ekf["series"])
+        assert "dt" in ekf["note"]
 
     def test_a_missing_profile_does_not_stop_the_check(self, tmp_path):
         out = make_run(tmp_path, provenance={"ekf_noise": {"origin": "profile", "path": "/nowhere/ekf_profile.json"}})
