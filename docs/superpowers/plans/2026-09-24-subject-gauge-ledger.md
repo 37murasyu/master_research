@@ -139,3 +139,7 @@ Minor（parked）を解消:
   - LineDemux: 行の途中の PREFIX が塊の境目で割れても、末尾の PREFIX の頭をためてフレームとして拾う
   - pictograms の <svg> の組み立てを _svg に 1 つにした
   - 緑の判定の彩度 0.25 の理由をコメントに書き、_to_rgb01 の ValueError の試験を追加
+書体（作業者の依頼）: app/gauge/fonts.py を追加。Mac にアクティベート済みのフォントワークスの書体を名前で探して使う（.app には同梱しない）
+- Ruling 19: 書体の組は設定 GAUGE_FONT_PRESET（rodin 既定・tsukushi・kaimin・system）。マティス EB は作業者の指示で使わない — 見出しのゴシック案（ロダン＋UD角ゴ_ラージ）を既定にした — 誤りなら code_default を変えるだけ
+- Ruling 20: 役は 3 つ（見出し＝header_title、数字＝value_text・header_rep・band_label、文字＝残り）。数字には tnum を指定（Qt 6.7 以上）
+- 見つからない書体はヒラギノ（見出しが明朝の組はヒラギノ明朝）→ IPAex。実機での見え方は Task 18 で `--role script --module app.gauge.fonts` と `app.gauge.demo --snapshot DIR --fonts all` で確かめる

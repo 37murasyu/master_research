@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.core.qt import QtCore, QtGui, QtSvg, QtWidgets
-from app.core.resources import japanese_font_path
+from app.gauge import fonts as gauge_fonts
 from app.gauge import model as gm
 from app.gauge import scene as sc
 from app.gauge.protocol import GaugeFrame
@@ -99,31 +99,16 @@ def _layout(w: float, h: float) -> tuple[float, float, float]:
 # 字体
 # ---------------------------------------------------------------------------
 
-# 候補の並び（Hiragino Sans → Hiragino Kaku Gothic ProN → 同梱 IPAex ゴシック）。
-# 初回だけ addApplicationFont を呼び、以後はキャッシュを返す
-# （呼ぶたびにフォントを登録し直すのは無駄なため）。
-_FONT_FAMILIES: tuple[str, ...] | None = None
+# 書体の選び方は ``app.gauge.fonts``（設定 GAUGE_FONT_PRESET の組。Mac に入っている
+# フォントワークスの書体を探し、無ければヒラギノ角ゴ → 同梱の IPAex ゴシック）。
 
 
-def _font_family_candidates() -> tuple[str, ...]:
-    global _FONT_FAMILIES  # pylint: disable=global-statement
-    if _FONT_FAMILIES is not None:
-        return _FONT_FAMILIES
-    families = ["Hiragino Sans", "Hiragino Kaku Gothic ProN"]
-    font_id = QtGui.QFontDatabase.addApplicationFont(str(japanese_font_path()))
-    if font_id != -1:
-        families.extend(QtGui.QFontDatabase.applicationFontFamilies(font_id))
-    _FONT_FAMILIES = tuple(families)
-    return _FONT_FAMILIES
+def _run_font(run: sc.Run, label_role: str = "") -> QtGui.QFont:
+    """``Run`` から ``QFont`` を作る。大きさは ``setPixelSize``（task-7-brief.md）。
 
-
-def _run_font(run: sc.Run) -> QtGui.QFont:
-    """``Run`` から ``QFont`` を作る。大きさは ``setPixelSize``（task-7-brief.md）。"""
-    font = QtGui.QFont()
-    font.setFamilies(list(_font_family_candidates()))
-    font.setPixelSize(max(1, round(run.size)))
-    font.setWeight(QtGui.QFont.Weight(run.weight))
-    return font
+    ``label_role`` で書体の役（見出し・数字・文字）が決まる。
+    """
+    return gauge_fonts.make_font(gauge_fonts.role_for_label(label_role), max(1, round(run.size)), run.weight)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +194,7 @@ def _draw_line(painter: QtGui.QPainter, line: sc.Line) -> None:
 
 def _draw_label(painter: QtGui.QPainter, label: sc.Label) -> None:
     """``Run`` を左から順に並べる。大きさ違いの幅は ``QFontMetricsF`` で測る。"""
-    fonts = [_run_font(run) for run in label.runs]
+    fonts = [_run_font(run, label.role) for run in label.runs]
     widths = [QtGui.QFontMetricsF(font).horizontalAdvance(run.text) for run, font in zip(label.runs, fonts)]
     total_width = sum(widths)
 
@@ -349,6 +334,7 @@ class _StaticKey:
     w: int
     h: int
     dpr: float
+    fonts: int  # 書体の組を変えたら作り直す（gauge_fonts.font_generation）
 
 
 class GaugeWidget(QtWidgets.QWidget):
@@ -436,7 +422,7 @@ class GaugeWidget(QtWidgets.QWidget):
     # -- 内部: 描画 ------------------------------------------------------------
 
     def _ensure_static_pixmap(self, w: int, h: int, dpr: float) -> None:
-        key = _StaticKey(w, h, dpr)
+        key = _StaticKey(w, h, dpr, gauge_fonts.font_generation())
         if self._static_pixmap is not None and self._static_key == key:
             return
         self._static_pixmap = self._build_static_pixmap(w, h, dpr)

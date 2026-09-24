@@ -66,6 +66,7 @@ IMPORT_SAFE_MODULES = [
     "app.gauge.protocol",
     "app.gauge.model",
     "app.gauge.scene",
+    "app.gauge.fonts",
 ]
 
 # Windows でしか存在しないモジュール。使うなら関数内 import か try で囲むこと。
