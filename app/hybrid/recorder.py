@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING
 from config import slot_of
 from app.gauge.protocol import PART_NAMES
 from app.hybrid.calibration_io import FILES, write_json
-from app.hybrid.ekf import GRID_NS as _GRID_NS   # 同期バッファの格子（30 Hz）[ns]。生 3D の frame は格子の番号
 from app.hybrid.paths import measurement_root
+from app.net.sync_buffer import DEFAULT_GRID
 from app.tuning.raw_capture import RawCaptureWriter
 
 if TYPE_CHECKING:
@@ -40,10 +40,14 @@ class Recorder:
         clock=time.monotonic,
         raw_provenance=None,
         offline_wrist=False,
+        grid=DEFAULT_GRID,
     ):
         self._owner = threading.get_ident()
         self.clock = clock
         self._flushed = clock()
+        # 同期バッファの格子（app.net.sync_buffer.GridSpec）。生 3D の frame は格子の番号で、抜けた格子の t は番号 × 間隔
+        self.grid = grid
+        # 時刻の原点。計測の結果が持つ原点（FrameResult.t0_ns）を使い、無ければ最初に書いた組の t_ns
         self._first_ns = None
         self.frames = 0
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -119,7 +123,7 @@ class Recorder:
         self.energy = writer("cycle_energy", ["frame", "t_ns", "part", "e_pos", "e_neg", "fc_current", "dt_sec", "n_u"])
         # OFFLINE_WRIST_CAPTURE: 前腕（肘→手首）(N,3) と手首の局所 τ_y (N,)。閉じるときに npy へ（USB と同じ名前）
         self._wrist = {"R": ([], []), "L": ([], [])} if offline_wrist else None
-        # EKF の手前の生 3D（EKF の較正 tune_ekf の入力）。1/30 s の格子で、抜けた格子は NaN の行で埋める
+        # EKF の手前の生 3D（EKF の較正 tune_ekf の入力）。同期バッファの格子（既定 1/30 s）で、抜けた格子は NaN の行で埋める
         # （行を詰めると dt 一定の前提が崩れる）。raw_provenance が無ければ書かない（EKF を通さない記録）
         self.raw3d = None
         self._raw_ids = sorted(pose_keypoints)
@@ -203,7 +207,7 @@ class Recorder:
         grid = int(result.grid_index)
         # flush は Recorder.flush（1 秒に 1 回）に任せる
         while self._raw_next < grid:
-            self.raw3d.append(self._raw_next, self._raw_next * _GRID_NS / 1e9, self._raw_blank, flush=False)
+            self.raw3d.append(self._raw_next, self._raw_next * self.grid.period_ns / 1e9, self._raw_blank, flush=False)
             self._raw_next += 1
         if grid < self._raw_next:
             return  # 格子が戻った（起こらないはず）。書かない
@@ -213,7 +217,7 @@ class Recorder:
     def record(self, result: "FrameResult"):
         self._check()
         if self._first_ns is None:
-            self._first_ns = result.t_ns
+            self._first_ns = result.t_ns if result.t0_ns is None else result.t0_ns
         self._append_raw(result)
         self.points.writerow([self.frames, *result.points_3d.ravel()])
         arm_ok = result.arm_ok
@@ -252,7 +256,7 @@ class Recorder:
                 [self.frames, *(value for part in self.TORQUE_VECTOR_PARTS
                                 for value in torques.get(part, (float("nan"),) * 3))])
         self.energy.writerows(
-            [self.frames, result.t_ns, part, e["e_pos"], e["e_neg"], e["fc"], 1.0 / 30.0, e["n_u"]]
+            [self.frames, result.t_ns, part, e["e_pos"], e["e_neg"], e["fc"], self.grid.period_s, e["n_u"]]
             for part, e in result.cycle_energy.items()
         )
         self.frames += 1

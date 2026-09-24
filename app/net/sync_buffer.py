@@ -11,6 +11,10 @@ grab 間の差はミリ秒で済むが、無線では受信バッファの状態
 
 さらに共通の等間隔グリッドへ**線形補間して再標本化**する。最近傍で組むより
 整合が良い。ランドマークは単なる点列なので補間は自明かつ安価。
+
+格子の周期と補間で埋める穴の上限は ``GridSpec`` が正本。下流（``app.runners.network_measure`` の格子の番号と
+dt、``app.hybrid.ekf`` の EKF の dt、``app.hybrid.rep_work`` の積む dt の上限、``app.hybrid.recorder`` の生 3D の
+格子とサイドカー）は同じ ``GridSpec`` を受け取って読む。値を別々に直書きすると、片方だけ変えたときに黙ってずれる。
 """
 
 from __future__ import annotations
@@ -21,9 +25,57 @@ from typing import Sequence
 
 from app.net.protocol import ROLES, LandmarkFrame, PixelCoordinates
 
-__all__ = ["InterpolatedFrame", "PairedSample", "SyncBuffer"]
+__all__ = ["DEFAULT_GRID", "GridSpec", "InterpolatedFrame", "PairedSample", "SyncBuffer"]
 
 Landmarks = Sequence[tuple[float, float, float, float]]
+
+
+@dataclass(frozen=True)
+class GridSpec:
+    """同期バッファの格子（再標本化の周波数と、補間で埋める穴の上限）。混成の計測の格子の値の正本。
+
+    ``period_s`` は ``1 / target_hz``（EKF・肘の濾波 E± の dt、サイドカーの dt）、``period_ns`` はそれを ns に
+    丸めたもの（格子の時刻の刻み）。30 Hz なら 1/30 s と 33,333,333 ns で、どちらも従来の直書きの値と同じ。
+    """
+
+    # 再標本化する格子の周波数 [Hz]。既存パイプラインは 30 fps 前提（``config.fps = 30``）
+    target_hz: float = 30.0
+    # 補間を許す最大の欠測幅 [ms]。これを超える穴は補間せず捨てる
+    max_gap_ms: float = 100.0
+
+    def __post_init__(self) -> None:
+        if not self.target_hz > 0:
+            raise ValueError("target_hz は正の値である必要があります")
+        if not self.max_gap_ms >= 0:
+            raise ValueError("max_gap_ms は 0 以上である必要があります")
+
+    @property
+    def period_ns(self) -> int:
+        """格子の間隔 [ns]。"""
+        return round(1_000_000_000 / self.target_hz)
+
+    @property
+    def period_s(self) -> float:
+        """格子の間隔 [s]（``1 / target_hz``）。"""
+        return 1.0 / self.target_hz
+
+    @property
+    def max_gap_ns(self) -> int:
+        """補間で埋める穴の上限 [ns]。"""
+        return round(self.max_gap_ms * 1_000_000)
+
+    @property
+    def max_gap_s(self) -> float:
+        """補間で埋める穴の上限 [s]。これより長い dt の組は、間で何が起きたか分からない。"""
+        return self.max_gap_ms / 1000.0
+
+    def index_of(self, t_ns: int, origin_ns: int) -> int:
+        """時刻 ``t_ns`` の格子の番号（``origin_ns`` を 0 とする）。組が番号を持たないときの割り戻し。"""
+        return round((t_ns - origin_ns) / self.period_ns)
+
+
+# 既定の格子（30 Hz、穴の上限 100 ms）
+DEFAULT_GRID = GridSpec()
 
 
 def _time_of(frame: LandmarkFrame) -> int:
@@ -52,6 +104,9 @@ class PairedSample:
 
     t_ns: int
     frames: dict[str, InterpolatedFrame]
+    # 同期バッファの格子の番号（バッファの格子の原点を 0 とし、抜けた格子の分だけ飛ぶ）。
+    # 格子の上にない組（``app.hybrid.retriangulate`` の実時刻の組など）は None
+    grid_index: int | None = None
 
 
 @dataclass
@@ -108,6 +163,9 @@ class SyncBuffer:
         補間を許す最大の欠測幅。これを超える穴は補間せず捨てる。
         長い穴を線形補間で埋めると、実際には動いていた手を
         「まっすぐ動いた」ことにしてしまうため。
+    grid:
+        格子（``GridSpec``）。渡したら ``target_hz``・``max_gap_ms`` より優先する。
+        下流（計測・EKF・記録）に同じものを渡すため、組み立てる側はこちらを使う。
     """
 
     def __init__(
@@ -116,14 +174,14 @@ class SyncBuffer:
         target_hz: float = 30.0,
         window_sec: float = 2.0,
         max_gap_ms: float = 100.0,
+        grid: GridSpec | None = None,
     ):
-        if target_hz <= 0:
-            raise ValueError("target_hz は正の値である必要があります")
+        self.grid = grid if grid is not None else GridSpec(target_hz=target_hz, max_gap_ms=max_gap_ms)
 
         self.roles = tuple(roles)
-        self.period_ns = round(1_000_000_000 / target_hz)
+        self.period_ns = self.grid.period_ns
         self.window_ns = round(window_sec * 1_000_000_000)
-        self.max_gap_ns = round(max_gap_ms * 1_000_000)
+        self.max_gap_ns = self.grid.max_gap_ns
 
         # ロールごとに時刻昇順で保持する。到着順は当てにしない。
         # 時刻はフレーム自身が持っているので別のリストにはしない
@@ -132,6 +190,8 @@ class SyncBuffer:
         self._frames: dict[str, list[LandmarkFrame]] = {r: [] for r in self.roles}
 
         self._next_grid_ns: int | None = None
+        # _next_grid_ns の格子の番号（原点を 0 とする）。組に載せて下流へ渡す
+        self._next_grid_index = 0
         self._stats = _Stats()
 
     # -- 入力 --------------------------------------------------------------
@@ -173,7 +233,7 @@ class SyncBuffer:
                 break  # まだデータが足りない。次の push を待つ
 
             if status == "ok":
-                sample = self._resolve(t)
+                sample = self._resolve(t, self._next_grid_index)
                 if sample is not None:
                     pairs.append(sample)
                     self._stats.emitted += 1
@@ -182,6 +242,7 @@ class SyncBuffer:
                 self._stats.dropped_gap += 1
 
             self._next_grid_ns = t + self.period_ns
+            self._next_grid_index += 1
 
         self._evict()
         return pairs
@@ -219,14 +280,14 @@ class SyncBuffer:
                 return "skip"  # 欠測が長すぎる。補間で埋めない
         return "ok"
 
-    def _resolve(self, t: int) -> PairedSample | None:
+    def _resolve(self, t: int, grid_index: int) -> PairedSample | None:
         frames: dict[str, InterpolatedFrame] = {}
         for role in self.roles:
             interpolated = self._interpolate(role, t)
             if interpolated is None:
                 return None
             frames[role] = interpolated
-        return PairedSample(t_ns=t, frames=frames)
+        return PairedSample(t_ns=t, frames=frames, grid_index=grid_index)
 
     def _interpolate(self, role: str, t: int) -> InterpolatedFrame | None:
         buffered = self._frames[role]

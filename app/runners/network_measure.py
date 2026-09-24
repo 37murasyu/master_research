@@ -82,12 +82,12 @@ from energy_pipeline import AdaptiveCutoff, EnergyFilterConfig, angle_between, c
 from app.gauge.protocol import PART_NAMES
 from app.gauge.thresholds import PartBand, part_bands
 from app.hybrid.demo_gauge import DemoConfig, DemoGauge
-from app.hybrid.ekf import GRID_NS, EkfSettings, GridEkf
+from app.hybrid.ekf import EkfSettings, GridEkf
 from app.hybrid.gravity import GravityChoice, choose_gravity
 from app.hybrid.rep_detector import RepConfig, RepDetector, RepEvent
 from app.tuning.ekf_profile import SCALE_REF_PAIR, body_scale_ratio
-from app.hybrid.rep_work import MAX_STEP_S, PartWork, RepAccumulator, WorkSample
-from app.net.sync_buffer import PairedSample
+from app.hybrid.rep_work import PartWork, RepAccumulator, WorkSample
+from app.net.sync_buffer import DEFAULT_GRID, GridSpec, PairedSample
 
 # 歪み補正で扱う画像の外側の余白（幅・高さに対する比）。NetworkMeasurement._undistort を参照。
 _UNDISTORT_MARGIN = 0.1
@@ -196,6 +196,10 @@ class MeasurementConfig:
     # EKF（app.hybrid.ekf）。既定は有効・同梱の既定値の雑音。計測の子は EkfSettings.from_env() を渡す
     ekf: EkfSettings = field(default_factory=EkfSettings)
 
+    # 同期バッファの格子（app.net.sync_buffer.GridSpec）。組み立てる側は SyncBuffer に同じものを渡す。
+    # 格子の番号・EKF の dt・積む dt の上限・肘の濾波 E± の dt・記録の生 3D の格子はすべてこれを読む
+    grid: GridSpec = DEFAULT_GRID
+
     # 保持するフレーム数の上限。長時間の計測でメモリを食い潰さないため。
     # 物理計算が実際に見るのは直近 2 フレームだけ（LinkVectorCalculator は
     # i と i-1、calculate_M_and_F は [-1] しか使わない）。
@@ -214,13 +218,17 @@ class FrameResult:
     # サイクルごとの仕事 [J]。詳細はモジュール docstring の「揃っていない点」を参照。
     cycle_work_j: dict[str, float] = field(default_factory=dict)
     # 前の組からの実時間差 [s]。仕事はこの dt で積む（app.hybrid.rep_work）
-    dt_s: float = 1.0 / 30.0
+    dt_s: float = DEFAULT_GRID.period_s
     # 関節ごとの仕事率 P = τ_y × ω_rel·y [W]（キーは local_torques と同じ）
     powers: dict[str, float] = field(default_factory=dict)
     # EKF の手前の 3D 点（三角測量の直後）。None なら points_3d と同じ（EKF を通していない記録）
     points_raw: np.ndarray | None = None
-    # 同期バッファの格子の番号 round((t_ns − 最初の組の t_ns) / 33.3 ms)。抜けた組の分だけ飛ぶ
+    # 同期バッファの格子の番号（最初の組を 0 とする）。組が持つ番号（PairedSample.grid_index）から引き、
+    # 番号が無い組は round((t_ns − 最初の組の t_ns) / 格子の間隔)。抜けた組の分だけ飛ぶ
     grid_index: int = 0
+    # 時刻の原点（grid_index が 0 の組の t_ns）。記録（app.hybrid.recorder）の t_s・生 3D の t もこれから測る。
+    # None なら記録側が最初に書いた組の t_ns を使う（計測を通さずに作った結果）
+    t0_ns: int | None = None
     # EKF の速度 [m/s]（点 × 3）。EKF が無効なら None
     velocity: np.ndarray | None = None
     # このフレームで先頭の窓が閉じた（体格・重力・帯が決まった）
@@ -282,7 +290,10 @@ class NetworkMeasurement:
         self._restart_dynamics()
         self.frame_index = 0
         self._prev_t_ns: int | None = None
+        self.grid = self.config.grid
+        # 時刻の原点（最初の組の t_ns）と、その組が持っていた格子の番号（番号が無い組なら None）
         self._t0_ns: int | None = None
+        self._grid0: int | None = None
         self._prev_grid: int | None = None
         # 100 ms を超える抜けで速度の計算をやり直した回数
         self.dynamics_restarts = 0
@@ -294,10 +305,11 @@ class NetworkMeasurement:
 
         self._demo = None if self.config.demo is None else DemoGauge(self.config.demo)
         # 肘の濾波 E± の適応カットオフ（E_FC_ADAPTIVE_ON=1 のときだけ動く）。毎フレーム左右の肘角の平均を渡す
-        self._cutoff = AdaptiveCutoff(self.config.energy_filter, fps=30.0)
+        self._cutoff = AdaptiveCutoff(self.config.energy_filter, fps=self.grid.target_hz)
 
-        # EKF（app.hybrid.ekf）。無効なら None
-        self.ekf = GridEkf(self.config.ekf, self.pose_keypoints) if self.config.ekf.enabled else None
+        # EKF（app.hybrid.ekf）。格子の間隔で回す。無効なら None
+        self.ekf = (GridEkf(self.config.ekf, self.pose_keypoints, dt=self.grid.period_s)
+                    if self.config.ekf.enabled else None)
 
         self._inertia: dict[str, np.ndarray] = {}
         self.gravity: np.ndarray | None = None
@@ -332,7 +344,8 @@ class NetworkMeasurement:
         self.discarded_reps = 0
         # 今の回の仕事。フレームごとの dt で積む（かつては確定したフレームの dt を全体に掛けていた）。
         # 関所が開く前の輪の長さは回の区切りの設定（RepConfig.lookback_frames）に従う
-        self.rep_work = RepAccumulator(PART_KEYS, lookahead=self.config.rep.lookback_frames)
+        self.rep_work = RepAccumulator(PART_KEYS, max_step_s=self.grid.max_gap_s,
+                                       lookahead=self.config.rep.lookback_frames)
 
         self.results: list[FrameResult] = []
 
@@ -375,12 +388,12 @@ class NetworkMeasurement:
         raw = self.points_3d(pair)
         if raw is None:
             return None
-        grid = self._grid_index(pair.t_ns)
+        grid = self._grid_index(pair)
         missing = 0 if self._prev_grid is None else max(0, grid - self._prev_grid - 1)
         self._prev_grid = grid
 
         dt = self._timestep(pair.t_ns)
-        if self.frame_index > 0 and dt > MAX_STEP_S:
+        if self.frame_index > 0 and dt > self.grid.max_gap_s:
             # 長い抜けの後は、抜ける前のフレームとの差で速度・加速度を作らない（トルクが跳ねる）
             self._restart_dynamics()
             self.dynamics_restarts += 1
@@ -396,7 +409,7 @@ class NetworkMeasurement:
         self._update_links(dt)
 
         result = FrameResult(t_ns=pair.t_ns, points_3d=points, dt_s=dt, points_raw=raw,
-                             grid_index=grid, velocity=velocity)
+                             grid_index=grid, t0_ns=self._t0_ns, velocity=velocity)
 
         if not self.window_closed:
             self._collect_window(raw, points, result)
@@ -484,11 +497,18 @@ class NetworkMeasurement:
         # 直近 2 フレームだけ持つ。物理計算はそれ以上遡らない。
         self._recent_points: list[np.ndarray] = []
 
-    def _grid_index(self, t_ns: int) -> int:
-        """同期バッファの格子の番号（最初の組を 0 とする）。"""
+    def _grid_index(self, pair: PairedSample) -> int:
+        """同期バッファの格子の番号（最初の組を 0 とする）。
+
+        組が番号を持っていればそれを使う（時刻から割り戻さない）。持っていない組（試験で直に作った組など）は
+        最初の組からの時刻を格子の間隔で丸める。同期バッファの組の時刻は格子の上にあるので、どちらも同じ値になる。
+        """
         if self._t0_ns is None:
-            self._t0_ns = t_ns
-        return round((t_ns - self._t0_ns) / GRID_NS)
+            self._t0_ns = pair.t_ns
+            self._grid0 = pair.grid_index
+        if pair.grid_index is not None and self._grid0 is not None:
+            return pair.grid_index - self._grid0
+        return self.grid.index_of(pair.t_ns, self._t0_ns)
 
     def summary(self) -> dict:
         """計測を閉じるときに meta.json へ残す値（被験者の帯・重力・EKF・関所・腕の長さの安全策）。"""
@@ -533,10 +553,10 @@ class NetworkMeasurement:
         """
         if self._prev_t_ns is None:
             self._prev_t_ns = t_ns
-            return 1.0 / 30.0
+            return self.grid.period_s
         dt = (t_ns - self._prev_t_ns) / 1e9
         self._prev_t_ns = t_ns
-        return dt if dt > 0 else 1.0 / 30.0
+        return dt if dt > 0 else self.grid.period_s
 
     def _update_links(self, dt: float) -> None:
         index = len(self._recent_points) - 1
@@ -785,13 +805,14 @@ class NetworkMeasurement:
                 self.tracker.discard_rep()
 
     def _elbow_energy(self) -> dict[str, dict]:
-        """今の回の肘の濾波 E±（USB 経路と同じ ``compute_cycle_energy_filtered``、dt は格子の 1/30 s）。"""
+        """今の回の肘の濾波 E±（USB 経路と同じ ``compute_cycle_energy_filtered``、dt は格子の間隔（既定 1/30 s））。"""
         config = self.config.energy_filter
         fc = self._cutoff.fc if config.fc_adaptive_on else None
         energy = {}
         for side in ("L", "R"):
             theta, tau = self.rep_work.series(f"elbow_{side}")
-            e_pos, e_neg, info = compute_cycle_energy_filtered(theta, tau, 1.0 / 30.0, fc_override=fc, config=config)
+            e_pos, e_neg, info = compute_cycle_energy_filtered(theta, tau, self.grid.period_s, fc_override=fc,
+                                                          config=config)
             energy[f"elbow_{side}"] = {"e_pos": e_pos, "e_neg": e_neg, "fc": info.get("fc"),
                                        "n_u": int(info.get("n_u", 0))}
         return energy

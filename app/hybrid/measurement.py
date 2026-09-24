@@ -49,13 +49,14 @@ class MeasurementSession:
     def _raw_provenance(self, measurement):
         """生 3D（kpts3d_raw）のサイドカー。USB の kpts3d_raw と同じ鍵に、混成の出どころを足す。"""
         ekf = self.config.ekf
+        grid = self.config.grid
         noise = None if measurement.ekf is None else measurement.ekf.noise
         return {
             "unit": "m",
             "frame": "runtime",
-            "dt": 1.0 / 30.0,
-            "dt_source": "混成ステレオの同期バッファの 30 Hz の格子（抜けた格子は NaN の行）",
-            "src_fps": 30.0,
+            "dt": grid.period_s,
+            "dt_source": f"混成ステレオの同期バッファの {grid.target_hz:g} Hz の格子（抜けた格子は NaN の行）",
+            "src_fps": float(grid.target_hz),
             "source": "hybrid",
             "times": "grid",
             "file_mode": False,
@@ -90,6 +91,7 @@ class MeasurementSession:
                 ),
                 raw_provenance=self._raw_provenance(self.measurement),
                 offline_wrist=self.config.offline_wrist_capture,
+                grid=self.config.grid,
             )
             self.recorder.meta["ekf"] = self.measurement.ekf_provenance()
             if self.tracker is not None:

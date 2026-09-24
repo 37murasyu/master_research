@@ -148,6 +148,8 @@ def main(argv=None):
                 port=args.port,
                 advertise_host=args.advertise_host,
             session=stable_session(renew=args.new_session),
+                # 同期バッファの格子を計測（NetworkMeasurement・EKF・記録）と同じものにする
+                grid=measure_config.grid,
                 capture_mode=CaptureMode(args.preview_hz, 640, 70),
                 on_pairs=measurement.on_pairs,
                 on_landmarks=measurement.on_landmarks,

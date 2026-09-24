@@ -1,12 +1,14 @@
-"""混成の計測（Mac＋Pixel）の EKF。USB 経路（``master_research_code.py``）と同じ ``LandmarkEKF`` を 30 Hz の格子で回す。
+"""混成の計測（Mac＋Pixel）の EKF。USB 経路（``master_research_code.py``）と同じ ``LandmarkEKF`` を同期バッファの格子
+（既定 30 Hz、``app.net.sync_buffer.GridSpec``）で回す。
 
 - 雑音は ``HYBRID_EKF_PROFILE`` の較正プロファイル。**空なら同梱の既定値**（``app.tuning.ekf_profile`` の builtin）。
   USB 経路は空なら環境変数のスカラー（``EKF_Q_ACC``・``EKF_R``）を使うが、GUI は USB 向けの 1e-3 を必ず子へ渡し、
   それを混成に使うと合成の押し上げで肘の W_pos が +52% になる（同梱値なら +10%）。混成は ``EKF_Q_ACC``・``EKF_R``・
   ``EKF_PROFILE`` を読まない
 - ``EKF_ENABLE``・``EKF_GATE_STD``・``EKF_ROBUST_GATE``・``EKF_MAX_GAP_S``・``EKF_BPF_*`` は USB と共用
-- 同期バッファ（``app.net.sync_buffer``）は 100 ms を超える穴で組を作らないので、次の組の時刻は格子（1/30 s）の
-  n 倍跳ぶ。抜けた格子の数だけ NaN の観測と dt=1/30 で予測してから観測で更新する（``GridEkf.step``）。
+- 同期バッファ（``app.net.sync_buffer``）は 100 ms を超える穴で組を作らないので、次の組の時刻は格子（既定 1/30 s）の
+  n 倍跳ぶ。抜けた格子の数だけ NaN の観測と dt=格子の間隔で予測してから観測で更新する（``GridEkf.step``）。
+  dt は組み立てる側（``NetworkMeasurement``）が同期バッファと同じ ``GridSpec`` の ``period_s`` を渡す
   ``REBUILD_GAP_S`` を超える抜けは外挿が当てにならないので作り直す
 - **発散の見張り**: 同梱の既定値（q=0.122、r=2.59e-5）で追える帯域は約 0.65 Hz で、頑健な門は予測から外れるほど
   更新を弱める（外れ幅 y に対して修正量が P·c²/y）。1 Hz・振幅 10 cm（最大 0.63 m/s）の動きで追従を失い、
@@ -23,15 +25,13 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from app.net.sync_buffer import DEFAULT_GRID
 from app.tuning.ekf_profile import AXES, RuntimeNoise, resolve_profile, runtime_noise
 from config import env_flag, env_float
 from extended_kalman_filter import EKFConfig, LandmarkEKF, SeriesNoise
 
-__all__ = ["DT", "GRID_NS", "REBUILD_GAP_S", "DIVERGE_M", "DIVERGE_FRAMES", "EkfSettings", "GridEkf", "hybrid_noise"]
+__all__ = ["REBUILD_GAP_S", "DIVERGE_M", "DIVERGE_FRAMES", "EkfSettings", "GridEkf", "hybrid_noise"]
 
-# 同期バッファの格子（30 Hz）
-DT = 1.0 / 30.0
-GRID_NS = 33_333_333
 # これより長い抜けは EKF を作り直す [s]
 REBUILD_GAP_S = 0.5
 # 発散の見張り: 観測からのずれ [m] と、それが続くフレーム数
@@ -71,7 +71,7 @@ class EkfSettings:
         return asdict(self)
 
 
-def hybrid_noise(settings: EkfSettings, landmark_ids: Sequence[int], *, dt: float = DT,
+def hybrid_noise(settings: EkfSettings, landmark_ids: Sequence[int], *, dt: float = DEFAULT_GRID.period_s,
                  bpf_enabled: bool = False) -> RuntimeNoise:
     """混成の EKF の雑音と出どころ。プロファイルが無ければ同梱の既定値（``resolve_profile(None, dt=)`` 相当）。
 
@@ -96,9 +96,9 @@ def _with_gate(noise: SeriesNoise, gate_std: float) -> SeriesNoise:
 
 
 class GridEkf:
-    """30 Hz の格子の上で ``LandmarkEKF`` を回す。受信スレッドだけから呼ぶ。"""
+    """同期バッファの格子（``dt`` は格子の間隔、既定 1/30 s）の上で ``LandmarkEKF`` を回す。受信スレッドだけから呼ぶ。"""
 
-    def __init__(self, settings: EkfSettings, landmark_ids: Sequence[int], *, dt: float = DT,
+    def __init__(self, settings: EkfSettings, landmark_ids: Sequence[int], *, dt: float = DEFAULT_GRID.period_s,
                  rebuild_gap_s: float = REBUILD_GAP_S):
         self.settings = settings
         self.landmark_ids = tuple(sorted(int(lid) for lid in landmark_ids))

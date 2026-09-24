@@ -384,10 +384,12 @@ def _quality_checks(quality: Mapping[str, Any], add) -> None:
 
 
 def _hybrid_ekf_stats(capture, kpts_path: Path, frames: pd.DataFrame, base_dir: Path | None = None) -> dict[str, Any]:
-    """混成の EKF の前後の差と棄却率。行の番号ではなく、時刻を格子に丸めて（round(t/dt)）合わせる。
+    """混成の EKF の前後の差と棄却率。行の番号ではなく、同じ格子どうしで合わせる。
 
-    生 3D は 1/30 s の格子で抜けた格子は NaN の行、EKF の後の kpts3d は届いた組だけの行なので、行で合わせると
-    抜けの後ろがすべてずれる。時刻はどちらも最初の組からの秒（生 CSV の ``t``、frames の ``t_s``）。
+    生 3D は同期バッファの格子（既定 1/30 s）で抜けた格子は NaN の行、EKF の後の kpts3d は届いた組だけの行なので、
+    行で合わせると抜けの後ろがすべてずれる。生 CSV の ``frame`` は格子の番号で、frames の ``grid_index`` と同じ
+    番号（どちらも最初の組を 0 とする）なので、それで直接つなぐ。``grid_index`` の無い古い記録は、時刻を格子に
+    丸めて（round(t/dt)）合わせる。時刻はどちらも最初の組からの秒（生 CSV の ``t``、frames の ``t_s``）。
     """
     provenance = capture.provenance
     dt = float(provenance["dt"])
@@ -395,11 +397,19 @@ def _hybrid_ekf_stats(capture, kpts_path: Path, frames: pd.DataFrame, base_dir: 
     kpts = pd.read_csv(kpts_path)
     n = min(len(kpts), len(frames))
     usable = np.isfinite(capture.points).any(axis=(1, 2))
+    grid = pd.to_numeric(frames["grid_index"], errors="coerce").to_numpy(float)[:n] if "grid_index" in frames else None
+    if grid is not None and len(grid) and np.isfinite(grid).all():
+        alignment = "grid_index"
+        raw_keys = np.asarray(capture.frame, dtype=float)
+        keys = grid
+    else:
+        alignment = "round(t/dt)"
+        raw_keys = np.rint(np.asarray(capture.t, dtype=float) / dt)
+        keys = np.rint(frames["t_s"].to_numpy(float)[:n] / dt)
     index: dict[int, int] = {}
-    for row, key in enumerate(np.rint(np.asarray(capture.t, dtype=float) / dt)):
+    for row, key in enumerate(raw_keys):
         if usable[row] and np.isfinite(key):
             index.setdefault(int(key), row)
-    keys = np.rint(frames["t_s"].to_numpy(float)[:n] / dt)
     pairs = [(index[int(k)], j) for j, k in enumerate(keys) if np.isfinite(k) and int(k) in index]
     try:
         origin, lookup, note = _noise_lookup(provenance, dt, base_dir)
@@ -411,7 +421,7 @@ def _hybrid_ekf_stats(capture, kpts_path: Path, frames: pd.DataFrame, base_dir: 
     raw_rows = capture.points[[raw for raw, _ in pairs]] if pairs else np.empty((0, *capture.points.shape[1:]))
     kpts_rows = kpts.iloc[[row for _, row in pairs]].reset_index(drop=True)
     result = _ekf_series(capture, raw_rows, kpts_rows, origin, lookup, note)
-    result.update(ekf_enabled=enabled, matched_rows=len(pairs), kpts_rows=int(n), alignment="round(t/dt)",
+    result.update(ekf_enabled=enabled, matched_rows=len(pairs), kpts_rows=int(n), alignment=alignment,
                   scale_ratio=provenance.get("ekf_scale_ratio"))
     return result
 
@@ -746,7 +756,8 @@ def _ekf_lines(e: Mapping[str, Any]) -> list[str]:
     if e.get("note"):
         lines.append(f"  {e['note']}")
     if "matched_rows" in e:
-        lines.append(f"  生 CSV と kpts3d を時刻の格子（round(t/dt)）で合わせた行 {e['matched_rows']} / {e['kpts_rows']}、"
+        how = "格子の番号（grid_index）" if e.get("alignment") == "grid_index" else "時刻の格子（round(t/dt)）"
+        lines.append(f"  生 CSV と kpts3d を{how}で合わせた行 {e['matched_rows']} / {e['kpts_rows']}、"
                      f"体格の比 {_fmt(e.get('scale_ratio'), '.3f')}")
     if rms:
         lines.append(f"  RMS（前後の差）[mm]: 中央値 {np.median(rms):.2f} / 最大 {max(rms):.2f}")

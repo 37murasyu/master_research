@@ -91,7 +91,8 @@ def replay(session_dir: str | Path, *, root: str | Path, start_s: float = 0.0, e
     if on_session is not None:
         on_session(measurement)
     frames = merged_frames(read_landmarks(session_dir), start_s=start_s, end_s=end_s)
-    buffer = SyncBuffer()
+    # 計測と同じ格子（MeasurementConfig.grid）で組を作る。格子の番号・EKF の dt・記録の格子がこれに揃う
+    buffer = SyncBuffer(grid=config.grid)
     stop = should_stop or (lambda: False)
     samples_ms: list[float] = []
     pair_count = [0]
