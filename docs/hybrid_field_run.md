@@ -71,8 +71,9 @@
 カメラと Pixel を使わずに記録を実時間で流し、ゲージが「▶ 再生」の印つきで動く。フォルダを選ぶまで主ボタンは押せない。
 流す範囲と速さは入れ子の「開発・診断用」の `HYBRID_REPLAY_FROM`・`HYBRID_REPLAY_TO`（空なら終わりまで）・`HYBRID_REPLAY_SPEED`
 （1 で実時間、0 で待たない）。記録は `~/Documents/WheelchairTorque/hybrid/replay` に書き、終わった後の「出力フォルダ」でそこが開く。
-再生は実機の計測とは別の役割なので、シェルに `HYBRID_REPLAY` を export しても「Mac＋Pixel」の計測は再生にならない（環境変数は
-再生の子にも渡らず、画面で選んだ値だけが渡る）。端末からは `.venv/bin/python -m app.runners.hybrid_replay <計測フォルダ> --from 20` でも流せる。
+再生は実機の計測とは別の役割で、画面で選んだフォルダと範囲・速さは再生の子へ引数で渡す（子は環境変数を見ない）。シェルに
+`HYBRID_REPLAY` を export しても、「Mac＋Pixel」の計測も再生も変わらない。端末からは同じ引数で
+`.venv/bin/python -m app.runners.hybrid_replay <計測フォルダ> --from 20` のように流せる（`--to`・`--speed` も同じ）。
 合成の押し上げは `.venv/bin/python -m tools.synth_session --out ~/Documents/WheelchairTorque/hybrid/synth --reps 10` で作れる。
 2026-09-23 の実機の記録は先頭が壊れているので `HYBRID_REPLAY_FROM` を 20 にして流す。ただしこの記録は置き方の失敗で両腕とも骨の長さが大きく
 揺れ、骨の長さの見張り（先頭の窓の中央値から ±25%）が 20〜90 s の左腕 74%・右腕 79% のフレームをゲージに積まないので、ゲージはほとんど

@@ -194,4 +194,4 @@ def test_hybrid_measure_ignores_hybrid_replay(monkeypatch):
     monkeypatch.setattr(hybrid_measure, "load_calibration", load_calibration)
     assert hybrid_measure.main([]) == 2
     source = Path(hybrid_measure.__file__).read_text(encoding="utf-8")
-    assert "REPLAY_ENV" not in source and "hybrid_replay" not in source
+    assert "HYBRID_REPLAY" not in source and "hybrid_replay" not in source

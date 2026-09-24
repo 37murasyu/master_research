@@ -43,23 +43,35 @@ def test_missing_session_is_reported(tmp_path, capsys):
     assert "計測フォルダではありません" in capsys.readouterr().err
 
 
-def test_gui_launch_reads_the_folder_from_settings_and_stops_on_the_stop_file(pushups, tmp_path, monkeypatch, capsys):
-    """GUI は ``--role hybrid_replay`` で引数なしに起動し、フォルダは設定 ``HYBRID_REPLAY`` で渡す。停止ボタンは停止ファイル。"""
+def test_what_to_replay_comes_only_from_the_arguments(tmp_path, monkeypatch):
+    """何を流すかは引数だけで決まる。親のシェルに残った ``HYBRID_REPLAY*`` は効かない（GUI は引数で渡す）。"""
+    monkeypatch.setenv("HYBRID_REPLAY", str(tmp_path))
+    monkeypatch.setenv("HYBRID_REPLAY_FROM", "20")
+    monkeypatch.setenv("HYBRID_REPLAY_TO", "90")
+    monkeypatch.setenv("HYBRID_REPLAY_SPEED", "0")
+    with pytest.raises(SystemExit) as raised:
+        runner.main([])
+    assert raised.value.code == 2, "計測フォルダを環境変数から読んだ"
+    args = runner._parser().parse_args([str(tmp_path)])
+    assert (args.start_s, args.end_s, args.speed) == (0.0, None, 1.0)
+
+
+def test_gui_launch_takes_the_arguments_and_stops_on_the_stop_file(pushups, tmp_path, monkeypatch, capsys):
+    """GUI は ``--role hybrid_replay`` に、設定から組み立てた引数（``page_measure.replay_arguments``）を付けて起動する。
+    ``--to`` は設定が空なら付かない（終わりまで）。停止ボタンは停止ファイル。"""
     import json
     import threading
     import time
 
     monkeypatch.setattr(runner, "replay_root", lambda: tmp_path / "replay")
-    monkeypatch.setenv("HYBRID_REPLAY", str(pushups))
-    monkeypatch.setenv("HYBRID_REPLAY_SPEED", "1")  # 実時間。3 回の押し上げは 10 秒を超える
-    monkeypatch.setenv("HYBRID_REPLAY_TO", "")  # 空は終わりまで（設定の既定）
     stop_file = tmp_path / "stop"
     monkeypatch.setenv("APP_STOP_FILE", str(stop_file))
     timer = threading.Timer(1.0, stop_file.touch)
     timer.start()
     started = time.monotonic()
     try:
-        assert runner.main([]) == 0
+        # 速さ 1 は実時間。3 回の押し上げは 10 秒を超える
+        assert runner.main([str(pushups), "--from", "0.0", "--speed", "1.0"]) == 0
     finally:
         timer.cancel()
     assert time.monotonic() - started < 6.0, "停止ファイルで止まっていない"

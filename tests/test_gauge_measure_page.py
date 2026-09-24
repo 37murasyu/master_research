@@ -56,9 +56,16 @@ def page(qt_app, settings):
     page.shutdown()
 
 
+def _radio(page, role: str):
+    """role の入力のラジオ（並びは MEASURE_INPUTS）。"""
+    from app.shell.page_measure import MEASURE_INPUTS, measure_input
+
+    return page._input_radios[MEASURE_INPUTS.index(measure_input(role))]
+
+
 def _choose_input(page, role: str) -> None:
     """入力（USB カメラ 2 台／Mac＋Pixel／記録の再生）のラジオを押す。"""
-    {USB: page._input_usb, HYBRID: page._input_hybrid, REPLAY: page._input_replay}[role].click()
+    _radio(page, role).click()
     assert page._runner.role == role
 
 
@@ -377,7 +384,7 @@ class TestAdvancedSettings:
         assert [r.text() for r in radios] == ["USB カメラ 2 台", "Mac＋Pixel", "記録の再生"]
         group = radios[0].group()
         assert group is not None and all(r.group() is group for r in radios) and group.exclusive()
-        assert page._input_usb.isChecked() and page._runner.role == USB
+        assert _radio(page, USB).isChecked() and page._runner.role == USB
         assert not page.findChildren(QtWidgets.QComboBox), "入力のコンボボックスが残っている（少数は R2-03）"
 
     def test_inputs_come_from_one_table(self, page):
@@ -399,16 +406,15 @@ class TestAdvancedSettings:
         source = Path(module.__file__).read_text(encoding="utf-8")
         assert '"hybrid_measure"' in source and source.count('"hybrid_measure"') == 1, "role の文字列が表の外にもある"
         assert "_HYBRID_ROLE" not in source
+        assert '"hybrid_replay"' not in source, "再生の role は app.entry.REPLAY_ROLE を引く"
 
     def test_radio_switches_role(self, page):
-        page._input_hybrid.click()
-        assert page._runner.role == HYBRID
+        _choose_input(page, HYBRID)
         assert not page._joules_switch.isHidden()
-        page._input_replay.click()
+        _radio(page, REPLAY).click()
         assert page._runner.role == REPLAY, "再生は実機の計測（hybrid_measure）とは別の role"
         assert not page._joules_switch.isHidden(), "再生もゲージ窓に J を出す"
-        page._input_usb.click()
-        assert page._runner.role == USB
+        _choose_input(page, USB)
         assert page._joules_switch.isHidden()
 
     def test_advanced_settings_are_in_a_closed_disclosure(self, page):
@@ -418,7 +424,7 @@ class TestAdvancedSettings:
         assert isinstance(advanced, Disclosure)
         assert advanced._button.text() == "実験者用の詳細設定"
         assert not advanced.is_open(), "既定で閉じていない"
-        for widget in (page._input_usb, page._input_hybrid, page._subject_edit, page._body_mass):
+        for widget in (*page._input_radios, page._subject_edit, page._body_mass):
             assert advanced.isAncestorOf(widget)
 
         dev = page._dev
@@ -468,7 +474,7 @@ class TestAdvancedSettings:
         assert _row_names(form) & visible == visible - {"SUBJECT_ID"}
 
     def test_settings_disabled_while_running_with_reason(self, page):
-        editors = (page._input_usb, page._input_hybrid, page._input_replay, page._subject_edit, page._body_mass,
+        editors = (*page._input_radios, page._subject_edit, page._body_mass,
                    page._replay_edit, page._replay_choose, page._form)
         assert page._locked_reason.isHidden()
 
@@ -730,8 +736,8 @@ class TestReplayInput:
         page = MeasurePage(settings)
         try:
             assert page._replay_edit.text() == str(tmp_path)
-            page._replay_edit.setText("/elsewhere")
-            assert settings.get("HYBRID_REPLAY") == "/elsewhere"
+            page._replay_edit.setText("  /elsewhere  ")
+            assert settings.get("HYBRID_REPLAY") == "/elsewhere", "前後の空白は欄の編集で落とす"
         finally:
             page.shutdown()
 
@@ -781,6 +787,45 @@ class TestReplayInput:
         _choose_input(page, USB)
         assert page._main_button.isEnabled(), "USB の計測は再生のフォルダによらない"
         assert page._start_blocked.isHidden()
+
+    def test_replay_child_takes_the_settings_as_arguments(self, page, settings, monkeypatch, tmp_path):
+        """何を流すか（計測フォルダ・範囲・速さ）は、設定から組み立てた引数で子へ渡す。
+
+        アプリの入口（``app.entry.parse_args``）を通したうえで、子（``app.runners.hybrid_replay``）の引数の解釈が
+        設定の値を受け取れることを確かめる。子は環境変数から読まないので、ここで渡らなければ効かない。
+        """
+        from pathlib import Path
+
+        from app import entry
+        import app.runners.hybrid_replay as child
+
+        passed = []
+        monkeypatch.setattr(page._runner, "start",
+                            lambda settings, passthrough=None, module=None: passed.append(passthrough) or False)
+
+        def child_args():
+            page._main_button.click()
+            command = entry.worker_command(page._runner.role, passed[-1])
+            parsed = entry.parse_args(command[command.index("--role"):])
+            assert parsed.role == REPLAY
+            return child._parser().parse_args(parsed.passthrough)
+
+        folder = _session_folder(tmp_path)
+        _choose_input(page, REPLAY)
+        page._replay_edit.setText(str(folder))
+        settings.set("HYBRID_REPLAY_FROM", 20.0)
+        settings.set("HYBRID_REPLAY_TO", " 90 ")
+        settings.set("HYBRID_REPLAY_SPEED", 0.0)
+        args = child_args()
+        assert (Path(args.session), args.start_s, args.end_s, args.speed) == (folder, 20.0, 90.0, 0.0)
+
+        settings.set("HYBRID_REPLAY_TO", "")  # 空は終わりまで
+        assert child_args().end_s is None
+
+        for role in (USB, HYBRID):
+            _choose_input(page, role)
+            page._main_button.click()
+            assert passed[-1] is None, f"{role} に再生の引数を渡した"
 
     def test_replay_start_launches_the_replay_role_and_opens_the_gauge_window(self, page, monkeypatch, tmp_path):
         calls = _start_replay(monkeypatch, page, tmp_path)
