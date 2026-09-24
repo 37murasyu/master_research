@@ -15,6 +15,10 @@
 （間引きなしでは過程の寄与が約 20 万分の 1）ので、過程の寄与が観測誤差を十分上回るまで
 m を倍々に広げてから見積もる。
 
+どちらも行が dt ごとに並ぶ前提なので、生 CSV は frame 番号の抜け（処理が間に合わず取りこぼした行）を NaN の行に
+戻してから使う（``capture_on_grid``）。詰めたままだと抜けの前後が 1 dt に縮み、q_acc が狂う（正弦の動きで 1 割の
+取りこぼしなら約 2 倍）。
+
 CLI（S6 の実測で使う）::
 
     python -m app.tuning.ekf_estimate output_data/kpts3d_raw_0913_120000.csv
@@ -45,6 +49,8 @@ UNIT_JERK_VAR = 11.0 / 20.0
 PROCESS_DOMINANCE = 100.0
 # 初期値を取るのに要る 3 階差分の最少個数
 MIN_DIFFS = 30
+# frame 番号の抜けに挟む NaN の行の上限（30 Hz で 10 秒。これより長い抜けは状態の不確かさが事実上作り直しと同じ）
+MAX_FILL_ROWS = 300
 
 
 @dataclass(frozen=True)
@@ -133,14 +139,54 @@ def fit_series(
     )
 
 
+def frame_step(frame: np.ndarray) -> float:
+    """frame 番号の差のうち最も多いもの（1 行ぶんの間引き幅。USB の 4 Hz 間引きなら 8、混成の格子なら 1）。"""
+    diffs = np.diff(np.asarray(frame, dtype=float))
+    positive = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if not positive.size:
+        return 1.0
+    values, counts = np.unique(positive, return_counts=True)
+    return float(values[np.argmax(counts)])   # 同数なら小さい方
+
+
+def on_frame_grid(frame: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """frame 番号の抜けを NaN の行で埋め、``values``（行が先頭の軸）を dt ごとの等間隔に並べ直す。
+
+    推定（``innovation_loglik``・``initial_guess``）は行が dt ごとに並ぶ前提。処理が間に合わず取りこぼした行を
+    詰めたまま推定すると、抜けの前後が 1 dt に縮んで q_acc が狂う。frame の差が間引き幅（``frame_step``）の k 倍なら
+    k − 1 行の NaN を挟む。倍数でない差はいちばん近い倍数、0 以下の差は 1 行とみなす（どちらも普通は起こらない）。
+    NaN を挟むのは ``MAX_FILL_ROWS`` 行まで（それより長い抜けは予測の分散が十分広がり、推定は変わらない）。
+    """
+    frame = np.asarray(frame, dtype=float)
+    if frame.size < 2:
+        return values
+    advance = np.rint(np.diff(frame) / frame_step(frame))
+    advance = np.clip(np.nan_to_num(advance, nan=1.0), 1, MAX_FILL_ROWS + 1).astype(int)
+    if (advance == 1).all():
+        return values
+    rows = np.concatenate([[0], np.cumsum(advance)])
+    grid = np.full((int(rows[-1]) + 1, *np.shape(values)[1:]), np.nan)
+    grid[rows] = values
+    return grid
+
+
+def capture_on_grid(capture: RawCapture) -> np.ndarray:
+    """生 CSV の点（行, 点, 3）を frame 番号の抜けを NaN の行で埋めて等間隔に並べ直したもの（推定・門・棄却率の入力）。"""
+    return on_frame_grid(capture.frame, capture.points)
+
+
 def fit_capture(capture: RawCapture) -> dict[tuple[int, str], SeriesFit | None]:
-    """生 CSV 1 本の全系列を推定する。初期値すら取れない系列は None（S7 のフォールバック対象）。"""
+    """生 CSV 1 本の全系列を推定する。初期値すら取れない系列は None（S7 のフォールバック対象）。
+
+    行は frame 番号の抜けを NaN で埋めてから使う（``capture_on_grid``）。
+    """
     dt = float(capture.provenance["dt"])
+    points = capture_on_grid(capture)
     fits: dict[tuple[int, str], SeriesFit | None] = {}
     for point, lid in enumerate(capture.landmark_ids):
         for axis_index, axis in enumerate(("x", "y", "z")):
             try:
-                fits[(lid, axis)] = fit_series(capture.points[:, point, axis_index], dt)
+                fits[(lid, axis)] = fit_series(points[:, point, axis_index], dt)
             except ValueError:
                 fits[(lid, axis)] = None
     return fits

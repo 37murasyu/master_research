@@ -26,7 +26,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from app.tuning.ekf_estimate import SeriesFit
+from app.tuning.ekf_estimate import SeriesFit, capture_on_grid
 from app.tuning.ekf_likelihood import innovation_loglik
 from app.tuning.raw_capture import RawCapture, git_commit
 from extended_kalman_filter import EKFConfig, SeriesNoise
@@ -85,13 +85,14 @@ def _is_usable(fit: SeriesFit | None, min_n_eff: int) -> bool:
     return fit is not None and not fit.at_bound and fit.n_eff >= min_n_eff
 
 
-def _gate_std(capture: RawCapture, key: tuple[int, str], fit: SeriesFit, dt: float) -> float:
+def _gate_std(capture: RawCapture, points: np.ndarray, key: tuple[int, str], fit: SeriesFit, dt: float) -> float:
     """正規化イノベーションの分布から、その系列の門の広さを決める。
 
     ゲート無しで推定した ``r`` は外れ値を吸収して過大になるので、固定 3.0 だと門が広くなる。
+    ``points`` は推定と同じく frame 番号の抜けを NaN の行で埋めた点（``capture_on_grid``）。
     """
     lid, axis = key
-    z = capture.points[:, capture.landmark_ids.index(lid), AXES.index(axis)]
+    z = points[:, capture.landmark_ids.index(lid), AXES.index(axis)]
     normalized = innovation_loglik(z, dt, fit.q_acc, fit.r).normalized
     finite = normalized[np.isfinite(normalized)]
     if finite.size == 0:
@@ -130,11 +131,12 @@ def build_profile(
     """推定結果を、実行時が読める形に落とす。採用できない系列は段階を踏んでフォールバックする。"""
     dt = float(capture.provenance["dt"])
     usable = {key: fit for key, fit in fits.items() if _is_usable(fit, min_n_eff)}
+    points = capture_on_grid(capture)
     fitted = {
         key: SeriesEntry(
             q_acc=fit.q_acc,
             r=fit.r,
-            gate_std=_gate_std(capture, key, fit, dt),
+            gate_std=_gate_std(capture, points, key, fit, dt),
             n_eff=fit.n_eff,
             rho1=fit.rho[0],
             source="fit",

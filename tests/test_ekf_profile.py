@@ -107,6 +107,19 @@ class TestBuildProfile:
         fits[(11, "z")] = _fit(at_bound=True)
         assert build_profile(_capture(), fits)["series"]["11"]["z"]["source"] != "fit"
 
+    def test_the_gate_sees_dropped_frames_as_missing_rows(self):
+        """取りこぼした行（frame 番号の抜け）は、門を決めるイノベーションでも推定と同じく NaN の行として扱う。
+        行を詰めたままだと抜けの前後が 1 dt に縮み、正規化イノベーションが大きく出て門が広がる。"""
+        full = _capture()
+        keep = np.flatnonzero(np.arange(N_FRAMES) % 10 != 3)   # 10 行に 1 行を取りこぼした
+        packed = RawCapture(landmark_ids=IDS, frame=full.frame[keep], t=full.t[keep], points=full.points[keep],
+                            provenance=full.provenance)
+        holed = full.points.copy()
+        holed[np.arange(N_FRAMES) % 10 == 3] = np.nan
+        filled = RawCapture(landmark_ids=IDS, frame=full.frame, t=full.t, points=holed, provenance=full.provenance)
+        gate = build_profile(packed, _all_good_fits())["series"]["11"]["x"]["gate_std"]
+        assert gate == pytest.approx(build_profile(filled, _all_good_fits())["series"]["11"]["x"]["gate_std"])
+
 
 class TestFileFormat:
     """壊れたファイルは読んだ時点で止める。"""

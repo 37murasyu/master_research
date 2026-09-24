@@ -43,10 +43,11 @@ def _truth(n: int) -> np.ndarray:
 
 
 def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip=(), log=True,
-             provenance=None, lost_rows=()) -> Path:
+             provenance=None, lost_rows=(), dropped_rows=()) -> Path:
     """計測 1 回ぶんの出力フォルダ（master_research_code.py が書くものと同じ名前・列）。
 
     ``lost_rows`` の行は、人を見つけられなかったフレームとして生 CSV の 3D を NaN にする。
+    ``dropped_rows`` の行は生 CSV に書かない（取りこぼし。frame 番号が跳ぶ）。
     """
     out = tmp_path / "run"
     out.mkdir()
@@ -62,7 +63,8 @@ def make_run(tmp_path: Path, *, raw_offset=None, file_mode=True, t_step=DT, skip
     meta.update(provenance or {})
     writer = RawCaptureWriter(out / f"kpts3d_raw_{TS}.csv", IDS, meta)
     for k in range(N):
-        writer.append(k, k * t_step, raw[k])
+        if k not in dropped_rows:
+            writer.append(k, k * t_step, raw[k])
     writer.note(gravity=[0.0, 0.0, -9.80665], gravity_label="Z-", gravity_set=True)
     writer.close()
 
@@ -306,6 +308,13 @@ class TestEkf:
         ekf = vr.check_run(out)["ekf"]
         assert all(row["rejection_rate"] is None for row in ekf["series"])
         assert "見つからない" in ekf["note"]
+
+    def test_dropped_frames_do_not_count_as_rejections(self, tmp_path):
+        """取りこぼした行（frame 番号の跳び）は、推定と同じく NaN の行として棄却率を数える。行を詰めたままだと
+        抜けの前後が 1 dt に縮み、なめらかな動きでも正規化イノベーションが門の外に出る（この設定で 4 割）。"""
+        scalar = {"EKF_Q_ACC": 0.1, "EKF_R": 1e-8, "EKF_GATE_STD": 3.0}
+        ekf = vr.check_run(make_run(tmp_path, provenance=scalar, dropped_rows=range(3, N, 10)))["ekf"]
+        assert all(row["rejection_rate"] == 0.0 for row in ekf["series"]), ekf["series"][:3]
 
     def test_no_gate_means_no_rejection_rate(self, tmp_path):
         """EKF_GATE_STD <= 0 なら実行時は門を使わない（extended_kalman_filter）。100% と出さない。"""

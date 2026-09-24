@@ -48,6 +48,7 @@ from app import entry  # noqa: E402
 from app.core.settings import OUTPUT_DIR_ENV, Settings  # noqa: E402
 from app.core.stop_request import STOP_FILE_ENV  # noqa: E402
 from app.hybrid.retriangulate import retriangulate  # noqa: E402
+from app.tuning.ekf_estimate import capture_on_grid  # noqa: E402
 from app.tuning.ekf_likelihood import innovation_loglik  # noqa: E402
 from app.tuning.ekf_profile import builtin_entry, resolve_profile  # noqa: E402
 from app.tuning.raw_capture import (  # noqa: E402
@@ -202,13 +203,15 @@ def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[s
 def _ekf_series(capture, raw_rows: np.ndarray, kpts: pd.DataFrame, origin: str, lookup, note: str) -> dict[str, Any]:
     """合わせ済みの行（``raw_rows`` と ``kpts`` の同じ番号が同じ時刻）で、系列ごとの RMS と棄却率を出す。
 
-    棄却率は生の系列の全体（抜けた格子の NaN を含む、dt 一定）で数える。
+    棄却率は生の系列の全体（抜けた格子の NaN を含む、dt 一定）で数える。取りこぼした行（frame 番号の跳び）は、
+    推定（``ekf_estimate``）と同じく NaN の行に戻す（``capture_on_grid``）。
     """
     dt = float(capture.provenance["dt"])
+    grid = capture_on_grid(capture)
     rows = []
     for i, lid in enumerate(capture.landmark_ids):
         for a, axis in enumerate(AXES):
-            raw = capture.points[:, i, a]
+            raw = grid[:, i, a]
             column = f"joint_{i}_{axis}"
             diff = raw_rows[:, i, a] - (kpts[column].to_numpy(float) if column in kpts else np.nan)
             finite = np.isfinite(diff)
