@@ -85,8 +85,17 @@ def _one(out_dir: Path, pattern: str) -> Path | None:
     return found[-1] if found else None
 
 
+def _read_table(path: Path, **kwargs) -> pd.DataFrame:
+    """CSV を読む。USB の本体は処理したフレームが 0 だと列も無い空の CSV（``pd.DataFrame([]).to_csv``）を書くので、
+    そのときは 0 行の表を返す（``EmptyDataError`` で check を落とさず、行の検査で不合格にする）。"""
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
 def _torque_stats(path: Path) -> dict[str, Any]:
-    df = pd.read_csv(path, encoding="utf-8-sig")
+    df = _read_table(path, encoding="utf-8-sig")
     stats = {}
     for joint in JOINTS:
         column = f"{joint}_y"
@@ -102,7 +111,7 @@ def _torque_stats(path: Path) -> dict[str, Any]:
 
 
 def _gauge_stats(path: Path) -> dict[str, Any]:
-    df = pd.read_csv(path, encoding="utf-8-sig")
+    df = _read_table(path, encoding="utf-8-sig")
     meta_path = path.with_suffix(".json")
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
     bands = meta.get("thresholds_gauge") or meta.get("thresholds_auto") or {}
@@ -182,7 +191,7 @@ def _ekf_stats(capture, kpts_path: Path, base_dir: Path | None = None) -> dict[s
     外に出た割合。実行時の EKF はロバスト更新で状態が変わるので近似である。門が 0 以下なら実行時は門を
     使わないので、棄却率は出さない。USB の生 CSV と kpts3d は 1 行ずつ対応するので、行の番号で合わせる。
     """
-    kpts = pd.read_csv(kpts_path)
+    kpts = _read_table(kpts_path)
     n = min(capture.points.shape[0], len(kpts))
     dt = float(capture.provenance["dt"])
     origin, lookup, note = _noise_lookup(capture.provenance, dt, base_dir)
@@ -752,11 +761,11 @@ def check_run(out_dir: str | Path, log: str | Path | None = None, timestamp: str
 
     capture = read_raw_capture(raw_path) if has_raw else None
     if capture is not None and files["kpts3d"] is not None:
-        n_raw, n_kpts = capture.points.shape[0], len(pd.read_csv(files["kpts3d"]))
+        n_raw, n_kpts = capture.points.shape[0], len(_read_table(files["kpts3d"]))
         # 体格の比で計測を止めたとき（終了コード 3）だけ、生 CSV が 1 行多い
         add("行: 生 CSV と kpts3d が 1 行ずつ対応", n_raw - n_kpts in (0, 1), f"生 {n_raw} 行 / kpts3d {n_kpts} 行")
     if files["aim_torque"] is not None:
-        n_torque = len(pd.read_csv(files["aim_torque"], encoding="utf-8-sig"))
+        n_torque = len(_read_table(files["aim_torque"], encoding="utf-8-sig"))
         add("行: aim_torque が 1 行以上", n_torque > 0, f"{n_torque} 行（慣性の暖機 30 フレームの後から）")
         report["torque"] = _torque_stats(files["aim_torque"])
     if files["gauge_energy"] is not None:
@@ -782,7 +791,8 @@ def check_run(out_dir: str | Path, log: str | Path | None = None, timestamp: str
         # 3D が 1 点も取れない回（人が写っていない・灰色の映像）でも、ファイルと行はそろいトルクは 0 のまま書かれる
         tracked, rows = _tracked_rows(capture.points, capture.landmark_ids)
         add(f"3D: 肩・肘・手首がそろった行 {MIN_TRACKED_SHARE:.0%} 以上", rows > 0 and tracked / rows >= MIN_TRACKED_SHARE,
-            f"{tracked} / {rows} 行" + ("" if rows and tracked else "、人を見つけていない。映像と写り方を確かめる"))
+            f"{tracked} / {rows} 行" + ("、処理したフレームが無い" if not rows else
+                                         "" if tracked else "、人を見つけていない。映像と写り方を確かめる"))
         # 骨の長さは混成と同じ節（値として並べる。USB の置き方・校正の目安は混成と違うので合否にしない）
         report["quality"] = {"segments": _segment_lengths(capture.points, capture.landmark_ids)}
         if files["kpts3d"] is not None:

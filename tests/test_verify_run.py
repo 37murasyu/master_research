@@ -157,6 +157,22 @@ class TestStructure:
                                      "[STOP] 停止要求を受けました。\n✅ aim_torque x\n", encoding="utf-8")
         assert not _check(vr.check_run(out, log=out / "run.log"), "ログ: 指定した入力を読んだ")["ok"]
 
+    def test_a_run_that_processed_no_frame_fails_without_crashing(self, tmp_path):
+        """止めるのが早すぎた・入力がすぐ尽きた回は、本体が中身の無い CSV（pd.DataFrame([]).to_csv、列も無い）を書く。
+        check は EmptyDataError で落ちずに 0 行として扱い、不合格にする。"""
+        out = make_run(tmp_path)
+        raw = out / f"kpts3d_raw_{TS}.csv"
+        raw.write_text(raw.read_text(encoding="utf-8").split("\n", 1)[0] + "\n", encoding="utf-8")
+        pd.DataFrame([]).to_csv(next(out.glob("kpts3d_0923*_gZ-.csv")), index=False)
+        pd.DataFrame([]).to_csv(next(out.glob("aim_torque_vec_*.csv")), index=False, encoding="utf-8-sig")
+        pd.DataFrame([]).to_csv(next(out.glob("gauge_energy_*.csv")), index=False, encoding="utf-8-sig")
+        report = vr.check_run(out, log=out / "run.log")
+        check = _check(report, "行: aim_torque が 1 行以上")
+        assert not check["ok"] and check["detail"].startswith("0 行")
+        assert not _check(report, TRACKED)["ok"]
+        assert report["torque"]["wrist_R"]["n"] == 0
+        vr.format_report(report)
+
     def test_raw_and_filtered_rows_match(self, tmp_path):
         out = make_run(tmp_path)
         kpts = next(out.glob("kpts3d_0923*_gZ-.csv"))
