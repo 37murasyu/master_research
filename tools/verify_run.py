@@ -515,6 +515,14 @@ def _hybrid_gauge(work: pd.DataFrame, meta: Mapping[str, Any]) -> dict[str, Any]
     return stats
 
 
+def _closed_reps(work: pd.DataFrame) -> pd.DataFrame:
+    """``cycle_work`` のうち閉じた回だけ。止めたときに開いたままの回は ``status=unfinished`` の行で残るので、
+    回の数・仕事・帯への到達には数えない（``status`` 列の無い古い記録は全行が閉じた回）。"""
+    if "status" not in work.columns:
+        return work
+    return work[work["status"].astype(str) != "unfinished"]
+
+
 def _hybrid_extended(folder: Path, stamp: str | None, files: Mapping[str, Path | None], frames, meta, report, add,
                      raw_path: Path | None, raw_capture) -> None:
     """新しい版の記録（``output_schema_version`` がある）の検査と値。古い記録では何もしない。
@@ -539,9 +547,11 @@ def _hybrid_extended(folder: Path, stamp: str | None, files: Mapping[str, Path |
         add(f"行: kpts3d の各行に生 CSV の同じ格子がある（{MIN_GRID_MATCH:.0%} 以上）",
             rows > 0 and matched / rows >= MIN_GRID_MATCH, f"{matched} / {rows} 行")
     if files["cycle_work"] is not None:
-        work = pd.read_csv(files["cycle_work"])
+        all_work = pd.read_csv(files["cycle_work"])
+        work = _closed_reps(all_work)
         if set(HYBRID_WORK_COLUMNS) <= set(work.columns):
             report["gauge"] = _hybrid_gauge(work, meta)
+        report["unfinished_rep_rows"] = int(len(all_work) - len(work))
     report["subject"] = {key: meta.get(key) for key in HYBRID_SUBJECT_KEYS}
     board = (meta.get("calibration_meta") or {}).get("checkerboard_short_axis") or {}
     report["gravity"] = dict(meta.get("gravity") or {}, board_tilt_deg=board.get("tilt_deg"),
@@ -585,7 +595,8 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
         add("行: local_torque が 1 行以上", len(torque) > 0, f"{len(torque)} 行")
         report["torque"] = {joint: _abs_stats(torque.loc[torque["joint"] == joint, "y"]) for joint in JOINTS}
     if frames is not None:
-        work = pd.read_csv(files["cycle_work"]) if files["cycle_work"] else pd.DataFrame(columns=["joint", "work_j"])
+        work = (_closed_reps(pd.read_csv(files["cycle_work"])) if files["cycle_work"]
+                else pd.DataFrame(columns=["joint", "work_j"]))
         report["cycles"] = {
             "detected": int(frames["cycle_detected"].sum()),
             "work": {joint: [float(v) for v in work.loc[work["joint"] == joint, "work_j"]] for joint in JOINTS},

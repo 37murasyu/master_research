@@ -59,7 +59,7 @@ import numpy as np
 
 # これらはフレームが流れ始める前に払っておく。関数内 import にすると、
 # 最初の数フレームの中で utils(0.12s) + utils_dynamic(0.70s) の読み込みが走り、
-# その間 asyncio の受信ループが止まる（同期バッファの窓 2 秒の 1/3 を食う）。
+# その間 asyncio の受信ループが止まる（約 0.8 秒、30 Hz で 25 フレームぶん受信が滞る）。
 from body_part_storage_module import BodyPartDataStorage
 # 部位キーと重力の大きさは config.py が持っている。utils 経由で既に読み込まれているので
 # 追加コストなしで再利用できる。

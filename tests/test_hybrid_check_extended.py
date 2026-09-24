@@ -155,3 +155,13 @@ def test_the_text_report_shows_the_new_sections(tmp_path):
     text = vr.format_report(vr.check_run(make_new_run(tmp_path)))
     for word in ("被験者 00", "W_pos", "帯", "RMS", "棄却率", "checkerboard", "盤の傾き 4.2", "処理時間"):
         assert word in text, word
+
+
+def test_an_unfinished_rep_is_not_counted_as_a_rep():
+    """止めたときに開いたままの回（``status=unfinished``）は、回の数・仕事・帯への到達に数えない。
+    ``status`` 列の無い古い記録は全行を閉じた回として扱う（2026-09-24 の全体レビュー）。"""
+    work = pd.DataFrame({"joint": ["elbow_R", "elbow_R"], "work_j": [20.0, 230.0],
+                         "status": ["closed", "unfinished"]})
+    assert list(vr._closed_reps(work)["work_j"]) == [20.0]
+    old = work.drop(columns="status")
+    assert len(vr._closed_reps(old)) == 2
