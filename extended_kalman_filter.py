@@ -159,8 +159,14 @@ class ExtendedKalman1D:
         self.initialized = True
 
     def step(self, z: Optional[float], dt: float) -> Tuple[float, float, float]:
+        """観測 ``z`` で 1 ステップ進める。``z`` が None か有限でない（NaN・inf）なら欠測で、predict だけ行う。
+
+        NaN を観測として取り込むと状態が NaN になり、以後ずっと NaN を返す（``run_ekf`` の列の残りが全部消える）。
+        """
         if dt <= 0:
             raise ValueError("dt must be positive")
+        if z is not None and not np.isfinite(z):
+            z = None
         if not self.initialized:
             if z is None:
                 return float("nan"), float("nan"), float("nan")
@@ -200,7 +206,10 @@ class ExtendedKalman1D:
 
 
 class ExtendedKalmanND:
-    """Apply ExtendedKalman1D independently to each axis."""
+    """Apply ExtendedKalman1D independently to each axis.
+
+    NaN（有限でない値）の軸はその軸だけ欠測として扱う（``ExtendedKalman1D.step``）。
+    """
 
     def __init__(self, dim: int, cfg: EKFConfig):
         self.filters = [ExtendedKalman1D(cfg) for _ in range(dim)]
@@ -217,7 +226,7 @@ class ExtendedKalmanND:
         vel = np.zeros(len(self.filters), dtype=float)
         acc = np.zeros(len(self.filters), dtype=float)
         for i, f in enumerate(self.filters):
-            z_i = None if meas is None else float(meas[i])
+            z_i = None if meas is None or not np.isfinite(meas[i]) else float(meas[i])
             px, pv, pa = f.step(z_i, dt)
             pos[i], vel[i], acc[i] = px, pv, pa
         return pos, vel, acc
@@ -234,7 +243,7 @@ def run_ekf(
     Arguments
     ---------
     data : ndarray (n, d)
-        Measurements per axis.
+        Measurements per axis. NaN（有限でない値）はその時刻・軸の欠測として扱う。
     time_s : ndarray (n,)
         Time stamps in seconds (monotonic).
     cfg : EKFConfig
