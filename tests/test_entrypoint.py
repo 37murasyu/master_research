@@ -39,6 +39,31 @@ class TestArgumentDispatch:
         with pytest.raises(SystemExit):
             entry.parse_args(["--role", "そんな役割はない"])
 
+    def test_app_options_are_not_abbreviated(self):
+        """``--mod`` が ``--module`` の略として食われ、解析スクリプトへ届かなかった。"""
+        parsed = entry.parse_args(["--role", "script", "--module", "m", "--mod", "x"])
+        assert parsed.module == "m"
+        assert parsed.passthrough == ["--mod", "x"]
+
+
+class TestPassthroughSeparator:
+    """子のスクリプトへ渡す引数は ``--`` の後ろに置き、アプリの引数の解釈に触れさせない（開発・凍結とも）。"""
+
+    @pytest.mark.parametrize("frozen", [False, True], ids=["開発", "凍結"])
+    @pytest.mark.parametrize("extra", [
+        ["--mod", "x"],
+        ["--role", "calibrate"],
+        ["-h"],
+        ["0924_095256", "--base-dir", "/a b/c"],
+        ["--", "x"],
+        [],
+    ])
+    def test_script_arguments_reach_the_script_unchanged(self, monkeypatch, frozen, extra):
+        monkeypatch.setattr(entry.resources, "is_frozen", lambda: frozen)
+        command = entry.worker_command("script", extra, module="compute_local_torque_offline")
+        parsed = entry.parse_args(command[command.index("--role"):])
+        assert (parsed.role, parsed.module, parsed.passthrough) == ("script", "compute_local_torque_offline", extra)
+
 
 class TestWorkerCommand:
     def test_dev_mode_uses_module_invocation(self, monkeypatch):

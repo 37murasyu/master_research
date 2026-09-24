@@ -168,6 +168,75 @@ class TestEkfCalibrationTask:
         assert entry.resolve_module("script", "app.runners.tune_ekf") == "app.runners.tune_ekf"
 
 
+class TestAnalyzeArguments:
+    """解析画面が子のスクリプトへ渡す引数。"""
+
+    @pytest.fixture
+    def page(self, qt_app, monkeypatch):
+        from app.shell.page_analyze import AnalyzePage
+
+        page = AnalyzePage(Settings())
+        page.calls = []
+        monkeypatch.setattr(page._runner, "start",
+                            lambda settings, args, module=None: page.calls.append((args, module)) or True)
+        yield page
+        page.shutdown()
+
+    def _choose(self, page, module: str):
+        from app.shell.page_analyze import TASKS
+
+        page._task_combo.setCurrentIndex(next(i for i, t in enumerate(TASKS) if t.module == module))
+
+    def test_local_torque_passes_the_required_id(self, page, tmp_path):
+        """「局所トルクの再計算」は必須の位置引数（計測の ID）を渡さず、必ず exit 2 で終わっていた。"""
+        import compute_local_torque_offline
+
+        self._choose(page, "compute_local_torque_offline")
+        assert page._id_edit.isVisibleTo(page)
+        page._input_edit.setText(str(tmp_path))
+        page._id_edit.setText(" 0924_095256 ")
+        page._run()
+
+        [(args, module)] = page.calls
+        assert (args, module) == (["0924_095256", "--base-dir", str(tmp_path)], "compute_local_torque_offline")
+        # スクリプトの引数の解釈を通る（ファイルが無いので 1。引数の誤りなら SystemExit(2)）
+        assert compute_local_torque_offline.main(args) == 1
+
+    def test_local_torque_without_an_id_does_not_start(self, page, tmp_path):
+        self._choose(page, "compute_local_torque_offline")
+        page._input_edit.setText(str(tmp_path))
+        page._run()
+        assert page.calls == []
+        assert "ID" in page._log.toPlainText()
+
+    def test_the_id_field_is_only_for_tasks_that_need_it(self, page):
+        self._choose(page, "stereo_triangulate_pose")
+        assert not page._id_edit.isVisibleTo(page)
+
+    def test_extra_options_keep_quoted_paths_with_spaces(self, page, tmp_path):
+        self._choose(page, "stereo_triangulate_pose")
+        page._input_edit.setText(str(tmp_path))
+        page._extra_edit.setText('--out "/tmp/a b/out.csv" --fps 30')
+        page._run()
+        [(args, _module)] = page.calls
+        assert args == ["--input-dir", str(tmp_path), "--out", "/tmp/a b/out.csv", "--fps", "30"]
+
+    def test_an_unclosed_quote_is_reported_instead_of_starting(self, page, tmp_path):
+        self._choose(page, "stereo_triangulate_pose")
+        page._input_edit.setText(str(tmp_path))
+        page._extra_edit.setText('--out "/tmp/a b')
+        page._run()
+        assert page.calls == []
+        assert "引用符" in page._log.toPlainText()
+
+    def test_windows_paths_keep_their_backslashes(self):
+        from app.shell.page_analyze import split_options
+
+        text = r'--out "C:\Users\a b\out.csv" --dir C:\data --fps 30'
+        assert split_options(text, windows=True) == ["--out", r"C:\Users\a b\out.csv", "--dir", r"C:\data", "--fps", "30"]
+        assert split_options("--out '/tmp/a b' --fps 30", windows=False) == ["--out", "/tmp/a b", "--fps", "30"]
+
+
 class TestStopDirectory:
     """停止ファイル（§3-2）を置く一時ディレクトリは、計測のときだけ作り、残さない。"""
 
