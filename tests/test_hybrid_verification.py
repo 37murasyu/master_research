@@ -295,6 +295,20 @@ class TestRateCheck:
     def test_both_cameras_at_30fps_pass(self, tmp_path):
         assert _check(vr.check_run(make_hybrid_run(tmp_path)), "速さ: Mac・Pixel とも 24 fps 以上（30 fps の 8 割）")["ok"]
 
+    def test_a_reconnected_pixel_keeps_the_frames_after_the_reconnection(self, tmp_path):
+        """Pixel がつなぎ直すと seq は 0 に戻る（SensorClient.connect）。(role, seq) だけで重複を除くと、つなぎ直した後の
+        フレームが前のフレームの重複として捨てられ、Pixel のフレーム数と実測に基づく割合が小さく出る。"""
+        run = make_hybrid_run(tmp_path)
+        before = vr.check_run(run)["fps"]
+        marks = next(run.glob("landmarks2d_*.csv"))
+        table = pd.read_csv(marks)
+        late = (table.role == "cam1") & (table.seq >= 48)
+        table.loc[late, "seq"] -= 48   # 4 割のところでつなぎ直した
+        table.to_csv(marks, index=False)
+        after = vr.check_run(run)["fps"]
+        assert after["role_frames"] == before["role_frames"] == {"cam0": N, "cam1": N}
+        assert after["real_share"] == pytest.approx(before["real_share"])
+
 
 # ---------------------------------------------------------------------------
 # 配置と 3D の質（本番の前の試し計測で、置き方を直すべきかをその場で決めるため）

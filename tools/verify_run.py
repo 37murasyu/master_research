@@ -568,7 +568,8 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
         steps = _intervals(frames["t_s"])
         role_fps, role_frames = {}, {}
         if files["landmarks2d"] is not None:
-            marks = pd.read_csv(files["landmarks2d"], usecols=["role", "seq", "t_ns"]).drop_duplicates(["role", "seq"])
+            # 1 フレームは 33 行。Pixel はつなぎ直すと seq が 0 に戻るので、撮影時刻も合わせてフレームを見分ける
+            marks = pd.read_csv(files["landmarks2d"], usecols=["role", "seq", "t_ns"]).drop_duplicates(["role", "seq", "t_ns"])
             for role, group in marks.groupby("role"):
                 role_steps = _intervals(np.sort(group["t_ns"].to_numpy(float)) / 1e9)
                 role_frames[role] = int(len(group))
