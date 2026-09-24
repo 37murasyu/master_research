@@ -212,3 +212,9 @@ def test_replay_marks_header():
 
     replay = m.apply_frame(state, _frame("connected", rep=0, source="replay"))
     assert m.header(replay).replay is True
+
+
+def test_status_nan_is_none_not_over():
+    # NaN は比較がすべて偽になるので、そのままだと OVER に落ちる。fraction（NaN は 0）とそろえる
+    assert m.status(math.nan, (80.0, 100.0)) is m.Status.NONE
+    assert m.status_label(m.status(math.nan, (80.0, 100.0))) == ""

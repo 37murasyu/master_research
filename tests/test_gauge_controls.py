@@ -104,6 +104,14 @@ class TestCountBadge:
 
 
 class TestStatusText:
+    def test_unknown_state_is_an_error(self, qt_app):
+        from app.shell.controls import StatusText
+
+        status = StatusText()
+        with pytest.raises(ValueError):
+            status.set_status("runing")  # 綴り違いを「停止中」として隠さない
+        assert "停止中" in status.text()
+
     def test_status_text_pairs_symbol_and_words(self, qt_app):
         from app.shell.controls import StatusText
 

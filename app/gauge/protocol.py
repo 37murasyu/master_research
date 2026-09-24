@@ -270,8 +270,11 @@ class LineDemux:
         if self._pending and not self._looks_like_gauge_prefix(self._pending):
             prefix_at = self._pending.find(PREFIX)
             if prefix_at == -1:
-                log_parts.append(self._pending)
-                self._pending = ""
+                # 行の途中の PREFIX が塊の境目で割れた場合（"…@@GA" ＋ "UGE {…}"）。
+                # 末尾の PREFIX の頭になりうる部分だけをため、手前はログへ流す。
+                keep = self._partial_prefix_len(self._pending)
+                log_parts.append(self._pending[: len(self._pending) - keep])
+                self._pending = self._pending[len(self._pending) - keep :]
             else:
                 # 行の途中に PREFIX が現れた場合（任意の要件）。手前はログへ、
                 # PREFIX から先はゲージの行の候補としてためておく。
@@ -293,6 +296,14 @@ class LineDemux:
         """バッファとデコーダを初期化する（前回の計測の続きと混ざらないように）。"""
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._pending = ""
+
+    @staticmethod
+    def _partial_prefix_len(text: str) -> int:
+        """``text`` の末尾が PREFIX の頭（全体ではない）と一致する最長の長さ。無ければ 0。"""
+        for k in range(min(len(PREFIX) - 1, len(text)), 0, -1):
+            if text.endswith(PREFIX[:k]):
+                return k
+        return 0
 
     @staticmethod
     def _looks_like_gauge_prefix(text: str) -> bool:

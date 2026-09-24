@@ -186,8 +186,11 @@ class StatusText(QtWidgets.QLabel):
             self.setText("✓ 正常終了")
         elif state == "error":
             self.setText(f'<span style="color:{theme.OVER};">✕</span> 異常終了')
-        else:  # "stopped" を含め、既定は停止中扱い
+        elif state == "stopped":
             self.setText("停止中")
+        else:
+            # 黙って「停止中」に落とすと、呼び出し側の綴り違いが画面の誤りとして隠れる
+            raise ValueError(f"知らない状態: {state!r}")
 
     def set_link(self, connected: bool) -> None:
         if connected:

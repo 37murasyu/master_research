@@ -399,3 +399,20 @@ def test_header_replay_pill_shown_for_replay_source():
     assert (replay[0].x, replay[0].y) == (230.0, 40.0)
     assert replay[0].runs[0].text == "▶ 再生"
     assert replay[0].runs[0].color == theme.HEADER_SUB
+
+
+@pytest.mark.parametrize("part", ["elbow_L", "elbow_R", "wrist_L", "wrist_R"])
+def test_band_label_near_top_is_centered_and_lifted(part, monkeypatch):
+    # lo=62.5・hi=100 なら下端の割合は 62.5/125 = 0.5 で、弧の頂上（中央揃えの範囲）に来る
+    parts = {part: PartReading(now=None, prev=None, band=(62.5, 100.0))}
+    state = _waiting_state(parts, show_joules=True)
+
+    def lo_label():
+        labels = sc.build_scene(state).find("band_label", part)
+        (label,) = [lb for lb in labels if lb.runs[0].text == "62"]
+        return label
+
+    lifted = lo_label()
+    assert lifted.align == "center"
+    monkeypatch.setattr(sc, "CENTER_LABEL_LIFT", 0.0)
+    assert lo_label().y - lifted.y == pytest.approx(10.0), "中央揃えの数字は弧に重ならないよう持ち上げる"
