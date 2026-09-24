@@ -100,26 +100,9 @@ def _layout(w: float, h: float) -> tuple[float, float, float]:
 # 字体
 # ---------------------------------------------------------------------------
 
-# 書体の選び方は ``app.gauge.fonts``（設定 GAUGE_FONT_PRESET の組。Mac に入っている
-# フォントワークスの書体を探し、無ければヒラギノ角ゴ → 同梱の IPAex ゴシック）。
-
-
-def _run_font(run: sc.Run, label_role: str = "") -> QtGui.QFont:
-    """``Run`` から ``QFont`` を作る。大きさは ``setPixelSize``（task-7-brief.md）。
-
-    ``label_role`` で書体の役（見出し・数字・文字）が決まる。
-    """
-    return gauge_fonts.make_font(gauge_fonts.role_for_label(label_role), max(1, round(run.size)), run.weight)
-
-
-@functools.lru_cache(maxsize=1024)
-def _text_advance(text: str, role: str, pixel_size: int, weight: int, generation: int) -> float:
-    """文字列の幅（``QFontMetricsF.horizontalAdvance``）。同じ組は測り直さない。
-
-    ``generation``（``gauge_fonts.font_generation``）を鍵に含めるので、書体の組を変えれば測り直す。
-    """
-    font = gauge_fonts.make_font(role, pixel_size, weight)
-    return QtGui.QFontMetricsF(font).horizontalAdvance(text)
+# 書体は窓ごとの ``gauge_fonts.FontSet``（設定 GAUGE_FONT_PRESET の組。Mac に入っている
+# フォントワークスの書体を探し、無ければヒラギノ角ゴ → 同梱の IPAex ゴシック）。``QFont`` と
+# 文字列の幅は FontSet が覚えておくので、ここでは毎回引くだけでよい。
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +164,11 @@ def _draw_line(painter: QtGui.QPainter, line: sc.Line) -> None:
     painter.drawLine(QtCore.QPointF(line.x0, line.y0), QtCore.QPointF(line.x1, line.y1))
 
 
-def _draw_label(painter: QtGui.QPainter, label: sc.Label) -> None:
-    """``Run`` を左から順に並べる。大きさ違いの幅は ``QFontMetricsF`` で測る。"""
-    fonts = [_run_font(run, label.role) for run in label.runs]
-    role, generation = gauge_fonts.role_for_label(label.role), gauge_fonts.font_generation()
-    widths = [_text_advance(run.text, role, max(1, round(run.size)), run.weight, generation) for run in label.runs]
+def _draw_label(painter: QtGui.QPainter, label: sc.Label, fonts: gauge_fonts.FontSet) -> None:
+    """``Run`` を左から順に並べる。大きさ違いの幅は ``QFontMetricsF`` で測る（``FontSet.text_advance``）。"""
+    role = gauge_fonts.role_for_label(label.role)  # 書体の役（見出し・数字・文字）はラベルで決まる
+    sizes = [max(1, round(run.size)) for run in label.runs]  # setPixelSize に渡す大きさ（task-7-brief.md）
+    widths = [fonts.text_advance(run.text, role, size, run.weight) for run, size in zip(label.runs, sizes)]
     total_width = sum(widths)
 
     if label.align == "left":
@@ -195,8 +178,8 @@ def _draw_label(painter: QtGui.QPainter, label: sc.Label) -> None:
     else:
         x = label.x - total_width / 2.0
 
-    for run, font, width in zip(label.runs, fonts, widths):
-        painter.setFont(font)
+    for run, size, width in zip(label.runs, sizes, widths):
+        painter.setFont(fonts.font(role, size, run.weight))
         painter.setPen(QtGui.QColor(run.color))
         painter.drawText(QtCore.QPointF(x, label.y), run.text)
         x += width
@@ -244,8 +227,8 @@ def _draw_backdrop(
         figure_renderer.render(painter, FIGURE_RECT)
 
 
-def _draw_scene_elements(painter: QtGui.QPainter, scene: sc.Scene, role_ok) -> None:
-    """``role_ok(role)`` が真の要素だけを、弧→線→文字の順で描く。
+def _draw_scene_elements(painter: QtGui.QPainter, scene: sc.Scene, role_ok, fonts: gauge_fonts.FontSet) -> None:
+    """``role_ok(role)`` が真の要素だけを、弧→線→文字の順で描く。文字の書体は ``fonts`` の組。
 
     弧→線→文字の順は ``mk_subject.py`` の描く順（形が先、文字は最後に重ねる）
     と、``build_scene`` が同じ部位の中で積む順（溝→帯→値の弧→…→前回の目盛り）
@@ -260,7 +243,7 @@ def _draw_scene_elements(painter: QtGui.QPainter, scene: sc.Scene, role_ok) -> N
             _draw_line(painter, line)
     for label in scene.labels:
         if role_ok(label.role):
-            _draw_label(painter, label)
+            _draw_label(painter, label, fonts)
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +258,11 @@ def paint_scene(
     h: float,
     figure_renderer: QtSvg.QSvgRenderer,
     icon_renderer: QtSvg.QSvgRenderer,
+    fonts: gauge_fonts.FontSet | None = None,
 ) -> None:
-    """``scene`` を 1 回で全部描く（キャッシュしない）。試験・``render_image`` 用。
+    """``scene`` を 1 回で全部描く（静止層をキャッシュしない）。試験・``render_image`` 用。
+
+    ``fonts`` は書体の組（省略すると既定の組）。
 
     ``GaugeWidget`` はこれをそのまま使わず、動かない層と動く層を分けて描く
     （モジュール docstring）。地の色は余白（レターボックス）も含めた ``w×h``
@@ -290,25 +276,30 @@ def paint_scene(
     s, ox, oy = _layout(w, h)
     if s <= 0:
         return
+    if fonts is None:
+        fonts = gauge_fonts.font_set()
 
     painter.save()
     painter.translate(ox, oy)
     painter.scale(s, s)
     _draw_backdrop(painter, scene, figure_renderer, icon_renderer)
-    _draw_scene_elements(painter, scene, lambda _role: True)
+    _draw_scene_elements(painter, scene, lambda _role: True, fonts)
     if scene.spinner is not None:
         _draw_spinner(painter, scene.spinner)
     painter.restore()
 
 
-def render_image(state: gm.GaugeState, w: int, h: int) -> QtGui.QImage:
-    """1 フレームぶんをオフスクリーンの ``QImage`` に描く。スナップショット・試験用。"""
+def render_image(state: gm.GaugeState, w: int, h: int, fonts: gauge_fonts.FontSet | None = None) -> QtGui.QImage:
+    """1 フレームぶんをオフスクリーンの ``QImage`` に描く。スナップショット・試験用。
+
+    ``fonts`` は書体の組（省略すると既定の組）。
+    """
     scene = sc.build_scene(state, spinner_phase=0.0)
     image = QtGui.QImage(w, h, QtGui.QImage.Format_ARGB32)
     image.fill(QtGui.QColor(theme.FIELD))
     painter = QtGui.QPainter(image)
     try:
-        paint_scene(painter, scene, w, h, _figure_renderer(), _icon_renderer())
+        paint_scene(painter, scene, w, h, _figure_renderer(), _icon_renderer(), fonts)
     finally:
         painter.end()
     return image
@@ -324,22 +315,31 @@ class _StaticKey:
     w: int
     h: int
     dpr: float
-    fonts: int  # 書体の組を変えたら作り直す（gauge_fonts.font_generation）
+    fonts: gauge_fonts.FontSet  # 書体の組を変えたら作り直す（組ごとに別の FontSet。同一性で比べる）
 
 
 class GaugeWidget(QtWidgets.QWidget):
     """被験者ゲージの窓の中身。動かない層を ``QPixmap`` にキャッシュして描く。
 
     公開の口は ``set_frame``・``set_show_joules``・``finish``・``reset``・
-    ``state`` プロパティ（controller の「判断済みのこと」）。
+    ``state`` プロパティ（controller の「判断済みのこと」）と、書体の組を変える
+    ``set_font_preset``。
     """
 
     _SPINNER_INTERVAL_MS = 60
     _SPINNER_STEP_DEG = 24.0
 
-    def __init__(self, *, show_joules: bool = True, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        show_joules: bool = True,
+        font_preset: str | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._state = gm.reset(show_joules=show_joules)
+        # 書体の組（設定 GAUGE_FONT_PRESET の値。None・空・知らない名前は既定の組）
+        self._fonts = gauge_fonts.font_set(font_preset)
         self._spinner_phase = 0.0
         self._scene = sc.build_scene(self._state, spinner_phase=self._spinner_phase)
 
@@ -359,6 +359,19 @@ class GaugeWidget(QtWidgets.QWidget):
     @property
     def state(self) -> gm.GaugeState:
         return self._state
+
+    @property
+    def font_set(self) -> gauge_fonts.FontSet:
+        """今の書体の組。診断・試験用。"""
+        return self._fonts
+
+    def set_font_preset(self, font_preset: str | None) -> None:
+        """書体の組を変える（None・空・知らない名前は既定の組）。変われば動かない層を作り直す。"""
+        fonts = gauge_fonts.font_set(font_preset)
+        if fonts is self._fonts:
+            return
+        self._fonts = fonts
+        self.update()
 
     def set_frame(self, frame: GaugeFrame) -> None:
         state = gm.apply_frame(self._state, frame)
@@ -418,7 +431,7 @@ class GaugeWidget(QtWidgets.QWidget):
     # -- 内部: 描画 ------------------------------------------------------------
 
     def _ensure_static_pixmap(self, w: int, h: int, dpr: float) -> None:
-        key = _StaticKey(w, h, dpr, gauge_fonts.font_generation())
+        key = _StaticKey(w, h, dpr, self._fonts)
         if self._static_pixmap is not None and self._static_key == key:
             return
         self._static_pixmap = self._build_static_pixmap(w, h, dpr)
@@ -443,7 +456,7 @@ class GaugeWidget(QtWidgets.QWidget):
                 painter.translate(ox, oy)
                 painter.scale(s, s)
                 _draw_backdrop(painter, self._scene, _figure_renderer(), _icon_renderer())
-                _draw_scene_elements(painter, self._scene, _is_static_role)
+                _draw_scene_elements(painter, self._scene, _is_static_role, self._fonts)
                 painter.restore()
         finally:
             painter.end()
@@ -466,7 +479,7 @@ class GaugeWidget(QtWidgets.QWidget):
             painter.save()
             painter.translate(ox, oy)
             painter.scale(s, s)
-            _draw_scene_elements(painter, self._scene, _is_dynamic_role)
+            _draw_scene_elements(painter, self._scene, _is_dynamic_role, self._fonts)
             if self._scene.spinner is not None:
                 _draw_spinner(painter, self._scene.spinner)
             painter.restore()

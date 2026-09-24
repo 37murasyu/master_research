@@ -188,9 +188,9 @@ class TestGaugeWidgetPublicApi:
 
     def test_check_and_cross_glyphs_are_available(self, qt_app):
         from app.core.qt import QtGui
-        from app.gauge.widget import _run_font
+        from app.gauge import fonts as gauge_fonts
 
-        font = _run_font(sc.Run("", 16, 700, theme.TEXT))
+        font = gauge_fonts.font_set().font("text", 16, 700)  # 状態の文字（役 text）の書体
         metrics = QtGui.QFontMetrics(font)
         # model.status_label が返す "✓ 目標帯"・"✕ 過負荷" の記号。
         assert metrics.inFontUcs4(0x2713) is True  # ✓
@@ -301,6 +301,28 @@ class TestGaugeWidgetPerformance:
 
             widget.repaint()
             assert widget._static_builds == 2
+        finally:
+            widget.deleteLater()
+
+    def test_static_layer_is_rebuilt_when_the_font_preset_changes(self, qt_app):
+        from app.gauge.widget import GaugeWidget
+
+        widget = GaugeWidget(show_joules=True, font_preset="system")
+        try:
+            widget.resize(800, 450)
+            widget.show()
+            qt_app.processEvents()
+            widget.repaint()
+            assert widget._static_builds == 1
+
+            widget.set_font_preset(" System ")
+            widget.repaint()
+            assert widget._static_builds == 1, "同じ組なら動かない層を作り直さない"
+
+            widget.set_font_preset("tsukushi")
+            widget.repaint()
+            assert widget._static_builds == 2
+            assert widget.font_set.name == "tsukushi"
         finally:
             widget.deleteLater()
 

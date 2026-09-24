@@ -2,7 +2,8 @@
 
 名前の照合と太さの選び方は Qt に依存しないので、そのまま確かめる。Qt 側は、同梱の IPAex ゴシックの
 名前を「FOT-ロダン Pro EB」などに書き換えた偽の書体を登録し、Mac にフォントワークスの書体が
-入っているのと同じ状況を作って確かめる（この試験の環境には本物が無い）。
+入っているのと同じ状況を作って確かめる（この試験の環境には本物が無い）。書体の組は ``FontSet`` ごとに
+持つので、試験ごとに新しい ``FontSet`` を作れば、ほかの試験の組に影響しない。
 """
 
 from __future__ import annotations
@@ -11,13 +12,6 @@ import pytest
 
 from app.gauge import fonts as gf
 from app.gauge.fonts import Face
-
-
-@pytest.fixture(autouse=True)
-def _restore_preset():
-    before = gf.current_preset()
-    yield
-    gf.set_preset(before)
 
 
 # ---------------------------------------------------------------------------
@@ -88,19 +82,18 @@ def test_role_for_label(label_role, role):
 
 
 def test_unknown_preset_falls_back_to_default(capsys):
-    assert gf.set_preset("rodan") == gf.DEFAULT_PRESET
+    assert gf.FontSet("rodan").name == gf.DEFAULT_PRESET
     assert "rodan" in capsys.readouterr().err
-    assert gf.set_preset("") == gf.DEFAULT_PRESET
-    assert gf.set_preset(" Kaimin ") == "kaimin"
+    assert gf.FontSet("").name == gf.DEFAULT_PRESET
+    assert gf.FontSet(None).name == gf.DEFAULT_PRESET
+    assert gf.FontSet(" Kaimin ").name == "kaimin"
 
 
-def test_changing_preset_bumps_generation():
-    gf.set_preset("system")
-    before = gf.font_generation()
-    gf.set_preset("system")
-    assert gf.font_generation() == before, "同じ組なら動かない層を作り直さない"
-    gf.set_preset("tsukushi")
-    assert gf.font_generation() == before + 1
+def test_font_set_is_shared_per_preset():
+    # 窓の動かない層は FontSet の同一性で作り直すかを決めるので、同じ組は同じものを返す
+    assert gf.font_set(" Kaimin ") is gf.font_set("kaimin")
+    assert gf.font_set(None) is gf.font_set(gf.DEFAULT_PRESET)
+    assert gf.font_set("system") is not gf.font_set("tsukushi")
 
 
 def test_setting_defaults_to_rodin():
@@ -145,18 +138,22 @@ def fake_fontworks(tmp_path_factory):
         font_id = QtGui.QFontDatabase.addApplicationFont(str(path))
         assert font_id != -1
         families[stem] = QtGui.QFontDatabase.applicationFontFamilies(font_id)[0]
-    gf._FACES = None  # 登録した書体を引き直させる
-    gf._FONT_CACHE.clear()
+    _forget_installed_faces()  # 登録した書体を引き直させる
     yield families
-    gf._FACES = None
-    gf._FONT_CACHE.clear()
+    _forget_installed_faces()
+
+
+def _forget_installed_faces():
+    """インストール済みの書体の一覧と、それを引いた使い回しの FontSet を捨てる。"""
+    gf._installed_faces.cache_clear()
+    gf._shared_font_set.cache_clear()
 
 
 def test_installed_fontworks_faces_are_used(fake_fontworks):
-    gf.set_preset("rodin")
-    heading = gf.make_font("heading", 22, 800)
-    numeral = gf.make_font("numeral", 22, 800)
-    text = gf.make_font("text", 15, 700)
+    fonts = gf.FontSet("rodin")
+    heading = fonts.font("heading", 22, 800)
+    numeral = fonts.font("numeral", 22, 800)
+    text = fonts.font("text", 15, 700)
     assert heading.families()[0] == fake_fontworks["rodin"]
     assert numeral.families()[0] == fake_fontworks["udlarge"]
     assert text.families()[0] == fake_fontworks["udlarge"]
@@ -168,31 +165,40 @@ def test_installed_fontworks_faces_are_used(fake_fontworks):
 
 
 def test_system_preset_keeps_the_old_fonts(fake_fontworks):
-    gf.set_preset("system")
-    font = gf.make_font("heading", 22, 800)
+    font = gf.FontSet("system").font("heading", 22, 800)
     assert font.families()[0] == "Hiragino Sans"
     assert font.weight() == 800
 
 
 def test_missing_heading_falls_back_to_mincho_then_gothic(fake_fontworks):
-    gf.set_preset("tsukushi")  # 筑紫A見出ミンは登録していない
-    font = gf.make_font("heading", 22, 800)
+    fonts = gf.FontSet("tsukushi")  # 筑紫A見出ミンは登録していない
+    font = fonts.font("heading", 22, 800)
     assert font.families()[:2] == ["Hiragino Mincho ProN", "ヒラギノ明朝 ProN"]
-    assert gf.make_font("numeral", 22, 800).families()[0] == fake_fontworks["udlarge"]
+    assert fonts.font("numeral", 22, 800).families()[0] == fake_fontworks["udlarge"]
 
 
 def test_report_lists_the_found_faces(fake_fontworks):
-    gf.set_preset("rodin")
-    report = gf._report()
+    report = gf._report("rodin")
     assert fake_fontworks["rodin"] in report
-    assert "（今の設定）" in report
+    assert "rodin: 見出し ロダン／数字・文字 UD角ゴ_ラージ（選んだ組）" in report
+    # 見つからない役は、代わりの並びを出す（筑紫A見出ミンは登録していない）
+    assert "見つからない → Hiragino Mincho ProN → ヒラギノ明朝 ProN → Hiragino Sans" in report
 
 
-def test_widget_uses_the_heading_font_for_the_title(fake_fontworks):
-    from app.gauge import scene as sc
-    from app.gauge.widget import _run_font
-    from app.shell import theme
+def test_window_takes_the_preset_and_begin_changes_it(fake_fontworks):
+    from app.gauge.window import GaugeWindow
 
-    gf.set_preset("rodin")
-    font = _run_font(sc.Run("上肢の仕事量", 22, 800, theme.TEXT), "header_title")
-    assert font.families()[0] == fake_fontworks["rodin"]
+    window = GaugeWindow(font_preset="tsukushi")
+    try:
+        assert window.gauge.font_set is gf.font_set("tsukushi")
+        window.begin(show_joules=True)  # 渡さなければ今の組のまま
+        assert window.gauge.font_set.name == "tsukushi"
+
+        window.begin(show_joules=True, font_preset="rodin")
+        fonts = window.gauge.font_set
+        assert fonts.name == "rodin"
+        # 見出し帯の題（header_title）は見出しの書体で描く
+        title = fonts.font(gf.role_for_label("header_title"), 22, 800)
+        assert title.families()[0] == fake_fontworks["rodin"]
+    finally:
+        window.close()
