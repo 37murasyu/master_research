@@ -53,6 +53,7 @@ from app.tuning.ekf_profile import builtin_entry, resolve_profile  # noqa: E402
 from app.tuning.raw_capture import (  # noqa: E402
     HYBRID_RETRI_SOURCE, RawCaptureWriter, read_raw_capture, sidecar_path)
 from tools.parse_fps_stats import parse_file  # noqa: E402
+from tools.record_stereo import read_frame_timing, timing_warnings  # noqa: E402
 
 JOINTS = ("wrist_R", "elbow_R", "wrist_L", "elbow_L")
 CALIB_FILES = ("c0.dat", "c1.dat", "rot_trans_c0.dat", "rot_trans_c1.dat")
@@ -929,6 +930,12 @@ def format_report(report: Mapping[str, Any]) -> str:
         for role, shares in sorted(q.get("inside", {}).items()):
             lines.append(f"  {ROLE_NAMES.get(role, role)} の画面内: " + "、".join(f"{n} {v:.0%}" for n, v in shares.items()))
         lines.append("  肩幅は巻尺で測った値と比べる（mobile/README.md の目安は ±2 cm）")
+    if report.get("recording"):
+        r = report["recording"]
+        lines.append(f"[録画] 間隔 中央値 {r['median_interval_ms']:.1f} ms / 最大 {r['max_interval_ms']:.0f} ms、"
+                     f"穴 {r['gaps']} か所（取りこぼし約 {r['missing_frames']} フレーム）、左右のずれ 最大 "
+                     f"{_fmt(r['max_skew_ms'], '.1f')} ms / 95% {_fmt(r['p95_skew_ms'], '.1f')} ms")
+        lines.extend(f"  [警告] {warning}" for warning in timing_warnings(r))
     if report.get("kind") == "hybrid":
         h = report.get("hybrid", {})
         lines.append(f"[§3-2 記録] status={h.get('status')}、止まった理由 {h.get('stop_reason')}、"
@@ -1074,6 +1081,11 @@ def _replay(args) -> int:
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     base = gui_environment(Settings.load(Settings.default_path()), stop_file)
     dt_sec = dt_override(meta, args.fixed_hz, base) if meta else None
+    # 録画の穴と左右のずれは DT_SEC では直せない（再生は 1 フレームの間隔で並べ、同じ番号を組にする）ので、数えて警告する。
+    # meta に数の無い古い録画もあるので frames.csv から数え直す
+    recording = read_frame_timing(session) if session is not None else None
+    for warning in timing_warnings(recording):
+        print(f"[WARN] {warning}", flush=True)
     env = replay_environment(
         base,
         cam0=Path(cam0).resolve(), cam1=Path(cam1).resolve(), calib=Path(calib).resolve(), out_dir=out_dir,
@@ -1115,6 +1127,7 @@ def _replay(args) -> int:
     report = check_run(out_dir, log=log_path, timestamp=timestamp, expect_stop=bool(args.stop_after_sec),
                        expect_profile=bool(args.ekf_profile))
     report["exit_code"] = code
+    report["recording"] = recording
     report["replay"] = {"cam0": str(cam0), "cam1": str(cam1), "calib": str(calib), "fixed_hz": args.fixed_hz,
                         "dt_sec": dt_sec, "subject": args.subject, "stop_after_sec": args.stop_after_sec,
                         "recording_meta": meta or None}

@@ -10,7 +10,10 @@
 - ``cam0_<ts>.avi`` と ``cam1_<ts>.avi``（既定は MJPG。圧縮の劣化で S6 の雑音の推定がずれないように）
 - 校正ファイル 4 つのコピー（``--calib`` から）
 - ``frames.csv``: フレームごとの grab 完了時刻（``time.monotonic_ns``）と左右の差
-- ``meta.json``: 大きさ、容器の fps、実測の fps、止まった理由など
+- ``meta.json``: 大きさ、容器の fps、実測の fps、録画の穴と左右のずれ（``frame_timing``）、止まった理由など
+
+録画の穴（USB の取りこぼしで間隔が空いた所）と左右のずれは、再生では直せない（再生は動画のフレームを 1 フレームの
+間隔で並べ、同じ番号のフレームを組にする）。終わりに数えて警告する。``tools/verify_run.py replay`` の報告にも出す。
 
 止め方: 停止ファイル（``--stop-file`` か ``APP_STOP_FILE``）、SIGTERM、Ctrl-C、プレビューで q か ESC、
 ``--duration``、``--max-frames``、カメラの失敗。どれで止めても動画を閉じて ``meta.json`` を書く。
@@ -35,9 +38,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Sequence
 
 # pylint: disable=no-member
 import cv2 as cv
+import numpy as np
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +63,8 @@ SETTINGS_PATH = REPO_ROOT / "calibration_settings.yaml"
 # 実測の fps が容器の fps からこれ以上ずれたら警告する（再生では dt が容器の fps から決まるため）
 FPS_TOLERANCE = 0.05
 WARMUP_FRAMES = 5
+# 隣り合うフレームの間隔が、間隔の中央値のこの倍を超えたら録画の穴（取りこぼし）と数える
+GAP_FACTOR = 1.5
 PROGRESS_EVERY = 150
 EXIT_SETUP_FAILED = 2
 
@@ -173,6 +180,61 @@ def _measured_fps(times_ns: list[int]) -> float | None:
     return (len(times_ns) - 1) / ((times_ns[-1] - times_ns[0]) / 1e9)
 
 
+def frame_timing(t0_ns: Sequence[float], skew_ms: Sequence[float]) -> dict[str, Any] | None:
+    """``frames.csv`` の時刻から、録画の穴（取りこぼし）と左右のずれを数える。間隔が取れなければ None。
+
+    - 穴: cam0 の grab の間隔が中央値の ``GAP_FACTOR`` 倍を超えた所。取りこぼした数は「間隔 ÷ 中央値 − 1」の四捨五入の和
+    - 左右のずれ: cam1 − cam0 の grab 完了時刻の差の絶対値。中央値の間隔の半分を超えたフレームを数える
+      （再生は同じ番号のフレームを組にするので、半フレームを超えると隣の時刻と組になっているのに近い）
+    """
+    t = np.asarray(t0_ns, dtype=float)
+    steps = np.diff(t) / 1e6
+    positive = steps[np.isfinite(steps) & (steps > 0)]
+    if not positive.size:
+        return None
+    median = float(np.median(positive))
+    gaps = positive[positive > GAP_FACTOR * median]
+    skew = np.abs(np.asarray(skew_ms, dtype=float))
+    skew = skew[np.isfinite(skew)]
+    return {
+        "median_interval_ms": median,
+        "max_interval_ms": float(positive.max()),
+        "gaps": int(gaps.size),
+        "missing_frames": int(np.maximum(np.rint(gaps / median) - 1, 0).sum()),
+        "max_skew_ms": float(skew.max()) if skew.size else None,
+        "p95_skew_ms": float(np.percentile(skew, 95)) if skew.size else None,
+        "skewed_frames": int(np.sum(skew > median / 2.0)),
+    }
+
+
+def read_frame_timing(session: str | Path) -> dict[str, Any] | None:
+    """録画のフォルダの ``frames.csv`` から ``frame_timing`` を数え直す（meta に数の無い古い録画にも使う）。"""
+    path = Path(session) / "frames.csv"
+    if not path.is_file():
+        return None
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    return frame_timing([float(r["t0_ns"]) for r in rows], [float(r["skew_ms"]) for r in rows])
+
+
+def timing_warnings(timing: dict[str, Any] | None) -> list[str]:
+    """``frame_timing`` の警告の文（無ければ空）。"""
+    if not timing:
+        return []
+    warnings = []
+    if timing["gaps"]:
+        warnings.append(
+            f"録画に穴が {timing['gaps']} か所（最大の間隔 {timing['max_interval_ms']:.0f} ms、ふだんは "
+            f"{timing['median_interval_ms']:.1f} ms、取りこぼし約 {timing['missing_frames']} フレーム）。再生はフレームを "
+            "1 フレームの間隔で並べるので、その区間の時間が詰まる。USB の帯域（MJPG）・ほかの負荷を確かめて撮り直す")
+    if timing["skewed_frames"]:
+        warnings.append(
+            f"左右の撮影時刻のずれが半フレーム（{timing['median_interval_ms'] / 2:.1f} ms）を超えたフレームが "
+            f"{timing['skewed_frames']}（最大 {timing['max_skew_ms']:.1f} ms、95% {timing['p95_skew_ms']:.1f} ms）。"
+            "再生は同じ番号のフレームを組にするので、その間は左右の時刻が合わない")
+    return warnings
+
+
 def build_parser(defaults: SimpleNamespace) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="2 台の USB カメラの全フレームを録画する（計測に読み込ませて確かめる用）")
     parser.add_argument("--cam0", default=defaults.cam0, help="cam0 の番号かパス（既定は calibration_settings.yaml）")
@@ -231,7 +293,7 @@ def main(argv=None, open_camera=open_camera) -> int:
     stop.install_signal_handlers()
 
     times0: list[int] = []
-    skews: list[float] = []
+    skews: list[float] = []   # cam1 − cam0 [ms]（frames.csv の skew_ms と同じ符号付き）
     started = datetime.now().isoformat(timespec="seconds")
     t_start = time.monotonic_ns()
     frames, reason = 0, "setup_failed"
@@ -247,7 +309,7 @@ def main(argv=None, open_camera=open_camera) -> int:
             skew = round((t1 - t0) / 1e6, 3)
             rows.writerow([index, t0, t1, skew])
             times0.append(t0)
-            skews.append(abs(skew))
+            skews.append(skew)
             if index and index % PROGRESS_EVERY == 0:
                 fps_now = _measured_fps(times0)
                 print(f"[REC] {index} フレーム（{fps_now:.1f} fps）", flush=True)
@@ -278,6 +340,7 @@ def main(argv=None, open_camera=open_camera) -> int:
             signal.signal(num, handler)
         measured = _measured_fps(times0)
         fps_off = measured is not None and abs(measured - args.fps) / args.fps > FPS_TOLERANCE
+        timing = frame_timing(times0, skews)
         meta = {
             "label": args.label,
             "timestamp": timestamp,
@@ -287,7 +350,8 @@ def main(argv=None, open_camera=open_camera) -> int:
             "container_fps": float(args.fps),
             "measured_fps": measured,
             "fps_mismatch": bool(fps_off),
-            "max_skew_ms": max(skews) if skews else None,
+            "max_skew_ms": max(abs(s) for s in skews) if skews else None,
+            "frame_timing": timing,
             "codec": fourcc,
             "backends": [_backend_name(cap) for cap in cameras],
             "videos": [path.name for path in videos],
@@ -304,6 +368,8 @@ def main(argv=None, open_camera=open_camera) -> int:
     if fps_off:
         print(f"[WARN] 実測 {measured:.2f} fps が動画の {args.fps:g} fps と {FPS_TOLERANCE:.0%} 以上ずれた。"
               f"再生では DT_SEC={1.0 / measured:.5f} を渡す（tools/verify_run.py replay は自動で渡す）")
+    for warning in timing_warnings(timing):
+        print(f"[WARN] {warning}")
     if reason.startswith("error"):
         print(f"[ERROR] 録画が途中で止まった: {reason}", file=sys.stderr)
         return 1

@@ -379,6 +379,40 @@ class TestReplayRefusesBadInput:
         assert code == 2
 
 
+class TestReplayReportsTheRecording:
+    """録画の穴（USB の取りこぼし）と左右のずれは、再生の DT_SEC では直せない（再生は 1 フレームの間隔で並べ直す）。
+    record_stereo の frames.csv から数え直して再生の報告に出し、警告する（meta に数の無い古い録画も）。"""
+
+    def test_a_stall_in_the_recording_is_reported(self, tmp_path, monkeypatch, capsys):
+        from test_record_stereo import FakeCamera, _fake_times, _run
+        from tools import record_stereo as rs
+
+        cameras = [FakeCamera(12), FakeCamera(12)]
+        monkeypatch.setattr(rs, "_timed_grab", _fake_times(cameras, stall_after=6))
+        _, session = _run(tmp_path, cameras)
+        meta_path = session / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta.pop("frame_timing")   # 数を meta に残す前の録画
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        class FinishedProcess:
+            stdout = iter(())
+
+            def wait(self):
+                return 0
+
+            def poll(self):
+                return 0
+
+        monkeypatch.setattr(vr.subprocess, "Popen", lambda *args, **kwargs: FinishedProcess())
+        out = tmp_path / "out"
+        vr.main(["replay", "--session", str(session), "--subject", "7", "--out", str(out)])
+        report = json.loads((out / "verify_report.json").read_text(encoding="utf-8"))
+        assert report["recording"]["gaps"] == 1 and report["recording"]["missing_frames"] == 6
+        text = capsys.readouterr().out
+        assert "[録画]" in text and "穴が 1 か所" in text
+
+
 class TestDtOverride:
     def test_no_override_when_the_camera_kept_its_rate(self):
         assert vr.dt_override({"container_fps": 30.0, "measured_fps": 29.9}, fixed_hz=False) is None
