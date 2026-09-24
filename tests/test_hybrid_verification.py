@@ -387,6 +387,20 @@ class TestPlacementAndQuality:
         assert "有限の長さが無い" in _check(report, QUALITY["forearm"])["detail"]
         vr.format_report(report)
 
+    def test_a_camera_without_any_point_fails_the_rate_and_the_frame(self, tmp_path):
+        """Mac が人を見つけない（別のカメラ番号を開いた）と、landmarks2d に Mac の行が 1 つも無い。残った Pixel だけで
+        「Mac・Pixel とも」の速さと「両カメラの画面内」を合格にしない。"""
+        run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
+        marks = next(run.glob("landmarks2d_*.csv"))
+        table = pd.read_csv(marks)
+        table[table.role != "cam0"].to_csv(marks, index=False)
+        report = vr.check_run(run)
+        rate = _check(report, "速さ: Mac・Pixel とも 24 fps 以上（30 fps の 8 割）")
+        assert not rate["ok"] and "Mac（cam0）の点が無い" in rate["detail"]
+        inside = _check(report, QUALITY["inside"])
+        assert not inside["ok"] and "Mac の点が無い" in inside["detail"]
+        assert report["fps"]["real_share"] == 0.0
+
     def test_hands_out_of_the_frame_are_named(self, tmp_path):
         run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
         marks = next(run.glob("landmarks2d_*.csv"))

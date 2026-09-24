@@ -420,9 +420,11 @@ def _quality_checks(quality: Mapping[str, Any], add) -> None:
             ("、".join(narrow) + f"（基線 {quality['baseline_cm']:.1f} cm。被写体を近づけるか 2 台の間を広げ、"
              f"被写体を 2 台の中間の正面に置いて校正し直す。docs/hybrid_field_run.md の表）") if narrow else "")
     if "inside" in quality:
+        # 片方のカメラの点が 1 つも無ければ、残った 1 台だけで「両カメラ」を合格にしない
+        absent = [f"{ROLE_NAMES[role]} の点が無い" for role in ROLE_NAMES if role not in quality["inside"]]
         cut = [f"{ROLE_NAMES.get(role, role)} の{name} {share:.0%}" for role, shares in sorted(quality["inside"].items())
                for name, share in shares.items() if share < MIN_INSIDE_SHARE]
-        add("配置: 肘・手首が両カメラの画面内にある割合 95% 以上", not cut, "、".join(cut))
+        add("配置: 肘・手首が両カメラの画面内にある割合 95% 以上", not absent and not cut, "、".join(absent + cut))
 
 
 def _hybrid_ekf_stats(capture, kpts_path: Path, frames: pd.DataFrame, base_dir: Path | None = None) -> dict[str, Any]:
@@ -574,15 +576,19 @@ def check_hybrid_run(folder: Path, log: str | Path | None = None, expect_stop: b
                 role_steps = _intervals(np.sort(group["t_ns"].to_numpy(float)) / 1e9)
                 role_frames[role] = int(len(group))
                 role_fps[role] = 1.0 / float(np.median(role_steps)) if role_steps.size else None
+        # 2 台ともそろって初めて「Mac・Pixel とも」。片方の点が 1 つも無い（人を見つけない・別のカメラ）なら不合格
+        absent = [role for role in ROLE_NAMES if role not in role_fps]
         slow = {role: fps for role, fps in role_fps.items() if fps is None or fps < MIN_CAMERA_FPS}
-        detail = "、".join(f"{ROLE_NAMES.get(role, role)}（{role}）{_fmt(fps, '.1f')} fps" for role, fps in sorted(slow.items()))
-        add(f"速さ: Mac・Pixel とも {MIN_CAMERA_FPS:g} fps 以上（30 fps の 8 割）", bool(role_fps) and not slow,
-            detail or ("landmarks2d が無い" if not role_fps else ""))
+        detail = "、".join([f"{ROLE_NAMES[role]}（{role}）の点が無い" for role in absent]
+                          + [f"{ROLE_NAMES.get(role, role)}（{role}）{_fmt(fps, '.1f')} fps" for role, fps in sorted(slow.items())])
+        add(f"速さ: Mac・Pixel とも {MIN_CAMERA_FPS:g} fps 以上（30 fps の 8 割）", not absent and not slow,
+            "landmarks2d が無い" if not role_fps else detail)
         period = float(np.median(steps)) if steps.size else None
         report["fps"] = {
             "processed_fps": 1.0 / period if period else None,
-            # 組のうち、遅い方のカメラの実測に基づく割合。残りは同期バッファの線形補間で作った点
-            "real_share": min(1.0, min(role_frames.values()) / len(frames)) if role_frames and len(frames) else None,
+            # 組のうち、遅い方のカメラの実測に基づく割合。残りは同期バッファの線形補間で作った点（点の無いカメラは 0）
+            "real_share": (min(1.0, min(role_frames.get(role, 0) for role in ROLE_NAMES) / len(frames))
+                           if role_frames and len(frames) else None),
             # 同期バッファが 100 ms を超える穴で組を作らなかった時間（組の間隔が 1.5 倍を超えた分）
             "missing_s": float(steps[steps > 1.5 * period].sum()) if period else None,
             "interval_p05": float(np.percentile(steps, 5)) if steps.size else None,
