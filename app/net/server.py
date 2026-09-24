@@ -30,7 +30,7 @@ import websockets
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 from app.net import protocol as p
-from app.net.sync_buffer import DEFAULT_GRID, GridSpec, PairedSample, SyncBuffer
+from app.net.sync_buffer import DEFAULT_GRID, DEFAULT_WINDOW_SEC, GridSpec, PairedSample, SyncBuffer
 
 __all__ = [
     "SessionHandler",
@@ -578,7 +578,7 @@ def main() -> int:
     parser.add_argument("--host", default="0.0.0.0", help="待ち受けアドレス")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--hz", type=float, default=DEFAULT_GRID.target_hz, help="再標本化するグリッド周波数")
-    parser.add_argument("--window", type=float, default=2.0, help="バッファの時間窓（秒）")
+    parser.add_argument("--window", type=float, default=DEFAULT_WINDOW_SEC, help="バッファの保持時間（秒）")
     parser.add_argument("--max-gap-ms", type=float, default=DEFAULT_GRID.max_gap_ms, help="補間を許す最大欠測幅")
     parser.add_argument("--no-qr", action="store_true", help="QR コードを表示しない")
     args = parser.parse_args()

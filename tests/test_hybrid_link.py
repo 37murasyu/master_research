@@ -272,3 +272,14 @@ def test_mode_switch_does_not_use_delayed_preview_for_calibration():
     current = link._scheduler.next_request()
     link._handle_capture(p.CalibrationFrame('cam1', current.id, 2, 1280, 720, b'jpeg'))
     assert link.take_capture().id == current.id
+
+
+def test_link_keeps_the_buffer_default_window():
+    """PhoneLink の同期バッファの保持時間は、同期バッファの既定（Wi-Fi の詰まりの後にまとめて届く点を組にできる長さ）。
+
+    以前は PhoneLink が 2 s を直書きしており、3 s 以上の詰まりの後の点が組にならなかった。
+    """
+    from app.net.sync_buffer import SyncBuffer
+
+    link = PhoneLink(port=0)
+    assert link._server.buffer.window_ns == SyncBuffer().window_ns

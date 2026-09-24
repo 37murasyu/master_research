@@ -28,7 +28,7 @@ from typing import Callable, Iterable
 
 from app.net import protocol as p
 from app.net.server import DEFAULT_PORT, LandmarkServer, check_injectable, local_ip
-from app.net.sync_buffer import DEFAULT_GRID, GridSpec, PairedSample, SyncBuffer
+from app.net.sync_buffer import DEFAULT_GRID, DEFAULT_WINDOW_SEC, GridSpec, PairedSample, SyncBuffer
 
 __all__ = [
     "CALIBRATION",
@@ -178,7 +178,7 @@ class PhoneLink:
         host: str = "0.0.0.0",
         port: int = DEFAULT_PORT,
         advertise_host: str | None = None,
-        window_sec: float = 2.0,
+        window_sec: float = DEFAULT_WINDOW_SEC,
         grid: GridSpec = DEFAULT_GRID,
         on_pairs: PairsCallback | None = None,
         on_landmarks: LandmarksCallback | None = None,
