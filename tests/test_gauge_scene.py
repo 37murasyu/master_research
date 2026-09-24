@@ -207,6 +207,27 @@ def test_null_band_with_value_still_shows_number_when_joules_on():
     assert scene.find("value_rim", "elbow_L") == []
 
 
+def test_negative_value_is_shown_as_zero():
+    """設計書 §7「値が NaN・負: 0 として描く」。中央の数字も弧と同じく 0 にする。"""
+    parts = {"elbow_L": PartReading(now=-5.0, prev=None, band=BAND)}
+    scene = sc.build_scene(_running_state(parts, show_joules=True))
+
+    assert [run.text for label in scene.find("value_text", "elbow_L") for run in label.runs] == ["0", " J"]
+
+
+def test_decoded_band_with_non_positive_upper_edge_does_not_break_the_scene():
+    """子の行の帯の上端が 0 以下なら帯なしとして描く（割合の分母が 0 になり、場面の組み立てが落ちていた）。"""
+    from app.gauge import protocol
+
+    line = ('@@GAUGE {"v":2,"link":"connected","rep":0,"source":"measure",'
+            '"parts":{"elbow_L":{"now":1.0,"prev":null,"band":[-1.0,0.0],"w1rm":null}}}\n')
+    frame = protocol.decode(line)
+    scene = sc.build_scene(gm.apply_frame(gm.reset(True), frame))
+
+    assert scene.find("band", "elbow_L") == []
+    assert len(scene.find("groove", "elbow_L")) == 1
+
+
 def test_null_now_draws_no_value():
     parts = {"elbow_L": PartReading(now=None, prev=None, band=BAND)}
     state = _running_state(parts)

@@ -153,13 +153,18 @@ def _is_number(value: Any) -> bool:
 
 
 def _decode_band(raw: Any) -> tuple[float, float] | None:
+    """``[lo, hi]`` で ``lo < hi`` かつ ``hi > 0`` のものだけを帯にする。
+
+    上端は弧の割合 ``now / (1.25·hi)``（``model.fraction``・``scene.build_scene``）の分母になるので、
+    0 以下を通すと場面の組み立てが ZeroDivisionError で落ちる（正の仕事の帯なので正しい送り主は出さない）。
+    """
     if not isinstance(raw, (list, tuple)) or len(raw) != 2:
         return None
     lo, hi = raw[0], raw[1]
     if not (_is_number(lo) and _is_number(hi)):
         return None
     lo_f, hi_f = float(lo), float(hi)
-    if not lo_f < hi_f:
+    if not (lo_f < hi_f and hi_f > 0):
         return None
     return (lo_f, hi_f)
 

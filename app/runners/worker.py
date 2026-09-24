@@ -48,12 +48,15 @@ class WorkerRunner(QtCore.QObject):
 
     output = QtCore.Signal(str)
     gauge_frame = QtCore.Signal(object)  # app.gauge.protocol.GaugeFrame
-    state_changed = QtCore.Signal(str)  # "starting" / "running" / "stopped"
+    # "starting" / "running" / "stopping"（停止を求め、子が終わるのを待っている）/ "stopped"
+    state_changed = QtCore.Signal(str)
     finished = QtCore.Signal(int)  # 終了コード
 
     # 停止要求からの猶予。これを過ぎたら強制終了する。
     # 計測終了時に CSV を書き出すので、その時間は待つ必要がある。
     GRACE_MS = 10_000
+    # 強制終了した後、閉じるときに子の終わりを待つ長さ
+    KILL_WAIT_MS = 2_000
 
     def __init__(self, role: str = "realtime", parent: QtCore.QObject | None = None):
         super().__init__(parent)
@@ -68,6 +71,12 @@ class WorkerRunner(QtCore.QObject):
         # 子の標準出力から、ゲージの行と普通のログ行を解く。start のたびにリセットする
         # （前回の実行の、改行が来ないまま終わった断片を次の実行に持ち越さないため）。
         self._demux = LineDemux()
+        # 停止を求めてから強制終了するまでの猶予を数える。待つ間も GUI を固めない（stop）
+        self._grace_timer = QtCore.QTimer(self)
+        self._grace_timer.setSingleShot(True)
+        self._grace_timer.timeout.connect(self._kill)
+        # 停止を求めた後、子が終わるまで真。2 回目の stop を何もしないため
+        self._stopping = False
 
     # -- 操作 --------------------------------------------------------------
     @property
@@ -92,6 +101,7 @@ class WorkerRunner(QtCore.QObject):
             return False
 
         self._demux.reset()
+        self._stopping = False
 
         command = entry.worker_command(self.role, passthrough, module=module)
         # 穏やかな停止に対応するワーカーへ停止ファイルを渡す。
@@ -124,8 +134,13 @@ class WorkerRunner(QtCore.QObject):
         self.state_changed.emit("running")
         return True
 
+    @property
+    def is_stopping(self) -> bool:
+        """停止を求め、子が終わるのを待っているところか。"""
+        return self._stopping
+
     def stop(self) -> None:
-        """穏やかに止める。応じなければ強制終了する。
+        """穏やかに止めるよう求めて、すぐ戻る。猶予（``GRACE_MS``）を過ぎても終わらなければ強制終了する。
 
         計測終了時に 3D 座標とトルクの CSV を書き出すので、
         いきなり kill すると成果物が失われる。
@@ -135,9 +150,15 @@ class WorkerRunner(QtCore.QObject):
         POSIX の SIGTERM ではハンドラが無く即死し、Windows では WM_CLOSE がコンソールに届かず、
         どちらでも CSV が書かれなかった（KNOWN_ISSUES §3-2）。停止ファイルを見ない役割
         （キャリブレーション・解析スクリプト）には従来どおり ``terminate()`` を送る。
+
+        子の終わりは待たない（``finished`` で知る）。かつては ``waitForFinished`` で GUI が最大 10 秒固まり、
+        その間の 2 回目のクリックが停止の後に「計測を開始」として届いて計測をやり直していた。待つ間は
+        ``state_changed("stopping")`` を出し、猶予は QTimer で数える。待つ間の 2 回目の stop は何もしない。
+        窓を閉じるときのように、子が終わるまで待つ必要があるなら ``stop_and_wait``。
         """
-        if not self.is_running:
+        if not self.is_running or self._stopping:
             return
+        self._stopping = True
 
         self.output.emit("[停止] 終了を要求しました。CSV の書き出しを待ちます。\n")
         stop_file = self._stop_file()
@@ -146,12 +167,32 @@ class WorkerRunner(QtCore.QObject):
         else:
             self._process.terminate()
 
-        if not self._process.waitForFinished(self.GRACE_MS):
-            self.output.emit("[停止] 応答が無いため強制終了します。\n")
-            self._process.kill()
-            self._process.waitForFinished(2000)
+        self._grace_timer.start(self.GRACE_MS)
+        self.state_changed.emit("stopping")
+
+    def stop_and_wait(self) -> None:
+        """止めて、子が終わるまで待つ（窓を閉じるとき。子を残さない）。猶予を過ぎたら強制終了する。
+
+        既に停止を求めていれば、その猶予の残りだけ待つ。
+        """
+        if not self.is_running:
+            return
+        self.stop()
+        remaining = self._grace_timer.remainingTime()  # 猶予が切れて強制終了した後は -1
+        if remaining > 0 and self._process.waitForFinished(remaining):
+            return
+        self._kill()
+        self._process.waitForFinished(self.KILL_WAIT_MS)
 
     # -- 内部 --------------------------------------------------------------
+    def _kill(self) -> None:
+        """猶予を過ぎても終わらない子を強制終了する。終わったことは ``finished`` で知る。"""
+        self._grace_timer.stop()
+        if not self.is_running:
+            return
+        self.output.emit("[停止] 応答が無いため強制終了します。\n")
+        self._process.kill()
+
     def _stop_file(self) -> str | None:
         return None if self._stop_dir is None else str(Path(self._stop_dir) / "stop")
 
@@ -177,6 +218,8 @@ class WorkerRunner(QtCore.QObject):
             self.gauge_frame.emit(frame)
 
     def _on_finished(self, exit_code: int, exit_status) -> None:
+        self._grace_timer.stop()
+        self._stopping = False
         self._drain_output()
         # 改行が来ないまま終わった行の断片（あれば）も、最後にログへ出す。
         tail = self._demux.flush()

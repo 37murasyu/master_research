@@ -87,6 +87,19 @@ def _fake_start(monkeypatch, page, ok: bool = True) -> list[str]:
     return calls
 
 
+def _wait_until(qt_app, predicate, timeout_s: float) -> bool:
+    """イベントを回しながら ``predicate`` が真になるのを待つ（子の終了はイベントで届く）。"""
+    import time
+
+    from app.core.qt import QtCore
+
+    deadline = time.monotonic() + timeout_s
+    while not predicate() and time.monotonic() < deadline:
+        qt_app.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        time.sleep(0.01)
+    return predicate()
+
+
 def _frame(rep: int = 2, link: str = "connected") -> GaugeFrame:
     reading = PartReading(now=50.0, prev=40.0, band=(60.0, 80.0))
     return GaugeFrame(link=link, rep=rep, parts={"elbow_L": reading})
@@ -122,9 +135,11 @@ def _start_replay(monkeypatch, page, tmp_path) -> list[str]:
 class TestMainButton:
     def test_main_button_swaps_label_with_state(self, page):
         assert page._main_button.text() == "計測を開始"
-        for state, label in (("starting", "停止"), ("running", "停止"), ("stopped", "計測を開始")):
+        for state, label, enabled in (("starting", "停止", True), ("running", "停止", True),
+                                      ("stopping", "停止中…", False), ("stopped", "計測を開始", True)):
             page._runner.state_changed.emit(state)
             assert page._main_button.text() == label, state
+            assert page._main_button.isEnabled() is enabled, state
 
     def test_main_button_stays_enabled_while_running(self, page):
         from app.core.qt import QtWidgets
@@ -134,7 +149,7 @@ class TestMainButton:
         buttons = [b.text() for b in page.findChildren(QtWidgets.QPushButton)]
         assert buttons.count("停止") == 1, f"主ボタンのほかに停止ボタンが残っている: {buttons}"
 
-    def test_main_button_starts_then_stops(self, page, monkeypatch):
+    def test_main_button_starts_then_stops(self, qt_app, page, monkeypatch):
         from app import entry
 
         monkeypatch.setattr(
@@ -147,9 +162,51 @@ class TestMainButton:
         assert page.is_running, "主ボタンで開始していない"
         assert page._main_button.text() == "停止"
 
-        page._main_button.click()  # 停止ファイルを置き、子が抜けるのを待つ
-        assert not page.is_running, "主ボタンで停止していない"
+        page._main_button.click()  # 停止ファイルを置いてすぐ戻る。子が抜けるのはイベントで知る
+        assert page._main_button.text() == "停止中…"
+        assert _wait_until(qt_app, lambda: not page.is_running, 10), "主ボタンで停止していない"
         assert page._main_button.text() == "計測を開始"
+        assert page._main_button.isEnabled()
+
+    def test_clicks_while_stopping_do_not_start_again(self, qt_app, page, monkeypatch):
+        """停止を待つ間に押された 2 回目は、停止の後に「計測を開始」として届いてはいけない。
+
+        かつては停止が waitForFinished で GUI を最大 10 秒固め、その間に OS が溜めたクリックが
+        停止の後に届いて計測をやり直していた。
+        """
+        import time
+
+        from app import entry
+        from app.core.qt import QtCore, QtGui
+
+        starts = []
+
+        def command(role, passthrough=None, module=None):
+            starts.append(role)
+            return [sys.executable, "-c", _CHILD_WAITS_FOR_STOP_FILE + "time.sleep(1.0)\n"]
+
+        monkeypatch.setattr(entry, "worker_command", command)
+        _choose_input(page, USB)
+        button = page._main_button
+        button.click()
+        assert page.is_running
+
+        t0 = time.monotonic()
+        button.click()  # 停止
+        assert time.monotonic() - t0 < 0.5, "停止が GUI を固めている"
+        assert not button.isEnabled(), "停止を待つ間に主ボタンが押せる"
+        # 利用者の 2 回目のクリック（押す・離す）
+        center = QtCore.QPointF(button.rect().center())
+        for kind in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease):
+            buttons = QtCore.Qt.LeftButton if kind == QtCore.QEvent.MouseButtonPress else QtCore.Qt.NoButton
+            QtCore.QCoreApplication.postEvent(button, QtGui.QMouseEvent(
+                kind, center, button.mapToGlobal(center), QtCore.Qt.LeftButton, buttons, QtCore.Qt.NoModifier))
+        button.click()
+
+        assert _wait_until(qt_app, lambda: not page.is_running, 10)
+        _wait_until(qt_app, lambda: False, 0.3)  # 溜まったイベントを流し切る
+        assert starts == [USB], "停止を待つ間のクリックで計測をやり直した"
+        assert not page.is_running and button.text() == "計測を開始"
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +901,18 @@ class TestReplayInput:
         page._runner.state_changed.emit("stopped")
         page._runner.finished.emit(0)
         assert window.gauge.state.phase is gm.Phase.DONE
+
+
+def test_opening_the_page_leaves_the_default_body_mass_out_of_the_saved_differences(qt_app):
+    """欄の 65.0 を設定に入れ直しても、既定の "65" と同じ値なので差分にしない（毎回保存されていた）。"""
+    from app.shell.page_measure import MeasurePage
+
+    settings = Settings()
+    page = MeasurePage(settings)
+    try:
+        assert "BODY_MASS_KG" not in settings.overrides
+    finally:
+        page.shutdown()
 
 
 @pytest.mark.parametrize("saved, shown", [(300.0, 200.0), (5.0, 20.0), (72.5, 72.5)])

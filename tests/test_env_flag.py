@@ -98,3 +98,31 @@ def test_remaining_flags_use_shared_parser_and_bool_schema(name, default):
     setting = extract(path)[name]
     assert setting["type"] == "bool"
     assert setting["default"] == str(int(default))
+
+
+def _without_lines(payload: dict) -> dict:
+    """生成物から行番号（``lines``）を除いたもの。本体を編集すると行はずれるが、項目・型・既定は変わらない。"""
+    settings = {name: {key: value for key, value in entry.items() if key != "lines"}
+                for name, entry in payload["settings"].items()}
+    return {**payload, "settings": settings}
+
+
+class TestCommittedSchema:
+    """リポジトリの ``settings_schema.json`` は、抽出器で作り直したものと（行番号を除いて）一致する。"""
+
+    def test_regenerating_gives_the_committed_schema(self):
+        import json
+
+        from tools.extract_env_schema import DEFAULT_SOURCES, build_payload
+
+        committed = json.loads((REPO_ROOT / "app" / "core" / "settings_schema.json").read_text(encoding="utf-8"))
+        assert _without_lines(build_payload(DEFAULT_SOURCES)) == _without_lines(committed)
+
+    def test_internal_variables_are_not_settings(self):
+        """``APP_WORKSPACE``（config.py:9）は凍結時にワーカーが自分で決める値で、利用者の設定ではない。"""
+        from app.core.settings import SCHEMA
+        from app.core.workspace import WORKSPACE_ENV
+        from tools.extract_env_schema import extract
+
+        assert WORKSPACE_ENV not in extract(REPO_ROOT / "config.py")
+        assert WORKSPACE_ENV not in SCHEMA

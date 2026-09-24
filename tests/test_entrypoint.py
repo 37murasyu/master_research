@@ -39,6 +39,31 @@ class TestArgumentDispatch:
         with pytest.raises(SystemExit):
             entry.parse_args(["--role", "そんな役割はない"])
 
+    def test_app_options_are_not_abbreviated(self):
+        """``--mod`` が ``--module`` の略として食われ、解析スクリプトへ届かなかった。"""
+        parsed = entry.parse_args(["--role", "script", "--module", "m", "--mod", "x"])
+        assert parsed.module == "m"
+        assert parsed.passthrough == ["--mod", "x"]
+
+
+class TestPassthroughSeparator:
+    """子のスクリプトへ渡す引数は ``--`` の後ろに置き、アプリの引数の解釈に触れさせない（開発・凍結とも）。"""
+
+    @pytest.mark.parametrize("frozen", [False, True], ids=["開発", "凍結"])
+    @pytest.mark.parametrize("extra", [
+        ["--mod", "x"],
+        ["--role", "calibrate"],
+        ["-h"],
+        ["0924_095256", "--base-dir", "/a b/c"],
+        ["--", "x"],
+        [],
+    ])
+    def test_script_arguments_reach_the_script_unchanged(self, monkeypatch, frozen, extra):
+        monkeypatch.setattr(entry.resources, "is_frozen", lambda: frozen)
+        command = entry.worker_command("script", extra, module="compute_local_torque_offline")
+        parsed = entry.parse_args(command[command.index("--role"):])
+        assert (parsed.role, parsed.module, parsed.passthrough) == ("script", "compute_local_torque_offline", extra)
+
 
 class TestWorkerCommand:
     def test_dev_mode_uses_module_invocation(self, monkeypatch):
@@ -81,6 +106,32 @@ class TestWorkerEnvironment:
         monkeypatch.setenv("DEMO_MONO_GAUGE_ON", "1")
         env = entry.worker_environment(Settings())
         assert env["DEMO_MONO_GAUGE_ON"] == "0"
+
+    @pytest.mark.parametrize("name", ["SUBJECT_ID", "CAM0", "CAM1", "ONE_RM_CSV", "POSE_TASK_MODEL", "MP_THREADS"])
+    def test_settings_without_a_default_do_not_leak_from_the_shell(self, monkeypatch, name):
+        """既定値の無い設定は ``as_env`` が渡さないので、親のシェルの値がそのまま子へ漏れていた。
+
+        例えば親に残った SUBJECT_ID で、GUI では空欄のまま別の被験者の 1RM でゲージの帯が決まる。
+        """
+        from app.core.settings import SCHEMA
+
+        assert SCHEMA[name].effective_default is None
+        monkeypatch.setenv(name, "シェルに残った値")
+        assert name not in entry.worker_environment(Settings())
+
+    def test_the_child_writes_unbuffered_utf8(self, monkeypatch):
+        """親は子の出力を UTF-8 で読み、ログを逐次出す（tools/verify_run.py の再生と同じ 3 つ）。"""
+        monkeypatch.setenv("PYTHONIOENCODING", "cp932")
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+        env = entry.worker_environment(Settings())
+        assert (env["PYTHONUNBUFFERED"], env["PYTHONIOENCODING"], env["PYTHONUTF8"]) == ("1", "utf-8", "1")
+
+    def test_settings_without_a_default_are_passed_when_set_in_the_app(self, monkeypatch):
+        monkeypatch.setenv("SUBJECT_ID", "99")
+        settings = Settings()
+        settings.set("SUBJECT_ID", "3")
+        assert entry.worker_environment(settings)["SUBJECT_ID"] == "3"
 
     def test_marks_the_child_as_a_worker(self):
         """子プロセス側から「自分はワーカーだ」と分かるようにしておく。"""

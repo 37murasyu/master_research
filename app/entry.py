@@ -25,7 +25,7 @@ from pathlib import Path
 
 from app.core import resources, workspace
 from app.core.platform_compat import user_output_dir
-from app.core.settings import APP_NAME, OUTPUT_DIR_ENV, Settings, measurement_output_dir
+from app.core.settings import APP_NAME, OUTPUT_DIR_ENV, SCHEMA, Settings, measurement_output_dir
 from app.core.stop_request import STOP_FILE_ENV
 
 __all__ = [
@@ -34,6 +34,7 @@ __all__ = [
     "resolve_module",
     "worker_command",
     "worker_environment",
+    "CHILD_OUTPUT_ENV",
     "run_worker",
     "workspace_dir",
     "ROLES",
@@ -78,11 +79,28 @@ class ParsedArgs:
     passthrough: list[str] = field(default_factory=list)
 
 
+# アプリの引数と、子のスクリプトへ素通しする引数の区切り。``worker_command`` が入れ、``parse_args`` が分ける。
+PASSTHROUGH_SEPARATOR = "--"
+
+
 def parse_args(argv: list[str] | None = None) -> ParsedArgs:
+    """アプリの引数を読む。``--`` より後ろは解釈せず、そのまま子のスクリプトへ渡す。
+
+    区切りが無いときは、知らない引数を従来どおり素通しにする（端末から被験者番号などを付けて起動するとき）。
+    アプリの引数の略記は受けない（``allow_abbrev=False``）。受けると、解析スクリプトの ``--mod`` などが
+    ``--module`` の略として食われる。
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    passthrough: list[str] = []
+    if PASSTHROUGH_SEPARATOR in args:
+        split = args.index(PASSTHROUGH_SEPARATOR)
+        args, passthrough = args[:split], args[split + 1:]
+
     parser = argparse.ArgumentParser(
         prog="app",
         description="車椅子駆動の関節トルク計測アプリ",
         add_help=True,
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--role",
@@ -95,8 +113,8 @@ def parse_args(argv: list[str] | None = None) -> ParsedArgs:
         default=None,
         help="--role script のとき実行するモジュール名（内部用）",
     )
-    known, rest = parser.parse_known_args(argv)
-    return ParsedArgs(role=known.role, module=known.module, passthrough=list(rest))
+    known, rest = parser.parse_known_args(args)
+    return ParsedArgs(role=known.role, module=known.module, passthrough=[*rest, *passthrough])
 
 
 def resolve_module(role: str, module: str | None = None) -> str:
@@ -117,6 +135,13 @@ def resolve_module(role: str, module: str | None = None) -> str:
     return resolved
 
 
+# 子の標準出力の書き方（tools/verify_run.py の再生と同じ 3 つ）。親の環境の値より優先する。
+# - 文字コード: Windows のパイプの既定（cp932）だと、本体の "✅" の print で子が UnicodeEncodeError で落ちる。
+#   PYTHONUTF8 は open() の既定も UTF-8 にする（PYTHONIOENCODING は標準入出力だけ）
+# - ためない: Python はパイプへの出力をためるので、flush しない print は子が終わるまでログに出なかった
+CHILD_OUTPUT_ENV = {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+
+
 def uses_stop_file(role: str) -> bool:
     return role in {"realtime", "hybrid_calibrate", "hybrid_measure", REPLAY_ROLE}
 
@@ -128,6 +153,9 @@ def worker_command(
 
     **既存スクリプトのパスを直接参照しない**。凍結後はファイルとして
     存在しないため。自分自身を役割つきで呼び直す。
+
+    子のスクリプトへの引数は ``--`` の後ろに置く（開発・凍結とも同じ）。アプリの引数（``--role``・
+    ``--module``・``-h``）と同じ名前やその略記があっても、アプリ側で解釈されずにそのまま届く。
     """
     resolve_module(role, module)  # 妥当性の検査
 
@@ -135,7 +163,7 @@ def worker_command(
     if role == SCRIPT_ROLE:
         role_args += ["--module", module or ""]
 
-    extra = list(passthrough or [])
+    extra = [PASSTHROUGH_SEPARATOR, *passthrough] if passthrough else []
     if resources.is_frozen():
         return [sys.executable, *role_args, *extra]
     return [sys.executable, "-m", "app", *role_args, *extra]
@@ -153,13 +181,20 @@ def worker_environment(
     設定は全件を明示的に渡す（``Settings.as_env`` を参照）。差分だけ渡すと、
     渡さなかった項目は既存スクリプト側の既定値が効いてしまう。
 
+    設定の名前（``SCHEMA``）は、親の環境から先にまとめて落とす。既定値の無い設定（SUBJECT_ID・CAM0・
+    ONE_RM_CSV・MP_THREADS など）は ``as_env`` が渡さないので、上書きだけでは親のシェルの値が子へ漏れる。
+
     ``stop_file`` は停止要求のファイルのパス（``app.core.stop_request``）。親の環境に
     残った古い値を引き継がないよう、渡さないときは消す。
 
     計測の CSV は、GUI が「出力先」と表示している場所に書かせる（``OUTPUT_DIR``、config.save_dir が読む）。
+
+    子の標準出力は UTF-8 で、ためずに書かせる（``CHILD_OUTPUT_ENV``）。親（``WorkerRunner``）は UTF-8 で読み、
+    ログを逐次出す。
     """
-    env = dict(os.environ)
+    env = {name: value for name, value in os.environ.items() if name not in SCHEMA}
     env.update(settings.as_env())
+    env.update(CHILD_OUTPUT_ENV)
     env["APP_ROLE"] = role
     env[OUTPUT_DIR_ENV] = str(measurement_output_dir())
     env.pop(STOP_FILE_ENV, None)

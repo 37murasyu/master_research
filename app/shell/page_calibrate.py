@@ -43,6 +43,8 @@ class CameraProbe(QtCore.QThread):
         try:
             available = []
             for index in range(self.MAX_INDEX):
+                if self.isInterruptionRequested():  # 画面を閉じるところ（CalibratePage.shutdown）
+                    return
                 source = open_source(index)
                 if source is None:
                     continue
@@ -68,6 +70,9 @@ class CalibratePage(RunnerPage):
 
     def widgets_enabled_while_running(self) -> list[QtWidgets.QWidget]:
         return [self._stop_button]
+
+    def start_widgets(self) -> list[QtWidgets.QWidget]:
+        return [self._start_button]
 
     def build_side_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
@@ -154,6 +159,13 @@ class CalibratePage(RunnerPage):
         self.append_log(f"[検出] {len(cameras)} 台見つかりました。\n")
 
     def shutdown(self) -> None:
+        """子プロセスに加えて、カメラ検出のスレッドも残さない。
+
+        打ち切りを求めて（残りのカメラを開かずに抜ける）、終わるまで待つ。かつては 3 秒で待つのをやめており、
+        列挙が遅い（Windows の DSHOW の走査など）と、動いたままのスレッドが画面と一緒に破棄されて
+        SIGABRT（QThread: Destroyed while thread is still running）で落ちていた。
+        """
         super().shutdown()
         if self._probe is not None and self._probe.isRunning():
-            self._probe.wait(3000)
+            self._probe.requestInterruption()
+            self._probe.wait()

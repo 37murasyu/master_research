@@ -12,13 +12,15 @@ unwrap 漏れ、慣性テンソルが負）は論文の数値に直結する研�
 
 from __future__ import annotations
 
+import os
+import shlex
 from dataclasses import dataclass
 
 from app.core.qt import QtWidgets
 from app.core.settings import Settings, measurement_output_dir
 from app.shell.widgets import RunnerPage
 
-__all__ = ["AnalyzePage"]
+__all__ = ["AnalyzePage", "split_options"]
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,22 @@ class AnalysisTask:
     input_kind: str = "dir"
     # 入力パスを渡すときのオプション名。None なら位置引数として渡す。
     input_option: str | None = None
+    # 必須の位置引数（計測の ID）の欄に出す例。None なら欄を出さない。値は引数の先頭に置く
+    id_hint: str | None = None
+
+
+def split_options(text: str, windows: bool | None = None) -> list[str]:
+    """「追加オプション」の文字列を引数に分ける。引用符で囲めば、空白を含むパスも 1 つの引数になる。
+
+    空白で分けるだけ（``str.split``）だと、空白を含むパスが壊れていた。閉じていない引用符は ValueError。
+    Windows（``windows`` の既定は ``os.name == "nt"``）では ``\\`` を逃がし文字にしない。パスの ``\\`` が消えるため。
+    """
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    if os.name == "nt" if windows is None else windows:
+        lexer.escape = ""
+    return list(lexer)
 
 
 # README_pose_workflow.md に記載のワークフローから、主要なものを拾ってある。
@@ -63,6 +81,8 @@ TASKS: tuple[AnalysisTask, ...] = (
         description="計測時に保存されたグローバルトルクをリンク座標系に変換し直す。",
         input_kind="dir",
         input_option="--base-dir",
+        # 必須の位置引数。渡さないと argparse が必ず exit 2 で終わっていた
+        id_hint="例: 0924_095256（kpts3d_<ID>.csv と aim_torque_vec_<ID>.csv の <ID>）",
     ),
     AnalysisTask(
         label="動画から姿勢を抽出",
@@ -103,6 +123,9 @@ class AnalyzePage(RunnerPage):
     def widgets_enabled_while_running(self) -> list[QtWidgets.QWidget]:
         return [self._stop_button]
 
+    def start_widgets(self) -> list[QtWidgets.QWidget]:
+        return [self._run_button]
+
     def build_side_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
@@ -134,9 +157,15 @@ class AnalyzePage(RunnerPage):
         row.addWidget(browse)
         input_layout.addLayout(row)
 
+        # 必須の位置引数（計測の ID）。要る解析のときだけ出す（_on_task_changed）
+        self._id_label = QtWidgets.QLabel("ID")
+        input_layout.addWidget(self._id_label)
+        self._id_edit = QtWidgets.QLineEdit()
+        input_layout.addWidget(self._id_edit)
+
         input_layout.addWidget(QtWidgets.QLabel("追加オプション（任意）"))
         self._extra_edit = QtWidgets.QLineEdit()
-        self._extra_edit.setPlaceholderText("例: --fps 30 --verbose")
+        self._extra_edit.setPlaceholderText('例: --fps 30 --out "空白 を含む/パス.csv"')
         input_layout.addWidget(self._extra_edit)
         layout.addWidget(input_box)
 
@@ -166,7 +195,11 @@ class AnalyzePage(RunnerPage):
         return TASKS[max(0, self._task_combo.currentIndex())]
 
     def _on_task_changed(self, _index: int) -> None:
-        self._task_description.setText(self._current_task.description)
+        task = self._current_task
+        self._task_description.setText(task.description)
+        self._id_label.setVisible(task.id_hint is not None)
+        self._id_edit.setVisible(task.id_hint is not None)
+        self._id_edit.setPlaceholderText(task.id_hint or "")
 
     def _browse(self) -> None:
         task = self._current_task
@@ -186,10 +219,20 @@ class AnalyzePage(RunnerPage):
             return
 
         args: list[str] = []
+        if task.id_hint is not None:
+            run_id = self._id_edit.text().strip()
+            if not run_id:
+                self.append_log("[エラー] ID を入力してください。\n")
+                return
+            args.append(run_id)
         if task.input_option:
             args += [task.input_option, target]
         else:
             args.append(target)
-        args += self._extra_edit.text().split()
+        try:
+            args += split_options(self._extra_edit.text())
+        except ValueError as exc:
+            self.append_log(f"[エラー] 追加オプションの引用符が閉じていません（{exc}）。\n")
+            return
 
         self._runner.start(self._settings, args, module=task.module)

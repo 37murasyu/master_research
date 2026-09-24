@@ -51,7 +51,13 @@ datas = [
     # 計測スクリプトが os.path.dirname(__file__) から読むもの。凍結後は sys._MEIPASS 直下を指す
     (str(ROOT / "pose_landmarker_lite.task"), "."),
     (str(ROOT / "gauge_layout.json"), "."),
+    # master_research_code.py の stats_file。根に無いと、読み取り専用の _MEIPASS に雛形を書こうとする
+    (str(ROOT / "supervision_stats.csv"), "."),
+    # Mac＋Pixel の校正（app/runners/hybrid_calibrate.py の board_defaults）が resources.resource_root() から読む。
+    # seed/ にも入れる（calib.py はワークスペースの CWD 相対で読む）が、seed/ だけでは根に無く起動直後に落ちる
+    (str(ROOT / "calibration_settings.yaml"), "."),
 ]
+# 根に置くファイルは tests/test_packaging_spec.py が確かめる
 datas += [
     (str(ROOT / rel), str(Path(workspace.SEED_DIRNAME) / Path(rel).parent))
     for rel in workspace.SEED_FILES

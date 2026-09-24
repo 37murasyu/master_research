@@ -16,7 +16,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import math
+import os
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -41,8 +45,12 @@ def measurement_output_dir() -> Path:
 
 _SCHEMA_FILE = Path(__file__).with_name("settings_schema.json")
 
-# 既存コードが bool を読むときの慣用句。``os.getenv(X, '1') in ('1','true','True')``
-_TRUE_LITERALS = ("1", "true", "True")
+# 真偽の読み方。子が読む規則（``config.env_flag``: 大文字小文字と前後の空白は問わない）とそろえる。
+# かつて GUI は ``("1", "true", "True")`` だけを真としていて、"TRUE" で GUI は偽・子は真と食い違っていた。
+# config は import 時に output_data を作るので GUI からは読み込まず、同じ組をここに置く
+# （食い違わないことは tests/test_settings.py が env_flag と比べて確かめる）。
+_TRUE_WORDS = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
 
 
 @dataclass(frozen=True)
@@ -353,9 +361,22 @@ def _to_str(setting: Setting, value: Any) -> str:
     return str(value)
 
 
+def _parse_bool(raw: str) -> bool | None:
+    """真偽の文字列を読む（``config.env_flag`` と同じ規則）。どちらでもなければ None。"""
+    word = raw.strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    return None
+
+
 def _from_str(setting: Setting, raw: str) -> Any:
     if setting.type == "bool":
-        return raw in _TRUE_LITERALS
+        value = _parse_bool(raw)
+        if value is None:
+            raise ValueError(f"{setting.name} は真偽値。受け取った値: {raw!r}")
+        return value
     if setting.type == "int":
         return int(raw)
     if setting.type == "float":
@@ -363,14 +384,61 @@ def _from_str(setting: Setting, raw: str) -> Any:
     return raw
 
 
+def _normalize(setting: Setting, value: Any) -> str | None:
+    """保存ファイルの値 1 つを、子へ渡す文字列にそろえる。読めなければ None（その項目は既定値に戻す）。
+
+    手で書き換えた JSON の値は文字列とは限らない（``true``・``7``・``70.5``・配列など）。型ごとに確かめ、
+    子が読める形（真偽は "1"/"0"、整数は ``int()``、小数は ``float()`` が読める有限の数）にする。
+    文字列のまま通すと、"65kg" が体重の欄で、数や真偽の値が子の環境変数（文字列しか受けない）で落ちていた。
+    """
+    if isinstance(value, bool):
+        return _to_str(setting, value) if setting.type == "bool" else None
+    if not isinstance(value, (str, int, float)):
+        return None  # null・配列・辞書
+    try:
+        if setting.type == "bool":
+            parsed = _parse_bool(str(value))
+            return None if parsed is None else _to_str(setting, parsed)
+        if setting.type == "int":
+            if isinstance(value, float):
+                return str(int(value)) if value.is_integer() else None
+            return str(int(value))
+        if setting.type == "float":
+            number = float(value)
+            return repr(number) if math.isfinite(number) else None
+    except (ValueError, OverflowError):
+        return None
+    return str(value)
+
+
+def _same_value(setting: Setting, raw: str, other: str | None) -> bool:
+    """2 つの文字列が同じ値を表すか。型に直して比べる。
+
+    文字列のまま比べると、既定の "65" と欄が渡す 65.0（"65.0"）や、"1e-3" と 0.001 が
+    別の値になり、既定のままの項目が毎回差分として保存されていた。
+    """
+    if other is None:
+        return False
+    try:
+        return _from_str(setting, raw) == _from_str(setting, other)
+    except ValueError:
+        return raw == other
+
+
 class Settings:
     """設定値の集合。既定値との差分だけを保持する。"""
 
-    def __init__(self, values: dict[str, str] | None = None):
+    def __init__(self, values: dict[str, Any] | None = None):
         # 既定と異なる項目のみを持つ。既定が変わったとき自動で追随できるようにするため。
         self._overrides: dict[str, str] = {}
-        for name, raw in (values or {}).items():
-            if name in SCHEMA:  # 消えた設定は黙って捨てる（古い保存ファイル対策）
+        for name, value in (values or {}).items():
+            setting = SCHEMA.get(name)
+            if setting is None:  # 消えた設定は黙って捨てる（古い保存ファイル対策）
+                continue
+            raw = _normalize(setting, value)
+            if raw is None:  # 読めない値も捨てて、その項目だけ既定値に戻す
+                continue
+            if not _same_value(setting, raw, setting.effective_default):
                 self._overrides[name] = raw
 
     # -- 参照・更新 --------------------------------------------------------
@@ -394,7 +462,7 @@ class Settings:
     def set(self, name: str, value: Any) -> None:
         setting = self._setting(name)
         raw = _to_str(setting, value)
-        if raw == setting.effective_default:
+        if _same_value(setting, raw, setting.effective_default):
             self._overrides.pop(name, None)  # 既定に戻ったら差分から外す
         else:
             self._overrides[name] = raw
@@ -421,27 +489,51 @@ class Settings:
 
     # -- 永続化 ------------------------------------------------------------
     def save(self, path: str | Path) -> None:
+        """保存する。同じフォルダの一時ファイルに書いてから置き換える。
+
+        その場で書き直すと、書いている途中で止まった（落ちた・電源が切れた）ときに設定ファイルが
+        途中までの JSON になり、次の起動で全部の設定を失う。置き換え（``os.replace``）なら前回の
+        ファイルか今回のファイルのどちらかが残る。
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "_note": "既定値と異なる項目のみ保存している。既定はアプリ側で管理。",
             "values": self._overrides,
         }
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+            raise
 
     @classmethod
     def load(cls, path: str | Path) -> "Settings":
+        """保存ファイルを読む。壊れた設定ファイルで起動できなくなるより、既定で立ち上がる方がよい。
+
+        読めないファイル（UTF-8 でない・JSON でない・一番外や ``values`` が辞書でない）は丸ごと既定値。
+        項目ごとの読めない値は、その項目だけ既定値に戻す（``__init__``）。先頭の BOM は許す
+        （Windows のメモ帳で書き換えると付く）。
+        """
         path = Path(path)
         if not path.is_file():
             return cls()
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # 壊れた設定ファイルで起動できなくなるより、既定で立ち上がる方がよい。
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, RecursionError):
+            # ValueError は UnicodeDecodeError と JSONDecodeError を含む。RecursionError は深すぎる入れ子
             return cls()
-        return cls(payload.get("values", {}))
+        values = payload.get("values") if isinstance(payload, dict) else None
+        if not isinstance(values, dict):
+            return cls()
+        return cls(values)
 
     @classmethod
     def default_path(cls) -> Path:
