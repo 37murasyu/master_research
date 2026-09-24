@@ -3,6 +3,9 @@
 Mac 側の姿勢推定の設定は ``HYBRID_POSE_*`` だけを読む（``PoseOptions.from_env``）。GUI は USB 向けの既定
 （``POSE_ROI_ON=1``・``MP_INPUT_SCALE=0.5``・``POSE_MIN_DET``）も子プロセスへ渡すので、それを読むと誰も選んで
 いないのに推定の条件が変わる。既定は今までと同じ（同梱の lite・VIDEO モード・閾値 0.5・縮小 1.0・ROI なし）。
+
+``HYBRID_POSE_ROI=1`` なら USB の経路と同じ式（``app.hybrid.pose_roi``）で、前のフレームの点から決めた ROI だけを
+IMAGE モードで推定し、点を全体の画像に対する正規化座標へ戻して返す。呼ぶ側から見た戻り値の形は変わらない。
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from typing import Mapping
 
 import cv2 as cv
 from app.core.resources import resource_root
+from app.hybrid import pose_roi
+from config import pose_keypoints
 
 __all__ = ["PoseOptions", "PoseDetector", "landmarker_options"]
 
@@ -98,32 +103,70 @@ class PoseDetector:
             options = options or PoseOptions.from_env()
             if model:
                 options = replace(options, model=str(model))
-            if options.roi:
-                # ROI の切り出し（app.hybrid.pose_roi）はまだ推定に配線していない
-                print("[姿勢推定][警告] HYBRID_POSE_ROI=1 はこの版では未配線。全画面・VIDEO モードで推定する")
-                options = replace(options, roi=False)
             detector, image_factory = _create(options)
             print(options.describe(), flush=True)
         self.options = options or PoseOptions()
         self._detector = detector
         self._image = image_factory
         self._last_ms = -1
+        # ROI の追跡の状態（本体の _pose_roi0 と _pose_roi0_miss）。最初は前の点が無いので全画面
+        self._roi = None
+        self._roi_miss = 0
 
     def detect(self, bgr, t_ns):
+        """1 枚の BGR 画像の 33 点 ``(x, y, z, visibility)``（全体の画像に対する正規化座標）。人がいなければ None。"""
         self._last_ms = max(self._last_ms + 1, t_ns // 1_000_000)
+        if self.options.roi:
+            return self._detect_roi(bgr)
+        result = self._detector.detect_for_video(self._rgb(bgr), self._last_ms)
+        return self._points(result)
+
+    def _rgb(self, bgr):
         scale = self.options.input_scale
         if scale < 1.0:
             # MediaPipe の座標は画像に対する割合なので、縮小しても全体の座標のまま使える
             bgr = cv.resize(bgr, None, fx=scale, fy=scale, interpolation=cv.INTER_AREA)
-        result = self._detector.detect_for_video(
-            self._image(cv.cvtColor(bgr, cv.COLOR_BGR2RGB)), self._last_ms
-        )
+        return self._image(cv.cvtColor(bgr, cv.COLOR_BGR2RGB))
+
+    @staticmethod
+    def _points(result):
         if not result.pose_landmarks:
             return None
         return [
             (p.x, p.y, p.z, 1.0 if p.visibility is None else p.visibility)
             for p in result.pose_landmarks[0]
         ]
+
+    def _detect_roi(self, bgr):
+        """本体の _pose_process_with_roi と ROI の更新（master_research_code.py の推定の前後）と同じ手順。
+
+        見失った回数だけ ROI を広げ、``MAX_MISS`` 回を超えたら全画面に戻す。点が少なすぎて ROI を決められない
+        ときも全画面。IMAGE モードなので切り出す場所が画像ごとに変わっても追跡は崩れない。
+        """
+        roi = self._roi if self._roi_miss <= pose_roi.MAX_MISS else None
+        for _ in range(self._roi_miss if roi is not None else 0):
+            roi = pose_roi.expand_roi(roi, bgr.shape, pose_roi.MISS_GROW_RATIO)
+            if roi is None:
+                break
+        crop = None
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            crop = bgr[y0:y1, x0:x1]
+            if crop.size == 0:
+                crop = None
+        points = self._points(self._detector.detect(self._rgb(bgr if crop is None else crop)))
+        if points is not None and crop is not None:
+            points = pose_roi.remap_to_fullframe(points, roi, bgr.shape)
+
+        next_roi = pose_roi.roi_from_keypoints(pose_roi.landmarks_to_pixels(points, bgr.shape, pose_keypoints),
+                                               bgr.shape)
+        if next_roi is None:
+            self._roi_miss += 1
+            if self._roi_miss > pose_roi.MAX_MISS:
+                self._roi = None
+        else:
+            self._roi, self._roi_miss = next_roi, 0
+        return points
 
     def close(self):
         self._detector.close()
