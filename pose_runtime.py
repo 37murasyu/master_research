@@ -140,6 +140,12 @@ def _tasks_imports():
         return None, None, None, None
 
 
+def _solutions_pose(min_detection_confidence: float = 0.5, min_tracking_confidence: float = 0.5):
+    """MediaPipe Solutions の Pose（native・tasks が使えないとき、推論が失敗したときの代わり）。"""
+    return mp.solutions.pose.Pose(min_detection_confidence=min_detection_confidence,
+                                  min_tracking_confidence=min_tracking_confidence)
+
+
 class _LM:
     __slots__ = ('x','y','z','visibility')
     def __init__(self, x=0.0, y=0.0, z=0.0, visibility=0.0):
@@ -240,9 +246,24 @@ class PoseEstimator:
                 print(f"[PoseRT] Not using Tasks: {'; '.join(reason) if reason else 'unknown reason'}")
 
         if (self._mode != 'tasks') and (self._mode != 'native'):
-            self._pose = mp.solutions.pose.Pose(min_detection_confidence=min_det, min_tracking_confidence=min_track)
+            self._pose = _solutions_pose(min_detection_confidence=min_det, min_tracking_confidence=min_track)
             if os.getenv('POSE_DEBUG', '0') in ('1', 'true', 'True'):
                 print("[PoseRT] Using Solutions Pose")
+
+    def _fallback_to_solutions(self, frame_rgb: np.ndarray):
+        """推論に失敗したフレームを、その場で作った Solutions の Pose で処理し、以後もそれを使う。
+
+        native（DLL）と tasks の経路で共有する。native の経路は Solutions の Pose を作っていないので、以前は
+        失敗したフレームで ``self._pose``（None）の ``process`` を呼んで AttributeError になっていた。
+        Solutions も作れなければ、このフレームは人なし（``pose_landmarks`` が None）を返す。
+        """
+        if self._pose is None:
+            try:
+                self._pose = _solutions_pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+                self._mode = 'solutions'
+            except Exception:
+                return _PoseResult(None)
+        return self._pose.process(frame_rgb)
 
     def process(self, frame_rgb: np.ndarray):
         if self._mode == 'native' and self._native is not None:
@@ -250,7 +271,8 @@ class PoseEstimator:
                 return self._native.process(frame_rgb)
             except Exception as _pe:
                 if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                    print(f"[PoseRT] native detect failed -> fallback: {_pe}")
+                    print(f"[PoseRT] native detect failed: {_pe} -> fallback to Solutions")
+                return self._fallback_to_solutions(frame_rgb)
         if self._mode == 'tasks' and self._landmarker is not None:
             try:
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
@@ -268,15 +290,8 @@ class PoseEstimator:
                 return _PoseResult(None)
             except Exception as _pe:
                 if os.getenv('POSE_DEBUG', '0') in ('1','true','True'):
-                    print(f"[PoseRT] detect failed: {_pe} -> fallback to Solutions this frame")
-                if self._pose is None:
-                    try:
-                        self._pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-                        self._mode = 'solutions'
-                    except Exception:
-                        return _PoseResult(None)
-                sol_res = self._pose.process(frame_rgb)  # type: ignore
-                return sol_res
+                    print(f"[PoseRT] detect failed: {_pe} -> fallback to Solutions")
+                return self._fallback_to_solutions(frame_rgb)
         else:
             return self._pose.process(frame_rgb)  # type: ignore
 
