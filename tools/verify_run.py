@@ -363,12 +363,27 @@ def _hybrid_quality(folder: Path, files: Mapping[str, Path | None], meta: Mappin
     return quality
 
 
+NO_FINITE_LENGTH = "有限の長さが無い"
+NO_FINITE_HINT = "（3D が取れていない。被写体が両方の画面に入っているか、校正を確かめる）"
+
+
 def _quality_checks(quality: Mapping[str, Any], add) -> None:
+    """骨の長さと配置の検査。長さが 1 つも有限でない部位（割合・ばらつきが None）は「有限の長さが無い」で不合格。"""
     segments = quality["segments"]
-    short = [f"{name} {s['share']:.0%}" for name, s in segments.items() if s["share"] is None or s["share"] < MIN_SEGMENT_SHARE]
-    add("3D: 肩幅・上腕・前腕の長さが妥当な範囲に入る割合 95% 以上", not short, "、".join(short))
-    wobbly = [f"{name} {s['std_m'] * 100:.1f} cm" for name in ("前腕R", "前腕L")
-              for s in [segments[name]] if s["std_m"] is None or s["std_m"] >= MAX_FOREARM_STD_M]
+    short = [f"{name} {NO_FINITE_LENGTH}" if s["share"] is None else f"{name} {s['share']:.0%}"
+             for name, s in segments.items() if s["share"] is None or s["share"] < MIN_SEGMENT_SHARE]
+    missing = any(s["share"] is None for s in segments.values())
+    add("3D: 肩幅・上腕・前腕の長さが妥当な範囲に入る割合 95% 以上", not short,
+        "、".join(short) + (NO_FINITE_HINT if missing else ""))
+    wobbly = []
+    for name in ("前腕R", "前腕L"):
+        s = segments[name]
+        if s["share"] is None:
+            wobbly.append(f"{name} {NO_FINITE_LENGTH}")
+        elif s["std_m"] is None:
+            wobbly.append(f"{name} 範囲内の長さが 1 個以下")
+        elif s["std_m"] >= MAX_FOREARM_STD_M:
+            wobbly.append(f"{name} {s['std_m'] * 100:.1f} cm")
     add("3D: 前腕の長さのばらつき（標準偏差）1.5 cm 未満", not wobbly, "、".join(wobbly))
     if "angle_deg" in quality:
         angles = quality["angle_deg"]

@@ -338,6 +338,41 @@ class TestPlacementAndQuality:
         check = _check(report, QUALITY["segments"])
         assert not check["ok"] and "上腕R" in check["detail"]
 
+    def test_no_finite_length_fails_and_the_report_is_written(self, tmp_path):
+        """右手首の 3D が 1 組も取れていないと、前腕 R の長さが 1 つも有限でなく割合とばらつきが None になる。
+        check は落ちずに「有限の長さが無い」で不合格にし、案内と verify_report.json を出す（以前は TypeError で何も残らなかった）。"""
+        run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
+        kpts = next(p for p in run.glob("kpts3d_*.csv") if not p.name.startswith("kpts3d_raw_"))
+        table = pd.read_csv(kpts)
+        wrist = IDS.index(16)
+        table[[f"joint_{wrist}_{axis}" for axis in "xyz"]] = np.nan
+        table.to_csv(kpts, index=False)
+        assert vr.main(["check", str(run)]) == 1
+        report = json.loads((run / "verify_report.json").read_text(encoding="utf-8"))
+        for name in (QUALITY["segments"], QUALITY["forearm"]):
+            check = _check(report, name)
+            assert not check["ok"] and "前腕R 有限の長さが無い" in check["detail"], check
+
+    def test_no_length_in_the_range_fails_the_spread(self, tmp_path):
+        """長さは有限でも範囲内が 1 個以下だと、ばらつきを出せない（None）。落ちずに不合格にする。"""
+        run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
+        kpts = next(p for p in run.glob("kpts3d_*.csv") if not p.name.startswith("kpts3d_raw_"))
+        table = pd.read_csv(kpts)
+        table[f"joint_{IDS.index(16)}_x"] = table[f"joint_{IDS.index(14)}_x"] + 0.8   # 右前腕がいつも 0.8 m
+        table.to_csv(kpts, index=False)
+        report = vr.check_run(run)
+        assert "前腕R 0%" in _check(report, QUALITY["segments"])["detail"]
+        check = _check(report, QUALITY["forearm"])
+        assert not check["ok"] and "前腕R 範囲内の長さが 1 個以下" in check["detail"]
+        assert "前腕R" in vr.format_report(report)
+
+    def test_a_run_without_pairs_fails_without_crashing(self, tmp_path):
+        """組が 1 つもできなかった回（kpts3d が見出しだけ）も、落ちずに不合格にする。"""
+        report = vr.check_run(make_hybrid_run(tmp_path, frames=0))
+        assert not _check(report, QUALITY["segments"])["ok"]
+        assert "有限の長さが無い" in _check(report, QUALITY["forearm"])["detail"]
+        vr.format_report(report)
+
     def test_hands_out_of_the_frame_are_named(self, tmp_path):
         run = make_body_run(tmp_path, stereo=wide_stereo(), pixel_hz=30.0)
         marks = next(run.glob("landmarks2d_*.csv"))
