@@ -24,7 +24,7 @@ import app.hybrid.replay as rp
 from app.hybrid.ekf import EkfSettings
 from app.runners.network_measure import MeasurementConfig
 from app.hybrid.retriangulate import read_landmarks
-from test_hybrid_verification import _expected, make_body_run
+from test_hybrid_verification import _expected, cut_the_last_frame, make_body_run
 
 
 def _outputs(directory):
@@ -65,6 +65,18 @@ class TestReplay:
             if k < len(frames):
                 t = frames["t_ns"].iloc[k] / 1e9
                 assert np.nanmax(np.abs(points[k] - _expected(t))) < 0.02, "再生の 3D が記録の体とずれた"
+
+    def test_a_record_cut_by_a_kill_replays(self, tmp_path):
+        """kill で ``landmarks2d`` の最後のフレームが途中で切れた記録も、最後まで流して complete で閉じる。
+
+        以前は点の足りないフレームを流し、計測が IndexError で failed になった。
+        """
+        session = make_body_run(tmp_path, seconds=2.0)
+        cut_the_last_frame(session)
+        out = rp.replay(session, root=tmp_path / "replay", speed=0,
+                        config=MeasurementConfig(body_mass_kg=65.0, ekf=EkfSettings()))
+        meta = _outputs(out)[1]
+        assert (meta["status"], meta.get("error"), meta["stop_reason"]) == ("complete", None, "replay_end")
 
     def test_the_timing_of_the_measurement_is_recorded(self, tmp_path):
         out = rp.replay(make_body_run(tmp_path, seconds=2.0), root=tmp_path / "replay", speed=0)
