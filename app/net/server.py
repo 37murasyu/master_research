@@ -30,7 +30,7 @@ import websockets
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 from app.net import protocol as p
-from app.net.sync_buffer import PairedSample, SyncBuffer
+from app.net.sync_buffer import DEFAULT_GRID, GridSpec, PairedSample, SyncBuffer
 
 __all__ = [
     "SessionHandler",
@@ -515,9 +515,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     server = LandmarkServer(
         host=args.host,
         port=args.port,
-        buffer=SyncBuffer(
-            target_hz=args.hz, window_sec=args.window, max_gap_ms=args.max_gap_ms
-        ),
+        buffer=SyncBuffer(window_sec=args.window, grid=GridSpec(args.hz, args.max_gap_ms)),
         on_pairs=received,
     )
     try:
@@ -579,9 +577,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="スマホからランドマークを受け取るサーバ")
     parser.add_argument("--host", default="0.0.0.0", help="待ち受けアドレス")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--hz", type=float, default=30.0, help="再標本化するグリッド周波数")
+    parser.add_argument("--hz", type=float, default=DEFAULT_GRID.target_hz, help="再標本化するグリッド周波数")
     parser.add_argument("--window", type=float, default=2.0, help="バッファの時間窓（秒）")
-    parser.add_argument("--max-gap-ms", type=float, default=100.0, help="補間を許す最大欠測幅")
+    parser.add_argument("--max-gap-ms", type=float, default=DEFAULT_GRID.max_gap_ms, help="補間を許す最大欠測幅")
     parser.add_argument("--no-qr", action="store_true", help="QR コードを表示しない")
     args = parser.parse_args()
 

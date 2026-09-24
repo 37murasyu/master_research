@@ -32,8 +32,7 @@ from app.tuning.ekf_profile import MIN_N_EFF, build_profile, write_profile
 from app.tuning.raw_capture import read_raw_capture
 
 
-# 混成の計測の（既定の）格子の dt [s] と、実行時の探索が同じ dt とみなす相対差（ekf_profile.resolve_profile）
-HYBRID_GRID_DT = DEFAULT_GRID.period_s
+# 実行時の探索が同じ dt とみなす相対差（ekf_profile.resolve_profile）。混成の計測の格子の dt は DEFAULT_GRID.period_s
 DT_TOLERANCE = 0.05
 
 
@@ -90,8 +89,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[tune_ekf] 書き出し: {destination}")
     print("[tune_ekf] 採用元の内訳: " + ", ".join(f"{name}={count}" for name, count in sorted(sources.items())))
     if hybrid:
-        if abs(dt - HYBRID_GRID_DT) / HYBRID_GRID_DT > DT_TOLERANCE:
-            print(f"[tune_ekf][警告] この収録の dt {dt:.5f} s は混成の計測の格子 1/30 s（{HYBRID_GRID_DT:.5f} s）から "
+        grid_dt = DEFAULT_GRID.period_s
+        if abs(dt - grid_dt) / grid_dt > DT_TOLERANCE:
+            print(f"[tune_ekf][警告] この収録の dt {dt:.5f} s は混成の計測の格子 1/{DEFAULT_GRID.target_hz:g} s"
+                  f"（{grid_dt:.5f} s）から "
                   f"{DT_TOLERANCE:.0%} を超えて外れている。混成の計測はこのプロファイルを選ばない（計測フォルダの "
                   "kpts3d_raw_<stamp>.csv から作り直す）")
         print(f"[tune_ekf] 混成の計測で使うには、設定 HYBRID_EKF_PROFILE（GUI のカルマンフィルタの欄）に "

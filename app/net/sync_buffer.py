@@ -154,34 +154,26 @@ class SyncBuffer:
     ----------
     roles:
         揃うべきロール。既定は ``("cam0", "cam1")``。
-    target_hz:
-        再標本化するグリッドの周波数。既存パイプラインは 30 fps 前提
-        （``config.fps = 30``）なのでそれに合わせるのが既定。
     window_sec:
         保持する時間窓。長いほどジッタに強いが、その分だけ表示が遅れる。
-    max_gap_ms:
-        補間を許す最大の欠測幅。これを超える穴は補間せず捨てる。
-        長い穴を線形補間で埋めると、実際には動いていた手を
-        「まっすぐ動いた」ことにしてしまうため。
     grid:
-        格子（``GridSpec``）。渡したら ``target_hz``・``max_gap_ms`` より優先する。
-        下流（計測・EKF・記録）に同じものを渡すため、組み立てる側はこちらを使う。
+        格子（``GridSpec``）。再標本化する周波数（``target_hz``）と、補間を許す最大の欠測幅
+        （``max_gap_ms``）を持つ。これを超える穴は補間せず捨てる。長い穴を線形補間で埋めると、
+        実際には動いていた手を「まっすぐ動いた」ことにしてしまうため。
+        下流（計測・EKF・記録）に同じものを渡すので、格子の値はここでしか受けない。
     """
 
     def __init__(
         self,
         roles: Sequence[str] = ROLES,
-        target_hz: float = 30.0,
+        *,
         window_sec: float = 2.0,
-        max_gap_ms: float = 100.0,
-        grid: GridSpec | None = None,
+        grid: GridSpec = DEFAULT_GRID,
     ):
-        self.grid = grid if grid is not None else GridSpec(target_hz=target_hz, max_gap_ms=max_gap_ms)
+        self.grid = grid
 
         self.roles = tuple(roles)
-        self.period_ns = self.grid.period_ns
         self.window_ns = round(window_sec * 1_000_000_000)
-        self.max_gap_ns = self.grid.max_gap_ns
 
         # ロールごとに時刻昇順で保持する。到着順は当てにしない。
         # 時刻はフレーム自身が持っているので別のリストにはしない
@@ -208,7 +200,7 @@ class SyncBuffer:
             return  # 同時刻の重複。再送などで起こりうる
 
         # 既に処理を終えた時刻より古いフレームは使い道がない
-        if self._next_grid_ns is not None and frame.t_capture_ns < self._next_grid_ns - self.max_gap_ns:
+        if self._next_grid_ns is not None and frame.t_capture_ns < self._next_grid_ns - self.grid.max_gap_ns:
             self._stats.dropped_late += 1
             return
 
@@ -241,7 +233,7 @@ class SyncBuffer:
             else:  # "skip"
                 self._stats.dropped_gap += 1
 
-            self._next_grid_ns = t + self.period_ns
+            self._next_grid_ns = t + self.grid.period_ns
             self._next_grid_index += 1
 
         self._evict()
@@ -276,7 +268,7 @@ class SyncBuffer:
             if index < len(frames) and frames[index].t_capture_ns == t:
                 continue  # ちょうどサンプルがある
             gap = frames[index].t_capture_ns - frames[index - 1].t_capture_ns
-            if gap > self.max_gap_ns:
+            if gap > self.grid.max_gap_ns:
                 return "skip"  # 欠測が長すぎる。補間で埋めない
         return "ok"
 

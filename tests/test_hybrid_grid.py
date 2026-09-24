@@ -7,6 +7,8 @@
 肘の濾波 E± の dt、生 3D の格子とサイドカーの dt）。片方だけ変えると黙ってずれる。
 
 - 既定の格子の値は従来の直書きと同じ（1/30 s・33,333,333 ns・100 ms・0.1 s）。出力の CSV の値は変わらない
+- 同期バッファ（``SyncBuffer``・``PhoneLink``）は格子を ``GridSpec`` だけで受ける。周波数と穴の上限を別にも受けて
+  片方が黙って勝つ形にはしない
 - 組は同期バッファの格子の番号を持ち、計測は時刻から割り戻さずにそれを使う
 - 格子を変える（15 Hz・200 ms）と、EKF の dt・積む dt の上限・サイドカーの dt・生 3D の格子がそれに追随する
 - ``verify_run`` は frames の ``grid_index`` と生 CSV の ``frame``（格子の番号）で直接つなぐ。``grid_index`` の無い
@@ -23,6 +25,7 @@ import pytest
 
 import app.hybrid.replay as rp
 from app.hybrid.ekf import EkfSettings
+from app.hybrid.link import PhoneLink
 from app.net.protocol import LandmarkFrame
 from app.net.sync_buffer import DEFAULT_GRID, GridSpec, PairedSample, SyncBuffer
 from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
@@ -45,18 +48,42 @@ class TestGridSpec:
         assert DEFAULT_GRID.max_gap_ns == 100_000_000
         assert DEFAULT_GRID.max_gap_s == 0.1
 
-    def test_the_sync_buffer_keeps_its_old_arguments(self):
-        buffer = SyncBuffer(target_hz=15.0, max_gap_ms=200.0)
-        assert buffer.grid == GRID_15
-        assert (buffer.period_ns, buffer.max_gap_ns) == (66_666_667, 200_000_000)
-        assert SyncBuffer(grid=GRID_15, target_hz=30.0).grid == GRID_15, "grid を渡したら target_hz より優先する"
+    def test_the_sync_buffer_takes_the_grid_only(self):
+        """格子の値は ``GridSpec`` だけで受ける。周波数・穴の上限を別にも受けると、どちらが効くか呼ぶ側から見えない。"""
         assert SyncBuffer().grid == DEFAULT_GRID
+        assert SyncBuffer(grid=GRID_15).grid == GRID_15
+        assert PhoneLink(grid=GRID_15)._server.buffer.grid == GRID_15
+        for old in ({"target_hz": 15.0}, {"max_gap_ms": 200.0}):
+            with pytest.raises(TypeError):
+                SyncBuffer(**old)
+            with pytest.raises(TypeError):
+                PhoneLink(**old)
 
-    def test_a_non_positive_rate_is_rejected(self):
+    def test_the_buffer_steps_and_fills_gaps_by_its_grid(self):
+        """格子の間隔と補間で埋める穴の上限は、渡した ``GridSpec`` のもの。"""
+        t0, step = 1_000_000_000, 50_000_000   # 20 Hz で 1 s 撮る
+
+        def drain(buffer):
+            for k in range(21):
+                buffer.push(_frame("cam0", t0 + k * step, k))
+                if k not in (8, 9):   # cam1 は 150 ms の穴（既定の上限 100 ms を超え、GRID_15 の 200 ms に収まる）
+                    buffer.push(_frame("cam1", t0 + k * step, k))
+            return buffer.drain()
+
+        buffer = SyncBuffer(grid=GRID_15)
+        pairs = drain(buffer)
+        assert [p.grid_index for p in pairs] == list(range(15)), "15 Hz の格子の 1 s ぶんがすべて組になる"
+        assert all(p.t_ns == t0 + p.grid_index * GRID_15.period_ns for p in pairs)
+        assert buffer.stats["dropped_gap"] == 0
+        default = SyncBuffer()
+        drain(default)
+        assert default.stats["dropped_gap"] > 0, "既定の格子なら 150 ms の穴は埋めない"
+
+    def test_a_non_positive_rate_or_a_negative_gap_is_rejected(self):
         with pytest.raises(ValueError):
             GridSpec(target_hz=0.0)
         with pytest.raises(ValueError):
-            SyncBuffer(target_hz=-1.0)
+            GridSpec(max_gap_ms=-1.0)
 
 
 class TestPairsCarryTheGridIndex:
