@@ -82,6 +82,24 @@ class TestWorkerEnvironment:
         env = entry.worker_environment(Settings())
         assert env["DEMO_MONO_GAUGE_ON"] == "0"
 
+    @pytest.mark.parametrize("name", ["SUBJECT_ID", "CAM0", "CAM1", "ONE_RM_CSV", "POSE_TASK_MODEL", "MP_THREADS"])
+    def test_settings_without_a_default_do_not_leak_from_the_shell(self, monkeypatch, name):
+        """既定値の無い設定は ``as_env`` が渡さないので、親のシェルの値がそのまま子へ漏れていた。
+
+        例えば親に残った SUBJECT_ID で、GUI では空欄のまま別の被験者の 1RM でゲージの帯が決まる。
+        """
+        from app.core.settings import SCHEMA
+
+        assert SCHEMA[name].effective_default is None
+        monkeypatch.setenv(name, "シェルに残った値")
+        assert name not in entry.worker_environment(Settings())
+
+    def test_settings_without_a_default_are_passed_when_set_in_the_app(self, monkeypatch):
+        monkeypatch.setenv("SUBJECT_ID", "99")
+        settings = Settings()
+        settings.set("SUBJECT_ID", "3")
+        assert entry.worker_environment(settings)["SUBJECT_ID"] == "3"
+
     def test_marks_the_child_as_a_worker(self):
         """子プロセス側から「自分はワーカーだ」と分かるようにしておく。"""
         env = entry.worker_environment(Settings())

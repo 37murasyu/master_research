@@ -25,7 +25,7 @@ from pathlib import Path
 
 from app.core import resources, workspace
 from app.core.platform_compat import user_output_dir
-from app.core.settings import APP_NAME, OUTPUT_DIR_ENV, Settings, measurement_output_dir
+from app.core.settings import APP_NAME, OUTPUT_DIR_ENV, SCHEMA, Settings, measurement_output_dir
 from app.core.stop_request import STOP_FILE_ENV
 
 __all__ = [
@@ -153,12 +153,15 @@ def worker_environment(
     設定は全件を明示的に渡す（``Settings.as_env`` を参照）。差分だけ渡すと、
     渡さなかった項目は既存スクリプト側の既定値が効いてしまう。
 
+    設定の名前（``SCHEMA``）は、親の環境から先にまとめて落とす。既定値の無い設定（SUBJECT_ID・CAM0・
+    ONE_RM_CSV・MP_THREADS など）は ``as_env`` が渡さないので、上書きだけでは親のシェルの値が子へ漏れる。
+
     ``stop_file`` は停止要求のファイルのパス（``app.core.stop_request``）。親の環境に
     残った古い値を引き継がないよう、渡さないときは消す。
 
     計測の CSV は、GUI が「出力先」と表示している場所に書かせる（``OUTPUT_DIR``、config.save_dir が読む）。
     """
-    env = dict(os.environ)
+    env = {name: value for name, value in os.environ.items() if name not in SCHEMA}
     env.update(settings.as_env())
     env["APP_ROLE"] = role
     env[OUTPUT_DIR_ENV] = str(measurement_output_dir())
