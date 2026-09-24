@@ -38,6 +38,10 @@ DEFAULT_SOURCES = (
 # bool として扱う比較先。既存コードの慣用句。
 BOOL_LITERALS = {"1", "true", "True", "yes", "on"}
 
+# 走査対象が読むが、利用者の設定ではない環境変数。スキーマに入れると設定画面の項目になってしまう。
+# APP_WORKSPACE（config.py の folder_path）は凍結時にワーカーが自分で決める（app.core.workspace.WORKSPACE_ENV）。
+INTERNAL_NAMES = frozenset({"APP_WORKSPACE"})
+
 # 接頭辞からグループ名（UI の見出しに使う）
 GROUP_LABELS = {
     "E": "エネルギー・フィルタ",
@@ -167,6 +171,8 @@ def extract(source_path: Path) -> dict[str, dict]:
             continue
 
         name = node.args[0].value
+        if name in INTERNAL_NAMES:
+            continue
         default = None
         if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
             default = node.args[1].value
@@ -192,6 +198,27 @@ def extract(source_path: Path) -> dict[str, dict]:
     return dict(sorted(found.items()))
 
 
+def build_payload(sources) -> dict:
+    """``sources`` を走査した、``settings_schema.json`` の中身。
+
+    リポジトリの ``settings_schema.json`` がこれと（行番号を除いて）一致することを
+    tests/test_env_flag.py が確かめる。
+    """
+    sources = [Path(s) for s in sources]
+    schema: dict[str, dict] = {}
+    for source in sources:
+        for name, entry in extract(source).items():
+            if name in schema:
+                _merge_entry(schema[name], entry)
+            else:
+                schema[name] = entry
+    return {
+        "_generated_from": [s.name for s in sources],
+        "_note": "tools/extract_env_schema.py で生成。手で編集せず、上書きは settings.py の CURATED で行う。",
+        "settings": dict(sorted(schema.items())),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -203,21 +230,8 @@ def main() -> int:
     parser.add_argument("--out", default="-", help="出力先（既定は標準出力）")
     args = parser.parse_args()
 
-    sources = [Path(s) for s in (args.source or DEFAULT_SOURCES)]
-    schema: dict[str, dict] = {}
-    for source in sources:
-        for name, entry in extract(source).items():
-            if name in schema:
-                _merge_entry(schema[name], entry)
-            else:
-                schema[name] = entry
-    schema = dict(sorted(schema.items()))
-
-    payload = {
-        "_generated_from": [s.name for s in sources],
-        "_note": "tools/extract_env_schema.py で生成。手で編集せず、上書きは settings.py の CURATED で行う。",
-        "settings": schema,
-    }
+    payload = build_payload(args.source or DEFAULT_SOURCES)
+    schema = payload["settings"]
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
     if args.out == "-":
