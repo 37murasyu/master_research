@@ -271,6 +271,46 @@ class TestStopDirectory:
         assert not list(tmp_path.glob("wt_stop_*")), "起動に失敗したのに停止用のディレクトリが残った"
 
 
+class TestCameraProbeAtExit:
+    def test_shutdown_leaves_no_running_probe_thread(self, qt_app, monkeypatch):
+        """カメラ検出のスレッドが 3 秒を超えて動いていると、閉じた後に動いたまま破棄されて SIGABRT で落ちていた。
+
+        閉じるときは検出の打ち切りを求め、スレッドが終わるまで待つ。
+        """
+        import threading
+        import time
+
+        from app.core import video_source
+        from app.shell import page_calibrate
+        from app.shell.page_calibrate import CalibratePage
+
+        released = threading.Event()
+
+        def slow_names():  # 遅いカメラの列挙（Windows の DSHOW の走査など）
+            released.wait(10)
+            return []
+
+        opened = []
+        monkeypatch.setattr(page_calibrate, "enumerate_camera_device_names", slow_names)
+        monkeypatch.setattr(video_source, "open_source", lambda index: opened.append(index))
+        timer = threading.Timer(3.5, released.set)  # 前の打ち切り（3 秒）より長く動かす
+
+        page = CalibratePage(Settings())
+        page._detect_button.click()
+        assert page._probe.isRunning()
+        timer.start()
+        t0 = time.monotonic()
+        try:
+            page.shutdown()
+            assert not page._probe.isRunning(), "閉じた後も検出のスレッドが動いている"
+            assert time.monotonic() - t0 >= 3.0
+            assert opened == [], "閉じるのに、カメラの走査を打ち切らずに続けた"
+        finally:
+            released.set()
+            timer.cancel()
+            page._probe.wait()
+
+
 class TestOnePageAtATime:
     """どれかのページが実行中なら、ほかのページの開始は押せず、理由が出る。
 
