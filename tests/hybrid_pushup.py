@@ -156,8 +156,12 @@ def run(measurement, motion: PushUp = PushUp(), **kw):
     return results
 
 
-def calibrated_pairs(motion: PushUp = PushUp(), *, drop=(), fps: float = 30.0):
-    """``test_hybrid_measure.calibration`` の校正（歪みつき、基線 35 cm）で撮った押し上げの組。"""
+def calibrated_pairs(motion: PushUp = PushUp(), *, drop=(), fps: float = 30.0, hide=(),
+                     hide_until_s: float = float("inf")):
+    """``test_hybrid_measure.calibration`` の校正（歪みつき、基線 35 cm）で撮った押し上げの組。
+
+    ``hide`` のランドマーク ID は、``hide_until_s`` 秒まで Mac の画面のずっと外に置く（歪み補正で NaN になる）。
+    """
     import cv2 as cv
     from test_hybrid_measure import geometry
     from test_network_measure import _pair_from_pixels
@@ -171,5 +175,8 @@ def calibrated_pairs(motion: PushUp = PushUp(), *, drop=(), fps: float = 30.0):
         truth[:, 1] -= 5.0   # 両方の画像に収める
         a = cv.projectPoints(truth, np.zeros(3), np.zeros(3), intr.K, intr.distortion)[0].reshape(-1, 2)
         b = cv.projectPoints(truth, np.zeros(3), stereo.T, intr.K, intr.distortion)[0].reshape(-1, 2)
+        if k / fps < hide_until_s:
+            for landmark_id in hide:
+                a[SLOT[landmark_id]] = (-5000.0, -5000.0)
         pairs.append(_pair_from_pixels(round(k * 1e9 / fps), a, b))
     return pairs

@@ -10,6 +10,7 @@
   ``EKF_Q_ACC/EKF_R=1e-3`` は使わない（合成の押し上げで肘の W_pos が +52% になる。同梱値なら +10%）
 - 同期バッファは 100 ms を超える穴で組を作らず、次の組の時刻が格子（33.3 ms）の n 倍跳ぶ。EKF は NaN の観測で
   dt=1/30 の予測を抜けた回数だけ進めてから更新する。0.5 s を超える抜けは作り直す
+- 点ごとの欠測（画面の外に出た点）も、``EKF_MAX_GAP_S`` の指定が無ければ 0.5 s まで予測で埋め、その先は NaN
 - 100 ms を超える抜けの後は、リンクの速度の計算器と部位データも作り直す（古い前フレームとの差で速度と
   トルクが跳ねないように）
 - 記録と EKF の較正のため、EKF の手前（``points_raw``）と後（``points_3d``）を分けて持つ
@@ -23,10 +24,10 @@ import warnings
 import numpy as np
 import pytest
 
-from app.hybrid.ekf import EkfSettings, GridEkf, hybrid_noise
+from app.hybrid.ekf import REBUILD_GAP_S, EkfSettings, GridEkf, hybrid_noise
 from app.runners.network_measure import MeasurementConfig, NetworkMeasurement
 from config import pose_keypoints
-from hybrid_pushup import SLOT, PushUp, run
+from hybrid_pushup import SLOT, PushUp, pushup_cm, run, runtime_m
 from test_network_measure import _body_points, _pair_from_pixels, _project, _stereo_projections
 
 IDS = sorted(pose_keypoints)
@@ -84,6 +85,31 @@ class TestSettings:
         np.testing.assert_allclose(noise.cfg.r, 1e-4)
         assert noise.provenance()["path"].endswith("ekf_profile_test.json")
 
+    @pytest.mark.parametrize("raw", [None, "", "0", "nan"])
+    def test_the_per_point_gap_defaults_to_the_rebuild_gap(self, monkeypatch, raw):
+        """点ごとの欠測の上限は、指定が無ければフレーム全体の抜けで作り直す 0.5 s と同じ（2026-09-24 のレビュー）。
+
+        GUI は USB と共用の EKF_MAX_GAP_S を既定の 0（USB では無制限）のまま必ず子へ渡すので、混成は 0 も「指定なし」と
+        みなす。かつては無制限で、画面の外に出た点を期限なしに外挿し、手の点で手首の軸が流れて手首の W+ が −10〜−60%。
+        """
+        if raw is None:
+            monkeypatch.delenv("EKF_MAX_GAP_S", raising=False)
+        else:
+            monkeypatch.setenv("EKF_MAX_GAP_S", raw)
+        assert EkfSettings.from_env().max_gap_s == REBUILD_GAP_S == 0.5
+        assert EkfSettings().max_gap_s == REBUILD_GAP_S
+
+    def test_an_explicit_gap_is_kept(self, monkeypatch):
+        """正の値はそのまま、負の値は無制限（LandmarkEKF は 0 以下を無制限とする）。"""
+        monkeypatch.setenv("EKF_MAX_GAP_S", "0.3")
+        assert GridEkf(EkfSettings.from_env(), IDS)._ekf.max_gap_s == 0.3
+        monkeypatch.setenv("EKF_MAX_GAP_S", "-1")
+        assert GridEkf(EkfSettings.from_env(), IDS)._ekf.max_gap_s == -1.0
+
+    def test_the_provenance_has_the_gap_in_use(self):
+        provenance = GridEkf(EkfSettings(), IDS).provenance()
+        assert provenance["max_gap_s"] == 0.5 and provenance["settings"]["max_gap_s"] == 0.5
+
 
 class TestGrid:
     def test_missing_grid_steps_are_predicted_with_nan(self):
@@ -113,6 +139,35 @@ class TestGrid:
         pos, _ = ekf.step(jumped, missing=15)   # 0.53 s の抜け
         assert ekf.rebuilds == 1
         np.testing.assert_allclose(pos, jumped, err_msg="作り直した直後は観測そのもの")
+
+    @pytest.mark.parametrize("seed", range(3))
+    def test_a_point_out_of_view_is_not_extrapolated_past_the_limit(self, seed):
+        """静止した点（雑音 3 mm）を 5 s 観測した後に 1 点だけ観測が無くなる。0.5 s までは予測で埋め、その先は NaN。
+
+        上限が無いと 3 s で 0.2〜0.5 m 流れた（2026-09-24 のレビュー）。他の点は影響を受けない。
+        """
+        rng = np.random.default_rng(seed)
+        base = np.tile([0.2, 1.5, 0.3], (len(IDS), 1))
+        ekf = GridEkf(EkfSettings(), IDS)
+        for _ in range(150):
+            ekf.step(base + rng.normal(0, 0.003, base.shape))
+        out = []
+        for _ in range(90):
+            raw = base + rng.normal(0, 0.003, base.shape)
+            raw[6] = np.nan
+            out.append(ekf.step(raw)[0])
+        within = [np.linalg.norm(p[6] - base[6]) for p in out[:15]]
+        assert max(within) < 0.05, "0.5 s までは予測で埋める"
+        assert all(np.isnan(p[6]).all() for p in out[16:]), "0.5 s を超えて外挿した"
+        assert all(np.isfinite(np.delete(p, 6, axis=0)).all() for p in out)
+        unlimited = GridEkf(EkfSettings(max_gap_s=-1.0), IDS)
+        for _ in range(150):
+            unlimited.step(base + rng.normal(0, 0.003, base.shape))
+        raw = base.copy()
+        raw[6] = np.nan
+        for _ in range(90):
+            pos, _ = unlimited.step(raw)
+        assert np.isfinite(pos[6]).all(), "明示した無制限は尊重する"
 
     def test_the_scale_ratio_rescales_the_profile(self, tmp_path):
         ekf = GridEkf(EkfSettings(profile=str(_profile(tmp_path))), IDS)
@@ -220,6 +275,44 @@ class TestWorkWithTheEkf:
         with_ekf = self._w_pos(EkfSettings(), 0.3)
         without = self._w_pos(EkfSettings(enabled=False), 0.3)
         assert abs(with_ekf - truth) < 0.5 * abs(without - truth)
+
+
+class TestHandOutOfView:
+    """押し上げ中に左手の点（小指・人差し指）が画面の外に出続ける（2026-09-24 のレビュー）。
+
+    点ごとの欠測に上限が無く、EKF が手の点を数 m〜16 m 先まで外挿し、それで作った手首の軸で手首の W+ が −10〜−60%
+    になった。0.5 s を超えた点は NaN になり、手首の軸は肘の屈曲軸に落ちる（``push_up_model.joint_axes``）。軸の
+    取り方が変わるぶんの差は残る（この合成で −0〜−25%）。
+    """
+
+    MOTION = PushUp(reps=5, rest_s=3.0)
+
+    def _run(self, hide: bool):
+        measurement = _measurement()
+        rng = np.random.default_rng(0)
+        drift = []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for k in range(int(self.MOTION.duration_s * 30)):
+                t = k / 30
+                truth = pushup_cm(t, self.MOTION)
+                p0 = _project(measurement.P0, truth) + rng.normal(0, 0.3, (16, 2))
+                p1 = _project(measurement.P1, truth) + rng.normal(0, 0.3, (16, 2))
+                if hide and t >= 5.0:
+                    p0[SLOT[17]] = p0[SLOT[19]] = np.nan
+                result = measurement.process(_pair_from_pixels(round(k * 1e9 / 30), p0, p1))
+                if hide and t >= 5.0:
+                    drift.append(np.linalg.norm(result.points_3d[SLOT[17]] - runtime_m(truth)[SLOT[17]]))
+        return [c["parts"]["wrist_L"].pos for c in measurement.cycles], np.asarray(drift)
+
+    def test_the_hidden_hand_is_not_extrapolated_and_the_wrist_work_holds(self):
+        visible, _ = self._run(hide=False)
+        hidden, drift = self._run(hide=True)
+        assert np.nanmax(drift) < 0.1, "0.5 s までの予測でも手の点が 10 cm 以上流れた"
+        assert np.isnan(drift[16:]).all(), "0.5 s を超えて外挿した"
+        assert len(hidden) == len(visible) == 5
+        for seen, unseen in zip(visible, hidden):
+            assert unseen == pytest.approx(seen, rel=0.3)
 
 
 class TestDivergence:

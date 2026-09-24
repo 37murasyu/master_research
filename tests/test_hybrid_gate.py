@@ -218,3 +218,68 @@ class TestArmLengthGuard:
         work, work_clean = unguarded.cycles[0]["parts"]["elbow_R"], clean.cycles[0]["parts"]["elbow_R"]
         assert abs(work.pos - work_clean.pos) + abs(work.neg - work_clean.neg) > 2 * work_clean.pos
         assert all(r.arm_ok["R"] for r in results)
+
+
+class TestBaselineFollowsTheSeat:
+    """計測の全体（EKF・関所・回の区切り）で、座面の高さが先頭の窓とずれても回が閉じる（2026-09-24 のレビュー）。
+
+    基準を先頭の窓の中央値で固定していたので、1 回目の後に座り直して肩が 1.5 cm 高くなると 8 回で閉じたのは 1 回、
+    開いた回の肘の W+ が 231.7 J（帯 47〜57 J を超えて過負荷の誤表示）になり、30 s まで閉じなかった。先頭の窓で体を
+    持ち上げていると（基準が 13 cm 高い）以後の押し上げがすべて DISCARDED になった。
+    """
+
+    ONE_RM = {"elbow_L": 15.0, "elbow_R": 15.0, "wrist_L": 8.235, "wrist_R": 8.235}
+
+    def _feed(self, lift_cm, seconds, *, noise_px=0.3):
+        from hybrid_pushup import body_cm
+        from test_network_measure import _pair_from_pixels, _project
+
+        P0, P1 = _stereo_projections()
+        measurement = NetworkMeasurement(P0, P1, pose_keypoints,
+                                         MeasurementConfig(body_mass_kg=65.0, one_rm=self.ONE_RM))
+        rng = np.random.default_rng(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for k in range(int(seconds * 30)):
+                truth = body_cm(lift_cm(k / 30))
+                p0 = _project(P0, truth) + rng.normal(0, noise_px, (16, 2))
+                p1 = _project(P1, truth) + rng.normal(0, noise_px, (16, 2))
+                measurement.process(_pair_from_pixels(round(k * 1e9 / 30), p0, p1))
+        return measurement
+
+    def test_landing_15mm_higher_after_the_first_rep(self):
+        """1 回目の下げで 1.5 cm 高く着座し、以後その高さに座る。"""
+        motion = PushUp(reps=8, rest_s=2.0, period_s=3.0)
+        lowering = motion.rest_s + motion.rise_s + motion.hold_s
+
+        def lift(t):
+            return motion.lift(t) + 1.5 * min(max((t - lowering) / motion.lower_s, 0.0), 1.0)
+
+        measurement = self._feed(lift, motion.duration_s)
+        assert measurement.cycle_count == 8, "座り直した後の回が閉じない"
+        assert not measurement.rep_detector.is_open
+        band = measurement.bands["elbow_R"].band
+        for cycle in measurement.cycles:
+            assert cycle["parts"]["elbow_R"].pos == pytest.approx(26.0, rel=0.2)
+            assert cycle["parts"]["elbow_R"].pos < band[0], "1 回ぶんの仕事なのに帯（過負荷）に届いた"
+        assert measurement.rep_detector.baseline_m - measurement.baseline_height_m == pytest.approx(0.015, abs=0.003)
+
+    def test_a_lifted_start_counts_the_push_ups(self):
+        """最初の 1.5 s は体を持ち上げていた（先頭の窓の基準が 13 cm 高い）。座った後の押し上げを数える。
+
+        0.5 s で 13 cm 下ろした直後は EKF の行き過ぎの揺り戻しで上向きの速さが 0.1 m/s を超え、1 度開いて捨てる
+        （持ち上げが 3 cm に届かない。回に数えないのが正しい）。
+        """
+        motion = PushUp(reps=6, rest_s=3.0)
+
+        def lift(t):
+            if t < 1.5:
+                return 13.0
+            return 13.0 * max(0.0, 1 - (t - 1.5) / 0.5) if t < 2.0 else motion.lift(t)
+
+        measurement = self._feed(lift, motion.duration_s)
+        assert measurement.cycle_count == 6
+        assert measurement.discarded_reps <= 1
+        assert measurement.rep_detector.baseline_m == pytest.approx(measurement.baseline_height_m - 0.13, abs=0.003)
+        for cycle in measurement.cycles:
+            assert cycle["parts"]["elbow_R"].pos == pytest.approx(26.0, rel=0.2)

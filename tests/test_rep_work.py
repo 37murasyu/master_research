@@ -56,6 +56,17 @@ class TestSums:
         assert acc.work()["elbow_R"].net == 0.0
         assert acc.work()["wrist_R"].net == pytest.approx(0.1)
 
+    def test_each_part_counts_the_frames_it_integrated(self):
+        """部位ごとに有限の仕事率を積んだフレーム数を持つ。0 なら「0 J」ではなく「積んでいない」（記録は空欄）。"""
+        acc = RepAccumulator(PARTS)
+        acc.add(WorkSample(dt=0.05, powers={"elbow_R": float("nan"), "wrist_R": 2.0}))
+        acc.add(WorkSample(dt=0.05, powers={"wrist_R": 0.0}))
+        acc.add(WorkSample(dt=0.5, powers={"elbow_R": 1.0, "wrist_R": 1.0}))   # dt が長すぎて積まない
+        work = acc.work()
+        assert (work["elbow_R"].frames, work["wrist_R"].frames) == (0, 2)
+        assert acc.reset()["wrist_R"].frames == 2
+        assert acc.work()["wrist_R"].frames == 0
+
     def test_reset_returns_the_rep_and_starts_over(self):
         acc = RepAccumulator(PARTS)
         acc.add(_sample(3.0, 0.1))

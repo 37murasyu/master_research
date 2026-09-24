@@ -8,7 +8,8 @@
   その区間で腕がどう動いたかは分からないので、またいで積まない。上限は同期バッファが補間で埋める穴の上限
   （``GridSpec.max_gap_s``、既定 100 ms）で、計測（``NetworkMeasurement``）は同期バッファと同じ格子のものを渡す
 - 部位ごとに W+ = Σmax(P,0)·dt（論文 4.5.2 節の FB 尺度の分子、ゲージの値）、W− = Σmin(P,0)·dt（負の値）、
-  W± = W+ + W− を持つ
+  W± = W+ + W− と、有限の仕事率を積んだフレーム数を持つ。0 フレームの部位（見えない腕でトルクが NaN）は「0 J」
+  ではなく「積んでいない」で、記録（``app.hybrid.recorder``）は仕事を空欄にする
 - 肘の濾波 E±（``energy_pipeline.compute_cycle_energy_filtered``）の材料として、肘角 θ と τ_y の列も持つ。
   長く回が閉じなくてもメモリを食わないよう、列は ``max_series`` フレームで打ち切る（古い方から捨てる）
 - 力学の関所が閉じている間の直近 ``lookahead`` フレームは輪に置き（``hold``）、関所が開いたら流し込む
@@ -47,10 +48,11 @@ class WorkSample:
 
 @dataclass(frozen=True)
 class PartWork:
-    """1 部位の仕事 [J]。``neg`` は負の値（Σmin(P,0)·dt）。"""
+    """1 部位の仕事 [J]。``neg`` は負の値（Σmin(P,0)·dt）。``frames`` は有限の仕事率を積んだフレーム数。"""
 
     pos: float = 0.0
     neg: float = 0.0
+    frames: int = 0
 
     @property
     def net(self) -> float:
@@ -74,6 +76,7 @@ class RepAccumulator:
         self._held: deque[WorkSample] = deque(maxlen=max(0, int(lookahead)))
         self._pos = dict.fromkeys(self.parts, 0.0)
         self._neg = dict.fromkeys(self.parts, 0.0)
+        self._counted = dict.fromkeys(self.parts, 0)
         self._theta: dict[str, deque[float]] = {}
         self._tau: dict[str, deque[float]] = {}
         # 今の回で積んだフレーム数と、dt が長すぎて積まなかったフレーム数
@@ -97,6 +100,7 @@ class RepAccumulator:
                 self._pos[part] += power * sample.dt
             else:
                 self._neg[part] += power * sample.dt
+            self._counted[part] += 1
         for part, value in sample.theta.items():
             tau = sample.tau_y.get(part, float("nan"))
             self._theta.setdefault(part, deque(maxlen=self.max_series)).append(float(value))
@@ -119,7 +123,7 @@ class RepAccumulator:
         self._held.clear()
 
     def work(self) -> dict[str, PartWork]:
-        return {part: PartWork(self._pos[part], self._neg[part]) for part in self.parts}
+        return {part: PartWork(self._pos[part], self._neg[part], self._counted[part]) for part in self.parts}
 
     def series(self, part: str) -> tuple[np.ndarray, np.ndarray]:
         """肘角 θ [rad] と τ_y [N·m] の列（積んだフレームだけ）。"""
@@ -131,6 +135,7 @@ class RepAccumulator:
         done = self.work()
         self._pos = dict.fromkeys(self.parts, 0.0)
         self._neg = dict.fromkeys(self.parts, 0.0)
+        self._counted = dict.fromkeys(self.parts, 0)
         self._theta.clear()
         self._tau.clear()
         self._held.clear()

@@ -29,7 +29,11 @@
 混成だけのもの（2026-09-24、USB 経路は触らない）:
     - 回の区切りと力学の関所は ``app.hybrid.rep_detector.RepDetector``（肩の中点の重力の上向きへの射影＝高さ）。
       USB と同じ ``PushCycleDetector``（左肩の y の往復）は、実行時の座標の y が奥行きなので、手を固定して体幹が
-      上下するだけの押し上げで 1 回も閉じなかった
+      上下するだけの押し上げで 1 回も閉じなかった。基準の高さは先頭の窓の中央値から始めて座面の高さを追う
+    - 止めたときに開いたままの回は ``summary`` の ``unfinished_rep`` に残し、記録器が cycle_work に「未完」で書く
+    - 先頭の窓で長さが決まらなかった部位（見えなかった肘・手首）は、窓が閉じた後に見えてから長さ・慣性・前腕長・
+      帯・骨の長さの見張りの基準を決める（``late_segments``）。仕事を 1 フレームも積まなかった部位は、回の仕事を
+      0.0 J ではなく NaN（記録は空欄）にする
     - トルクと仕事率は関所によらず毎フレーム計算して記録し、仕事とゲージには関所が開いている間だけ積む
       （座っている間の雑音の仕事を積まない。``MeasurementConfig.dyn_gate``）
     - 仕事はフレームごとの dt で積む（``app.hybrid.rep_work``）
@@ -102,6 +106,20 @@ def _translate_image(P: np.ndarray, shift: np.ndarray) -> np.ndarray:
     S = np.array([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]], [0.0, 0.0, 1.0]])
     return S @ P
 
+
+def _power_inputs_finite(joint: str, torque, axes, forearm, upper_arm, trunk_omega) -> bool:
+    """関節の仕事率の入力（トルク・外側の部位の角速度・リンク・内側の部位の角速度）がすべて有限か。
+
+    ``push_up_joint_powers`` は非有限が混じる関節の仕事率を 0 にする。見えない腕や慣性が決まらない腕の 0 を
+    「0 W」として回に積むと、仕事は 0.0 J と普通の値に見える。ここで NaN に戻し、積まなかったフレームとして数える
+    （``RepAccumulator`` は非有限の仕事率を積まない）。組は ``push_up_joint_powers`` の相対角速度と同じ。
+    """
+    omega, parent = {"wrist": (forearm.omega, None), "elbow": (upper_arm.omega, forearm.omega),
+                     "shoulder": (upper_arm.omega, trunk_omega)}[joint]
+    vectors = [torque, omega, axes[joint][0]] + ([parent] if parent is not None else [])
+    return all(v is not None and np.all(np.isfinite(np.asarray(v, dtype=np.float64))) for v in vectors)
+
+
 def _median_segment(frames: np.ndarray, ia: int, ib: int) -> float:
     """点列 (フレーム, 点, 3) の点 ``ia``–``ib`` の距離の中央値（有限のフレームだけ）。1 つも無ければ NaN。"""
     lengths = np.linalg.norm(frames[:, ia] - frames[:, ib], axis=1)
@@ -116,10 +134,10 @@ EXIT_IMPLAUSIBLE_SCALE = 3
 
 
 class ImplausibleBodyScale(ValueError):
-    """先頭の窓の肩–肘の長さが人体の範囲（``ekf_profile.PLAUSIBLE_REF_LEN``）の外。
+    """先頭の窓の肩–肘の長さが人体の範囲（``ekf_profile.PLAUSIBLE_REF_LEN``）の外か、左右の肘が見えず測れない。
 
-    座標の単位か校正が壊れている（校正の並進を m で保存すると 1/100 になる。2026-09-23 の実機は右上腕が 6.4 m）。
-    そのまま逆動力学に入れるとトルクが桁違いになるので計測を止める。
+    範囲の外なら座標の単位か校正が壊れている（校正の並進を m で保存すると 1/100 になる。2026-09-23 の実機は右上腕が
+    6.4 m）。そのまま逆動力学に入れるとトルクが桁違いになるので計測を止める。
     """
 
 
@@ -147,6 +165,13 @@ _DYN_NEEDED = tuple(part for parts in ARM_PARTS.values() for part in parts.value
 _ARM_SLOTS = {side: tuple(slot_of(f"{side}_{n}") for n in ("SHOULDER", "ELBOW", "WRIST")) for side in ("L", "R")}
 # 左右の肩の位置索引（高さ = 肩の中点）
 _SHOULDER_SLOTS = (slot_of("L_SHOULDER"), slot_of("R_SHOULDER"))
+# 慣性テンソルを長さから決める部位 → (utils_dynamic.calculate_inertia_tensor の係数の行, 始点, 終点)
+_SEGMENTS = {
+    "upper_arm_R": (3, "R_SHOULDER", "R_ELBOW"),
+    "upper_arm_L": (3, "L_SHOULDER", "L_ELBOW"),
+    "forearm_R": (4, "R_ELBOW", "R_WRIST"),
+    "forearm_L": (4, "L_ELBOW", "L_WRIST"),
+}
 
 
 @dataclass
@@ -237,6 +262,8 @@ class FrameResult:
     dyn_active: bool = False
     # 高さ = 肩の中点・上向き u [m]（窓が閉じる前・肩が無いフレームは NaN）
     height_m: float = float("nan")
+    # このフレームの後の回の区切りの基準の高さ [m]（座面の高さを追う。窓が閉じる前は NaN）
+    baseline_m: float = float("nan")
     # このフレームが属する回の番号（0 始まり＝それまでに確定した回の数）
     rep: int = 0
     # 腕の長さの安全策（L・R）。偽ならその腕の仕事率を回とゲージに積まなかった
@@ -329,6 +356,10 @@ class NetworkMeasurement:
         self.baseline_height_m: float | None = None
         self.forearm_m: dict[str, float | None] = {}
         self.upper_arm_m: dict[str, float | None] = {}
+        # 先頭の窓で長さが決まらなかった部位 → 窓が閉じた後に集めている長さ [m]（両端が見えたフレームだけ）
+        self._late_lengths: dict[str, list[float]] = {}
+        # 窓が閉じた後に長さを決めた部位 → 決めたフレーム
+        self.late_segments: dict[str, int] = {}
         # 腕の長さの安全策: 最後に長さがずれてからのフレーム数と、積まなかったフレーム数
         self._arm_clean = {"L": _ARM_HISTORY, "R": _ARM_HISTORY}
         self.arm_guard_rejected = {"L": 0, "R": 0}
@@ -413,6 +444,8 @@ class NetworkMeasurement:
 
         if not self.window_closed:
             self._collect_window(raw, points, result)
+        elif self._late_lengths:
+            self._collect_late_segments(raw, points)
 
         if self.frame_index + 1 >= self.config.dynamics_ready_frames and self._inertia:
             dynamics = self._dynamics(points)
@@ -520,6 +553,7 @@ class NetworkMeasurement:
             "output_schema_version": OUTPUT_SCHEMA_VERSION,
             "forearm_len_m": dict(self.forearm_m) or None,
             "upper_arm_len_m": dict(self.upper_arm_m) or None,
+            "late_segments": dict(self.late_segments) or None,
             "w1rm_j": {part: band.w1rm for part, band in bands.items()} or None,
             "gauge_bands_j": {part: (None if band.band is None else list(band.band)) for part, band in bands.items()} or None,
             "gauge_band_reasons": {part: band.reason for part, band in bands.items() if band.reason} or None,
@@ -531,13 +565,42 @@ class NetworkMeasurement:
             "dyn_gate": self.config.dyn_gate,
             "demo": self._demo is not None,
             "baseline_height_m": self.baseline_height_m,
+            "rep_baseline": self._rep_baseline(),
             "reps": self.cycle_count,
+            "unfinished_rep": self.unfinished_rep(),
             "discarded_reps": self.discarded_reps,
             "dynamics_restarts": self.dynamics_restarts,
             "arm_length_guard": {"tolerance": self.config.arm_length_tolerance,
                                  "rejected_frames": dict(self.arm_guard_rejected)},
             "timing": self.timing(),
         }
+
+    def _rep_baseline(self) -> dict | None:
+        """回の区切りの基準の高さ（先頭の窓の値・最後の値・置き換えた回数）。窓が閉じる前は None。"""
+        detector = self.rep_detector
+        if detector is None:
+            return None
+        return {"initial_m": detector.initial_baseline_m, "final_m": detector.baseline_m,
+                "updates": detector.baseline_updates}
+
+    def unfinished_rep(self) -> dict | None:
+        """止めた時点で開いたままの回（関所が開いていて、まだ確定していない）。無ければ None。
+
+        meta.json の ``unfinished_rep`` に残し、記録器（``app.hybrid.recorder.Recorder.close``）が cycle_work の末尾に
+        「未完」（status=unfinished）の行を書く。frame・t_ns は最後に処理したフレーム。回の数（``reps``）には数えない。
+        """
+        detector = self.rep_detector
+        if detector is None or not detector.is_open or self.frame_index == 0:
+            return None
+        parts = {}
+        for key, work in self.rep_work.work().items():
+            band = self.bands.get(key)
+            counted = work.frames > 0   # 0 フレームの部位は「0 J」ではなく値なし（meta.json は NaN を書けない）
+            parts[key] = {"work_j": work.net if counted else None, "work_pos_j": work.pos if counted else None,
+                          "work_neg_j": work.neg if counted else None,
+                          "w1rm_j": None if band is None else band.w1rm, "frames": work.frames}
+        return {"frame": self.frame_index - 1, "t_ns": self._prev_t_ns, "open_s": detector.open_s,
+                "max_lift_m": detector.max_lift_m, "parts": parts}
 
     def ekf_provenance(self) -> dict:
         """EKF の出どころ（meta.json・サイドカー用）。"""
@@ -613,6 +676,11 @@ class NetworkMeasurement:
         run_length = ref_length(SCALE_REF_PAIR)
         if not math.isfinite(run_length):
             run_length = ref_length((MP_LANDMARK["L_SHOULDER"], MP_LANDMARK["L_ELBOW"]))
+        if not math.isfinite(run_length):
+            # 左右の肘が 1 フレームも見えなかった（予備で閉じた窓）。座標の単位の誤りとは別なので、案内も分ける
+            raise ImplausibleBodyScale(
+                "先頭の窓で左右の肘が一度も見えず、肩–肘の長さ（体格の検査）を測れない。"
+                "両方のカメラの画面に両肘が入るように置き直すこと")
         noise = None if self.ekf is None else self.ekf.noise
         scale_ref = noise.resolution.scale_ref if noise is not None and noise.origin == "profile" else None
         try:
@@ -633,9 +701,9 @@ class NetworkMeasurement:
 
         self.forearm_m = {side: median_length(f"{side}_ELBOW", f"{side}_WRIST") for side in ("L", "R")}
         self.upper_arm_m = {side: median_length(f"{side}_SHOULDER", f"{side}_ELBOW") for side in ("L", "R")}
-        self.bands = part_bands(self.config.body_mass_kg, self.forearm_m, self.config.one_rm or {})
-        if self.tracker is not None:
-            self.tracker.set_bands(self.bands)
+        # 窓で長さが決まらなかった部位は、窓が閉じた後に見えてから決める（_collect_late_segments）
+        self._late_lengths = {name: [] for name in _SEGMENTS if self._segment_length(name) is None}
+        self._set_bands()
         if math.isfinite(self.baseline_height_m):
             self.rep_detector = RepDetector(self.baseline_height_m, self.config.rep)
 
@@ -652,6 +720,54 @@ class NetworkMeasurement:
         }
         self.window_closed = True
 
+    def _length_table(self, name: str) -> tuple[dict[str, float | None], str]:
+        """部位（``_SEGMENTS`` の名前）の長さを持つ表（上腕長か前腕長）と側。"""
+        kind, side = name.rsplit("_", 1)
+        return (self.upper_arm_m if kind == "upper_arm" else self.forearm_m), side
+
+    def _segment_length(self, name: str) -> float | None:
+        """部位の決まった長さ [m]。決まっていなければ None。"""
+        table, side = self._length_table(name)
+        return table.get(side)
+
+    def _set_bands(self) -> None:
+        """実測の前腕長から帯を決め、ゲージにも渡す（窓が閉じたときと、前腕長を後から決めたとき）。"""
+        self.bands = part_bands(self.config.body_mass_kg, self.forearm_m, self.config.one_rm or {})
+        if self.tracker is not None:
+            self.tracker.set_bands(self.bands)
+
+    def _segment_inertia(self, name: str, length: float) -> np.ndarray:
+        """部位の慣性テンソル。長さが有限の正でなければ NaN（慣性の回帰式に NaN の長さを渡さない）。"""
+        if not (math.isfinite(length) and length > 0.0):
+            return np.full((3, 3), np.nan)
+        return calculate_inertia_tensor(_SEGMENTS[name][0], self.config.body_mass_kg, length)
+
+    def _collect_late_segments(self, raw: np.ndarray, points: np.ndarray) -> None:
+        """窓で長さが決まらなかった部位の長さを、両端が見えた（三角測量が有限の）フレームで集める。
+
+        窓と同じ数（``inertia_ready_frames``）たまったら中央値で長さを決め、慣性・上腕長か前腕長・帯（前腕のとき。
+        ゲージにも渡し直す）を埋める。骨の長さの見張り（``_arm_ok``）はこの長さを基準に検査を始める。
+        """
+        for name in list(self._late_lengths):
+            _, start, end = _SEGMENTS[name]
+            ends = [slot_of(start), slot_of(end)]
+            if not (np.all(np.isfinite(raw[ends])) and np.all(np.isfinite(points[ends]))):
+                continue
+            lengths = self._late_lengths[name]
+            lengths.append(float(np.linalg.norm(points[ends[0]] - points[ends[1]])))
+            if len(lengths) < self.config.inertia_ready_frames:
+                continue
+            length = float(np.median(lengths))
+            del self._late_lengths[name]
+            self._inertia[name] = self._segment_inertia(name, length)
+            table, side = self._length_table(name)
+            table[side] = length
+            if table is self.forearm_m:
+                self._set_bands()
+            self.late_segments[name] = self.frame_index
+            print(f"[計測] 先頭の窓で決まらなかった {name} の長さを、見えてから決めた（{length:.3f} m、"
+                  f"フレーム {self.frame_index}）", file=sys.stderr)
+
     def _build_inertia(self, samples: np.ndarray) -> None:
         """慣性テンソルと重力を確定させる。
 
@@ -663,16 +779,10 @@ class NetworkMeasurement:
         重力は同じ初期フレームの体幹（腰中点 → 肩中点）の向きから決める（§1-5）。校正の meta に盤を立てた
         向き（``board_up``）があれば、最寄りの軸に吸着させて使う（``app.hybrid.gravity.choose_gravity``）。
         """
-        mass = self.config.body_mass_kg
-
-        def length(a: str, b: str) -> float:
-            return _median_segment(samples, slot_of(a), slot_of(b))
-
+        # 窓で見えなかった部位の長さは NaN で、慣性も NaN（回帰式に渡さない）。見えてから決める（_collect_late_segments）
         self._inertia = {
-            "upper_arm_R": calculate_inertia_tensor(3, mass, length("R_SHOULDER", "R_ELBOW")),
-            "upper_arm_L": calculate_inertia_tensor(3, mass, length("L_SHOULDER", "L_ELBOW")),
-            "forearm_R": calculate_inertia_tensor(4, mass, length("R_ELBOW", "R_WRIST")),
-            "forearm_L": calculate_inertia_tensor(4, mass, length("L_ELBOW", "L_WRIST")),
+            name: self._segment_inertia(name, _median_segment(samples, slot_of(start), slot_of(end)))
+            for name, (_, start, end) in _SEGMENTS.items()
         }
         ups = trunk_up_vectors(*(samples[:, slot_of(n)] for n in ("L_SHOULDER", "R_SHOULDER", "L_HIP", "R_HIP")))
         config = self.config
@@ -717,10 +827,11 @@ class NetworkMeasurement:
                 link, parent = axes[joint]
                 local[key] = compute_local_torque(torque, link, parent, up)
                 self.storage.add_torque(key, local[key])
-            powers = push_up_joint_powers(
-                torques, axes, forearm, upper_arm, data["both_shoulder"][-1].get("omega"), up)
+            trunk_omega = data["both_shoulder"][-1].get("omega")
+            powers = push_up_joint_powers(torques, axes, forearm, upper_arm, trunk_omega, up)
             for joint, power in powers.items():
-                powers_by_key[f"{joint}_{side}"] = float(power)
+                finite = _power_inputs_finite(joint, torques[joint], axes, forearm, upper_arm, trunk_omega)
+                powers_by_key[f"{joint}_{side}"] = float(power) if finite else float("nan")
             # 肘の濾波 E± の材料（USB と同じ θ = 肩→肘 と 肘→手首 のなす角、τ_y は肘の局所トルクの y）
             theta[f"elbow_{side}"] = angle_between(elbow - shoulder, wrist - elbow)
             tau_y[f"elbow_{side}"] = float(local[f"elbow_{side}"][1])
@@ -784,6 +895,7 @@ class NetworkMeasurement:
         if detector is not None:
             speed = self._height(velocity) if velocity is not None else None
             event = detector.update(result.height_m, speed, dt)
+            result.baseline_m = detector.baseline_m
         if event is RepEvent.OPENED and gate:
             self.rep_work.release()
         is_open = (not gate) or (detector is not None and detector.is_open) \
@@ -808,13 +920,18 @@ class NetworkMeasurement:
         """今の回の肘の濾波 E±（USB 経路と同じ ``compute_cycle_energy_filtered``、dt は格子の間隔（既定 1/30 s））。"""
         config = self.config.energy_filter
         fc = self._cutoff.fc if config.fc_adaptive_on else None
+        work = self.rep_work.work()
         energy = {}
         for side in ("L", "R"):
-            theta, tau = self.rep_work.series(f"elbow_{side}")
+            part = f"elbow_{side}"
+            theta, tau = self.rep_work.series(part)
             e_pos, e_neg, info = compute_cycle_energy_filtered(theta, tau, self.grid.period_s, fc_override=fc,
                                                           config=config)
-            energy[f"elbow_{side}"] = {"e_pos": e_pos, "e_neg": e_neg, "fc": info.get("fc"),
-                                       "n_u": int(info.get("n_u", 0))}
+            frames = work[part].frames
+            if frames == 0:   # 仕事を 1 フレームも積まなかった（肘のトルクが NaN）。0 J ではなく値なし
+                e_pos = e_neg = float("nan")
+            energy[part] = {"e_pos": e_pos, "e_neg": e_neg, "fc": info.get("fc"),
+                            "n_u": int(info.get("n_u", 0)), "n_frames": frames}
         return energy
 
     def _gauge_now(self) -> dict[str, float]:
@@ -837,8 +954,10 @@ class NetworkMeasurement:
         result.cycle_energy = self._elbow_energy()
         parts = self.rep_work.reset()
         for key, work in parts.items():
-            self.cycle_work[key].append(work.net)
-            result.cycle_work_j[key] = work.net
+            # 有限の仕事率を 1 フレームも積まなかった部位は 0.0 J ではなく NaN（記録は空欄）
+            net = work.net if work.frames else float("nan")
+            self.cycle_work[key].append(net)
+            result.cycle_work_j[key] = net
         result.cycle_parts = parts
         result.cycle_w1rm = {key: (self.bands[key].w1rm if key in self.bands else None) for key in parts}
         self.cycles.append({"frame": self.frame_index, "t_ns": result.t_ns, "parts": parts,

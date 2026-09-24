@@ -6,6 +6,11 @@
   それを混成に使うと合成の押し上げで肘の W_pos が +52% になる（同梱値なら +10%）。混成は ``EKF_Q_ACC``・``EKF_R``・
   ``EKF_PROFILE`` を読まない
 - ``EKF_ENABLE``・``EKF_GATE_STD``・``EKF_ROBUST_GATE``・``EKF_MAX_GAP_S``・``EKF_BPF_*`` は USB と共用
+- **点ごとの欠測の上限**（``EKF_MAX_GAP_S``）: 指定が無ければ、フレーム全体の抜けで作り直す ``REBUILD_GAP_S``（0.5 s）と
+  同じにする（それを超えた点は NaN を返し、次に見えたときに観測で始め直す）。USB の既定の 0 は無制限で、画面の外に
+  出た点を期限なしに外挿し、押し上げ中に手の点が 5 s 見えないと手首の軸が流れて手首の W+ が −10〜−60% になった
+  （2026-09-24 のレビュー）。GUI は既定の 0 のまま全件を子へ渡すので、混成は 0 も「指定なし」とみなす。正の値は
+  そのまま使い、無制限にするなら負の値を指定する。使った値は出どころ（meta.json の ekf・生 3D のサイドカー）に残す
 - 同期バッファ（``app.net.sync_buffer``）は 100 ms を超える穴で組を作らないので、次の組の時刻は格子（既定 1/30 s）の
   n 倍跳ぶ。抜けた格子の数だけ NaN の観測と dt=格子の間隔で予測してから観測で更新する（``GridEkf.step``）。
   dt は組み立てる側（``NetworkMeasurement``）が同期バッファと同じ ``GridSpec`` の ``period_s`` を渡す
@@ -19,6 +24,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Sequence
@@ -47,8 +53,8 @@ class EkfSettings:
     profile: str | None = None
     gate_std: float = 3.0
     robust_gate: bool = True
-    # 系列ごとの欠測の上限 [s]（LandmarkEKF の max_gap_s）。0 は無制限
-    max_gap_s: float = 0.0
+    # 系列ごとの欠測の上限 [s]（LandmarkEKF の max_gap_s）。既定はフレーム全体の抜けで作り直す上限と同じ。0 以下は無制限
+    max_gap_s: float = REBUILD_GAP_S
     bpf_low: float = 0.0
     bpf_high: float = 0.0
     bpf_order: int = 2
@@ -61,7 +67,7 @@ class EkfSettings:
             profile=(env.get("HYBRID_EKF_PROFILE") or "").strip() or None,
             gate_std=env_float("EKF_GATE_STD", 3.0, env=env),
             robust_gate=env_flag("EKF_ROBUST_GATE", True, env),
-            max_gap_s=env_float("EKF_MAX_GAP_S", 0.0, env=env),
+            max_gap_s=_max_gap_from_env(env),
             bpf_low=env_float("EKF_BPF_LOW", 0.0, env=env),
             bpf_high=env_float("EKF_BPF_HIGH", 0.0, env=env),
             bpf_order=int(env_float("EKF_BPF_ORDER", 2, env=env)),
@@ -69,6 +75,12 @@ class EkfSettings:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _max_gap_from_env(env: Mapping[str, str]) -> float:
+    """``EKF_MAX_GAP_S``。空・0（GUI が渡す USB と共用の既定）・NaN は「指定なし」で ``REBUILD_GAP_S``、負は無制限。"""
+    value = env_float("EKF_MAX_GAP_S", 0.0, env=env)
+    return REBUILD_GAP_S if value == 0.0 or math.isnan(value) else value
 
 
 def hybrid_noise(settings: EkfSettings, landmark_ids: Sequence[int], *, dt: float = DEFAULT_GRID.period_s,
@@ -185,6 +197,8 @@ class GridEkf:
             "path": noise["path"],
             "reason": noise["reason"],
             "scale_ratio": self.scale_ratio,
+            # 点ごとの欠測の上限 [s]（0 以下は無制限）。settings の max_gap_s と同じ値
+            "max_gap_s": self._ekf.max_gap_s,
             "settings": self.settings.as_dict(),
             "rebuilds": self.rebuilds,
             "predicted_steps": self.predicted,
